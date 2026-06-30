@@ -198,8 +198,10 @@ RUST_LOG=debug PORTCULLIS_CONFIG=/etc/config/portcullis cargo run -p portcullis-
 ```bash
 # Target: MIPS 1004Kc, little-endian, static musl
 cargo build --release --target mipsel-unknown-linux-musl
-# Package as an .ipk via the RutOS / OpenWrt SDK (ramips/mt7621) — see .claude/skills/openwrt-build
+# Package as an .ipk via the RutOS / OpenWrt SDK (ramips/mt7621).
 ```
+
+**Full build → install → provision → verify guide: [`deploy/PACKAGING.md`](./deploy/PACKAGING.md)** (or `SDK_DIR=/path/to/sdk ./deploy/build-ipk.sh`).
 
 Runtime dependencies on-device: `kmod-nft-*` + `nftables` userspace and `dnsmasq-full` (declared as package deps).
 

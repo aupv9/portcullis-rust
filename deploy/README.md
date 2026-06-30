@@ -1,8 +1,12 @@
 # 📦 deploy/ — OpenWrt packaging for portcullis
 
 Artifacts that turn the Rust workspace into an installable RutOS/OpenWrt package
-for the Teltonika RUTM11 (`ramips/mt7621`, `mipsel-unknown-linux-musl`). See
-TDD §10 and the [`openwrt-build`](../.claude/skills/openwrt-build) skill.
+for the Teltonika RUTM11 (`ramips/mt7621`, `mipsel-unknown-linux-musl`). See the
+[`openwrt-build`](../.claude/skills/openwrt-build) skill.
+
+> 📘 **Full step-by-step build + install + provision + verify guide:
+> [`PACKAGING.md`](./PACKAGING.md).** Or run [`build-ipk.sh`](./build-ipk.sh)
+> against an extracted SDK: `SDK_DIR=/path/to/sdk ./deploy/build-ipk.sh`.
 
 | File | Installs to | Purpose |
 |---|---|---|
