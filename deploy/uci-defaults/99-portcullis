@@ -1,0 +1,47 @@
+#!/bin/sh
+# First-boot bootstrap for portcullis (TDD §10). Runs once on first boot, then
+# OpenWrt deletes it. Idempotent: safe if the fleet pipeline re-runs it.
+#
+# What it sets up that the package install can't: the dedicated daemon user, the
+# tmpfs state dir, the dnsmasq-full garden nftset wiring, and a placeholder
+# secrets dir. Per-store identity (store_id, endpoint, HMAC/WG keys) is injected
+# by the fleet provisioning pipeline, NOT baked into the image (§13).
+
+set -e
+
+# 1) Dedicated unprivileged user/group (no shell, no home). The daemon drops to
+#    this user with CAP_NET_ADMIN via procd (see capabilities/portcullis.json).
+if ! grep -q '^portcullis:' /etc/passwd 2>/dev/null; then
+	echo 'portcullis:x:err:err:portcullis:/var/run/portcullis:/bin/false' >/dev/null 2>&1 || true
+	group_add portcullis 2>/dev/null || true
+	user_add portcullis '' '' 'portcullis' /var/run/portcullis /bin/false 2>/dev/null || true
+fi
+
+# 2) Secrets dir (HMAC key + mTLS material land here, 0600, owned by the daemon).
+#    The pipeline drops the real key/certs; we only prepare the directory.
+mkdir -p /etc/portcullis/tls
+chmod 0700 /etc/portcullis /etc/portcullis/tls
+chown portcullis:portcullis /etc/portcullis /etc/portcullis/tls 2>/dev/null || true
+
+# 3) tmpfs runtime state dir (never NAND — §5.4).
+mkdir -p /tmp/portcullis
+
+# 4) Wire the walled garden into dnsmasq-full via nftset (§7.3). dnsmasq resolves
+#    each garden FQDN and injects the IPs into the inet wifihub garden4/garden6
+#    sets. portcullis-garden reconciles this list at runtime; this seeds it.
+GARDEN_CONF=/etc/dnsmasq.d/portcullis-garden.conf
+mkdir -p /etc/dnsmasq.d
+if [ ! -f "$GARDEN_CONF" ]; then
+	cat >"$GARDEN_CONF" <<'EOF'
+# Managed by portcullis (seed). Runtime reconcile may rewrite this.
+nftset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/4#inet#wifihub#garden4
+nftset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/6#inet#wifihub#garden6
+EOF
+fi
+# dnsmasq must include conf-dir /etc/dnsmasq.d (default on RutOS); reload to apply.
+/etc/init.d/dnsmasq reload 2>/dev/null || true
+
+# 5) Enable + start the service.
+/etc/init.d/portcullis enable 2>/dev/null || true
+
+exit 0

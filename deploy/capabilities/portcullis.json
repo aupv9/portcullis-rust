@@ -1,0 +1,20 @@
+{
+  "//": "procd capability set for portcullis (TDD §13). The daemon manages the",
+  "//2": "inet wifihub nftables table and reads the neigh/conntrack tables, all of",
+  "//3": "which require CAP_NET_ADMIN — and nothing else. No root, no extra caps.",
+  "bounding": [
+    "CAP_NET_ADMIN"
+  ],
+  "effective": [
+    "CAP_NET_ADMIN"
+  ],
+  "inheritable": [
+    "CAP_NET_ADMIN"
+  ],
+  "permitted": [
+    "CAP_NET_ADMIN"
+  ],
+  "ambient": [
+    "CAP_NET_ADMIN"
+  ]
+}

@@ -1,0 +1,21 @@
+# UCI config for portcullis (/etc/config/portcullis) — TDD §9.
+# Per-store values (store_id, control_endpoint, keys) are filled by the fleet
+# provisioning pipeline / first-boot bootstrap (uci-defaults/99-portcullis).
+#
+# Hot-reloadable: garden_fqdn, tier defaults, accounting_interval.
+# Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port.
+
+config portcullis 'main'
+	option store_id            'WMP-0000'
+	option control_endpoint    'https://cp.wifihub.internal:8443'
+	option wg_interface        'wg-hub'
+	option hmac_key_file       '/etc/portcullis/hmac.key'
+	option responder_port      '8080'
+	option accounting_interval '15'
+	option default_ttl         '1800'
+	option default_quota_mb    '0'
+	option default_rate_kbps   '2048'
+	list   garden_fqdn         'portal.wifihub.vn'
+	list   garden_fqdn         'cdn.wifihub.vn'
+	list   garden_fqdn         'otp.gateway'
+	list   garden_fqdn         'pay.example'

@@ -1,0 +1,45 @@
+#!/bin/sh /etc/rc.common
+# procd init script for portcullis (TDD §10).
+#
+# Runs the enforcement daemon under procd supervision as a dedicated non-root
+# user with CAP_NET_ADMIN only. State is tmpfs; the kernel holds the ruleset
+# across daemon restarts, so respawn never drops authorized clients (§7.8).
+
+USE_PROCD=1
+# Start late enough that the network/nftables/dnsmasq are up; stop early.
+START=95
+STOP=10
+
+PROG=/usr/sbin/portcullis
+NAME=portcullis
+USER=portcullis
+
+start_service() {
+	# Ensure the tmpfs state dir exists (never on NAND — §5.4).
+	[ -d /tmp/portcullis ] || mkdir -p /tmp/portcullis
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+	# The daemon reads UCI config from this path and logs at this level.
+	procd_set_param env RUST_LOG=info PORTCULLIS_CONFIG=/etc/config/portcullis
+	procd_set_param user "$USER"
+	# Drop to CAP_NET_ADMIN only (manage the inet wifihub table); no root.
+	procd_set_param capabilities /etc/capabilities/portcullis.json
+	# Respawn: if it crashes >5 times within 3600s with <5s uptime, back off.
+	procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/portcullis.pid
+	procd_close_instance
+}
+
+service_triggers() {
+	# Hot-reload (garden FQDNs, tier defaults, accounting interval) on UCI change.
+	procd_add_reload_trigger "portcullis"
+}
+
+reload_service() {
+	# The daemon hot-reloads what it can and ignores restart-only keys; a full
+	# restart is only needed for endpoint/key/port changes (§9).
+	procd_send_signal "$NAME"
+}
