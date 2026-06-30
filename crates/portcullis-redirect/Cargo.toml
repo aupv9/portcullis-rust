@@ -1,0 +1,24 @@
+[package]
+name = "portcullis-redirect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The :8080 HTTP 302 redirect responder: neigh-table MAC lookup + HMAC-signed portal redirect. The primary inbound attack surface (TDD §7.2, §13)."
+
+[dependencies]
+portcullis-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+axum.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
+serde.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

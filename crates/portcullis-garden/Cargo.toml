@@ -1,0 +1,17 @@
+[package]
+name = "portcullis-garden"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Walled-garden management: owns the FQDN list, renders/reconciles dnsmasq nftset config (TDD §7.3)."
+
+[dependencies]
+portcullis-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

@@ -1,0 +1,18 @@
+[package]
+name = "portcullis-accounting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "conntrack metering loop + quota watcher + interim event export (TDD §7.6, §7.7)."
+
+[dependencies]
+portcullis-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

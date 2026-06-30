@@ -1,0 +1,14 @@
+[package]
+name = "portcullis-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "UCI/TOML configuration types, load, and hot-reload for portcullis (TDD §9)."
+
+[dependencies]
+portcullis-types.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,34 @@
+# ── Rust / Cargo ───────────────────────────────────────────────────────────
+# Build artifacts (the workspace uses a single target dir at the root).
+/target
+**/target/
+# Backups from rustfmt and friends.
+**/*.rs.bk
+# Cargo.lock IS committed — this workspace builds a binary/daemon, so a locked,
+# reproducible dependency set is intended. Do not ignore it.
+
+# ── Secrets / provisioned material (never commit) ───────────────────────────
+# Per-store HMAC key, mTLS identity + CA, WireGuard keys (provisioned at boot).
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+secrets/
+**/tls/
+
+# ── Local tooling / editor ──────────────────────────────────────────────────
+.claude/settings.local.json
+.idea/
+.vscode/
+*.iml
+
+# ── OS cruft ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Coverage / profiling ─────────────────────────────────────────────────────
+*.profraw
+*.profdata
+tarpaulin-report.*
+/coverage

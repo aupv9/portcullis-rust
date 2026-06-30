@@ -1,0 +1,18 @@
+[package]
+name = "portcullis-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Domain: Session, lifecycle, in-RAM store, and the SessionManager that funnels all mutations to the nft writer (TDD §7.4, §7.8, §7.9)."
+
+[dependencies]
+portcullis-types.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
