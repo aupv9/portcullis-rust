@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+// Contract shared with the Go control plane (TDD §7.5, Appendix A).
+// Wire-compat rule: never renumber/retype/reuse a field tag; only add new tags.
+package wifihub.enforcement.v1;
+
+// Engine-side gRPC service. The Go control plane is the client; it also consumes
+// a server-stream of SessionEvents. Transport is gRPC/tonic over the WireGuard
+// overlay, mutually authenticated (mTLS). The engine NEVER speaks RADIUS.
+service Enforcement {
+  rpc GrantSession (GrantRequest) returns (GrantReply);
+  rpc RevokeSession(RevokeRequest) returns (Ack);
+  rpc GetSession   (Key)          returns (SessionInfo);
+  rpc ListSessions (ListRequest)  returns (stream SessionInfo);
+  rpc StreamEvents (StreamReq)    returns (stream SessionEvent); // engine -> control plane
+  rpc Health       (Empty)        returns (HealthReply);
+}
+
+message GrantRequest {
+  string store_id    = 1;
+  string client_mac  = 2; // primary identity (validated upstream via signed redirect)
+  string client_ip   = 3; // optional / informational
+  uint32 ttl_seconds = 4; // session length -> nft set-element timeout
+  uint64 quota_bytes = 5; // 0 = unlimited
+  uint64 rate_bps    = 6; // 0 = unlimited
+  string tier        = 7; // public | home | retail
+  string session_id  = 8; // control-plane issued (== RADIUS Acct-Session-Id)
+}
+
+message GrantReply {
+  string session_id = 1;
+  bool   accepted   = 2;
+}
+
+enum RevokeReason {
+  REVOKE_ADMIN      = 0;
+  REVOKE_QUOTA      = 1;
+  REVOKE_MAC_CHANGE = 2;
+}
+
+message RevokeRequest {
+  string       client_mac = 1;
+  RevokeReason reason     = 2;
+}
+
+message Ack {
+  bool   ok      = 1;
+  string message = 2;
+}
+
+message Key {
+  string client_mac = 1;
+}
+
+message ListRequest {
+  uint32 page_size  = 1; // 0 = server default
+  string page_token = 2;
+}
+
+message SessionInfo {
+  string session_id      = 1;
+  string client_mac      = 2;
+  string client_ip       = 3;
+  string tier            = 4;
+  int64  granted_at_unix = 5;
+  uint32 expires_in_secs = 6;
+  uint64 quota_bytes     = 7;
+  uint64 rate_bps        = 8;
+  uint64 bytes_in        = 9;
+  uint64 bytes_out       = 10;
+}
+
+enum EventKind {
+  GRANTED        = 0;
+  INTERIM        = 1;
+  EXPIRED        = 2;
+  REVOKED        = 3;
+  QUOTA_EXCEEDED = 4;
+}
+
+message SessionEvent {
+  string    session_id = 1;
+  string    client_mac = 2;
+  EventKind kind       = 3;
+  uint64    bytes_in   = 4;
+  uint64    bytes_out  = 5;
+  int64     ts_unix    = 6;
+}
+
+message StreamReq {
+  string store_id = 1;
+}
+
+message HealthReply {
+  bool backend_ok            = 1;
+  bool kernel_table_present  = 2;
+  bool cp_connected          = 3;
+  bool last_reconcile_ok     = 4;
+}
+
+message Empty {}

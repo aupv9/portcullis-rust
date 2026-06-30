@@ -1,0 +1,20 @@
+[package]
+name = "portcullis-nft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The ONLY crate touching netfilter: FirewallBackend trait, nft -j backend, base ruleset, single-owner writer actor (TDD §7.1, §7.9)."
+
+[dependencies]
+portcullis-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

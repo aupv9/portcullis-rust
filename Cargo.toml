@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/portcullis-types",
+    "crates/portcullis-config",
+    "crates/portcullis-nft",
+    "crates/portcullis-session",
+    "crates/portcullis-redirect",
+    "crates/portcullis-garden",
+    "crates/portcullis-accounting",
+    "crates/portcullis-control",
+    "crates/portcullis-engined",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "Proprietary"
+authors = ["AUPHAN — New Era <au.pv@newera.inc>"]
+
+[workspace.dependencies]
+# internal
+portcullis-types = { path = "crates/portcullis-types" }
+portcullis-config = { path = "crates/portcullis-config" }
+portcullis-nft = { path = "crates/portcullis-nft" }
+portcullis-session = { path = "crates/portcullis-session" }
+portcullis-redirect = { path = "crates/portcullis-redirect" }
+portcullis-garden = { path = "crates/portcullis-garden" }
+portcullis-accounting = { path = "crates/portcullis-accounting" }
+portcullis-control = { path = "crates/portcullis-control" }
+# async / runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util", "process"] }
+async-trait = "0.1"
+futures = "0.3"
+# error / log
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+# No `env-filter`: it pulls `matchers` -> `regex-automata`/`regex-syntax` (~290 KiB
+# of runtime .text). An embedded single-purpose daemon only needs a global level
+# (parsed from RUST_LOG in engined). `fmt` is a default feature and is retained.
+tracing-subscriber = { version = "0.3" }
+# serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# crypto
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+# http (redirect responder)
+axum = "0.7"
+hyper = { version = "1", features = ["full"] }
+# grpc (control)
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+[workspace.metadata]
+notes = "host build/test target is the CI-equivalent (TDD §15); device target is mipsel-unknown-linux-musl"
+
+# Size-first release profile for the embedded MIPS target (TDD §14: <15 MB binary,
+# <30 MB RSS). The .text is mmap'd so a smaller binary is also the biggest RSS win.
+# `panic = "abort"` is intentionally NOT set (keeps unwinding semantics); revisit
+# with `-Z build-std panic_immediate_abort` only if the on-device size check falls short.
+[profile.release]
+opt-level = "z"      # optimize for size; benchmark "s" too (sometimes smaller+faster after LTO)
+lto = true           # link-time optimization across crates
+codegen-units = 1    # one unit -> better cross-fn optimization (slower compile)
+strip = true         # drop symbols (large win on static musl)

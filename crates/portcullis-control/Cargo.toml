@@ -1,0 +1,25 @@
+[package]
+name = "portcullis-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "tonic gRPC server (Enforcement service) + mTLS over WireGuard; bridges proto <-> domain and fans events to the control plane (TDD §7.5, §13)."
+
+[dependencies]
+portcullis-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tonic = { workspace = true, features = ["tls"] }
+prost.workspace = true
+prost-types.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

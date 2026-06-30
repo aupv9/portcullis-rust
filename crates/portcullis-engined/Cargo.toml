@@ -1,0 +1,28 @@
+[package]
+name = "portcullis-engined"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The daemon binary: composition root, Tokio runtime, signal handling, graceful shutdown, restart adoption (TDD §6, §7.8)."
+
+[[bin]]
+name = "portcullis"
+path = "src/main.rs"
+
+[dependencies]
+portcullis-types.workspace = true
+portcullis-config.workspace = true
+portcullis-nft.workspace = true
+portcullis-session.workspace = true
+portcullis-redirect.workspace = true
+portcullis-garden.workspace = true
+portcullis-accounting.workspace = true
+portcullis-control.workspace = true
+tonic = { workspace = true, features = ["tls"] }
+tokio = { workspace = true }
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
