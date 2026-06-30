@@ -20,6 +20,10 @@ thiserror.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+# Bundled protoc so the build needs no system `protoc` (CI, cross containers,
+# and contributor machines all work out of the box). Used only as a fallback
+# when a system protoc is not on PATH.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

@@ -14,16 +14,14 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── Gate: build + lint + test on the host (CI-equivalent, TDD §15) ─────────
+  # Gate: build + lint + test on the host (the CI-equivalent — the ruleset
+  # logic is arch-independent). protoc is vendored by the build script, so no
+  # system protobuf-compiler install is needed.
   test:
     name: build · clippy · test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # tonic-build needs protoc to compile proto/enforcement.proto.
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install Rust (stable + clippy + rustfmt)
         uses: dtolnay/rust-toolchain@stable
@@ -47,39 +45,6 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true
 
-  # ── Cross-compile for the RUTM11 (mipsel-unknown-linux-musl) ───────────────
-  # NON-BLOCKING. MIPS musl is a tier-3 target (no prebuilt std), so the
-  # authoritative device build is the RutOS/OpenWrt SDK with `-Z build-std`
-  # (TDD §5.3). This job is a best-effort smoke check via `cross`; a red mark
-  # here does not gate the workflow.
-  cross-mipsel:
-    name: cross-compile (mipsel-musl, best-effort)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
-
-      - name: Install Rust nightly + rust-src (for build-std)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cross build (engine binary)
-        env:
-          # cross builds std from source for this tier-3 target.
-          CROSS_BUILD_STD: "true"
-        run: |
-          cross +nightly build --release \
-            -Z build-std=std,panic_abort \
-            --target mipsel-unknown-linux-musl \
-            -p portcullis-engined
+# NOTE: cross-compiling to mipsel-unknown-linux-musl (the RUTM11 target) is a
+# Rust tier-3 build (no prebuilt std) and is done with the RutOS/OpenWrt SDK
+# (`-Z build-std`), not generic CI — see deploy/README.md (TDD §5.3, §16 POC).
