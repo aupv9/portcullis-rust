@@ -5,7 +5,7 @@
 | **Component** | WiFi Hub — Captive Portal Data-Plane Enforcement Engine |
 | **Codename** | `portcullis` |
 | **Status** | DRAFT v0.1 |
-| **Owner** | AUPHAN — New Era (newera.inc) |
+| **Owner** | AUPHAN  |
 | **Deployment target** | Teltonika RUTM11 (RutOS 7.x), 1 instance per WinMart+ store (~10,000) |
 | **Upstream system** | WiFi Hub (Go control plane, FreeRADIUS, ClickHouse, Rust/Axum ad engine, Next.js portal) |
 | **Related decisions** | Abandon CoovaChilli; no Teltonika RMS; control plane is NAS-of-record |
