@@ -84,7 +84,7 @@ Client **data** breaks out locally at the store's WAN. The WireGuard overlay car
 | 🛡️ | **Fail-closed everywhere** — no error path ever fails open | ✅ |
 | 🪶 | **Embedded footprint** — ~2.4 MB binary, RAM-only state (no flash writes) | ✅ |
 | 🚄 | **Rate limiting / shaping** — `tc`/HTB per-tier (Phase-2 skeleton) | 🚧 |
-| 📦 | **OpenWrt `.ipk` packaging** — procd init, MIPS cross-compile | 🗺️ planned |
+| 📦 | **OpenWrt `.ipk` packaging** — procd init, UCI config, first-boot bootstrap ([`deploy/`](./deploy)) | 🚧 scaffolded |
 
 ---
 
@@ -301,8 +301,8 @@ cargo test --workspace          # 130 unit tests across 9 crates
 
 ## 🗺️ Roadmap
 
-- [ ] `deploy/` — procd init script, OpenWrt SDK `.ipk` Makefile, first-boot `uci-defaults`
-- [ ] MIPS cross-compile + on-device size/RSS validation
+- [x] `deploy/` — procd init, OpenWrt SDK `.ipk` Makefile, UCI config, first-boot `uci-defaults` ([`deploy/`](./deploy))
+- [ ] MIPS cross-compile validated on-device + size/RSS validation (`-Z build-std`, RutOS SDK)
 - [ ] `tc`/HTB bandwidth shaping (Phase-2)
 - [ ] Linux netns integration + fault-injection suite in CI
 - [ ] RFC 8910/8908 Captive Portal API (DHCP option 114) alongside CPD redirect
