@@ -178,7 +178,7 @@ On start: `ensure_base` (idempotent) → `list_auth` from the kernel → `adopt`
 
 ## 🚀 Quick start
 
-> Requires Rust **1.96+** and `protoc` (for the gRPC contract). Host build = CI-equivalent; the ruleset logic is arch-independent (TDD §15).
+> Requires Rust **1.96+** only — `protoc` for the gRPC contract is **vendored** by the build script (no system install needed). Host build = CI-equivalent; the ruleset logic is arch-independent.
 
 ```bash
 # Build & test the whole workspace
