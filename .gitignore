@@ -17,6 +17,9 @@
 secrets/
 **/tls/
 
+# ── Internal design doc (kept local-only, not published) ─────────────────────
+portcullis-edge-engine-TDD.md
+
 # ── Local tooling / editor ──────────────────────────────────────────────────
 .claude/settings.local.json
 .idea/

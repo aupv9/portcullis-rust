@@ -4,7 +4,7 @@ Thanks for working on the enforcement engine. This is safety-critical, embedded 
 
 ## 🧭 Before you start
 
-- Read [`portcullis-edge-engine-TDD.md`](./portcullis-edge-engine-TDD.md) (the design) and [`CLAUDE.md`](./CLAUDE.md) (the load-bearing invariants).
+- Read the [README](./README.md) (architecture & flows) and [`CLAUDE.md`](./CLAUDE.md) (the load-bearing invariants).
 - Skim the per-area engineering notes in [`.claude/skills/`](./.claude/skills/) for the crate you're touching:
   `nft-ruleset` · `openwrt-build` · `netns-harness` · `accounting-metering` · `embedded-perf`.
 
