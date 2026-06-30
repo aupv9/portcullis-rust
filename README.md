@@ -6,6 +6,7 @@
 
 *No client reaches the internet until the control plane explicitly authorizes it — and once authorized, the grant is enforced, metered, and expired correctly.*
 
+[![CI](https://github.com/aupv9/portcullis-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/aupv9/portcullis-rust/actions/workflows/ci.yml)
 ![status](https://img.shields.io/badge/status-alpha-orange)
 ![rust](https://img.shields.io/badge/rust-1.96%2B-blue?logo=rust)
 ![edition](https://img.shields.io/badge/edition-2021-blue)
