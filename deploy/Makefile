@@ -18,8 +18,8 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=portcullis
 PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
-PKG_MAINTAINER:=AUPHAN — New Era <au.pv@newera.inc>
-PKG_LICENSE:=Proprietary
+PKG_MAINTAINER:=The portcullis authors
+PKG_LICENSE:=MIT OR Apache-2.0
 
 # The crate sources live one level above deploy/ (the workspace root).
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)

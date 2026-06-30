@@ -2,7 +2,7 @@
 
 # 🏰 portcullis
 
-**Per-store edge enforcement engine for the WiFi Hub captive portal**
+**Per-site captive-portal edge enforcement engine for OpenWrt routers**
 
 *No client reaches the internet until the control plane explicitly authorizes it — and once authorized, the grant is enforced, metered, and expired correctly.*
 
@@ -15,7 +15,7 @@
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
 ![binary](https://img.shields.io/badge/binary-~2.4MB-informational)
 ![target](https://img.shields.io/badge/target-mipsel--musl%20(RUTM11)-lightgrey)
-![license](https://img.shields.io/badge/license-Proprietary-red)
+![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
 </div>
 
@@ -23,13 +23,13 @@
 
 ## 📖 What is this?
 
-`portcullis` is the **data-plane enforcement arm** of the WiFi Hub ad-gated public WiFi system. It runs locally on each WinMart+ store's **Teltonika RUTM11** router (~10,000 stores, 1 router : 1 store) and does exactly one job well: hold the internet gate shut until the control plane says open, then enforce / meter / expire that grant.
+`portcullis` is the **data-plane enforcement arm** of an ad-gated public-WiFi captive portal. It runs locally on each site's OpenWrt router (built for the **Teltonika RUTM11** / RutOS) — one router per site, scaling to thousands of independent sites — and does exactly one job well: hold the internet gate shut until the control plane says open, then enforce / meter / expire that grant.
 
-It is the mechanism behind **ad slot C** (the video gate): the moment the gate completes, the Go control plane calls `GrantSession`, and `portcullis` opens the path.
+It is the mechanism behind a **video-gate ad slot**: the moment the gate completes, the control plane calls `GrantSession`, and `portcullis` opens the path.
 
 > 🧭 It is **not** a NAS, **not** an ad renderer, **not** a business-logic owner — see [Boundaries](#-boundaries-what-it-deliberately-does-not-do).
 
-The full technical design lives in [`portcullis-edge-engine-TDD.md`](./portcullis-edge-engine-TDD.md); per-area engineering notes are in [`.claude/skills/`](./.claude/skills/) and [`CLAUDE.md`](./CLAUDE.md).
+Design notes and the load-bearing invariants are summarized below and in [`CLAUDE.md`](./CLAUDE.md) and the per-area engineering notes in [`.claude/skills/`](./.claude/skills/).
 
 ---
 
@@ -37,7 +37,7 @@ The full technical design lives in [`portcullis-edge-engine-TDD.md`](./portculli
 
 ```mermaid
 flowchart LR
-  subgraph Store["🏬 WinMart+ store ×10,000  (1 router : 1 store)"]
+  subgraph Store["🏬 Site / venue  (1 router : 1 site, ×N)"]
     C["📱 Clients<br/>Public-Hub SSID"]
     subgraph R["📡 RUTM11 — RutOS 7.x / OpenWrt 21.02"]
       ENG["🏰 portcullis daemon"]
@@ -228,7 +228,7 @@ Sourced from UCI (`/etc/config/portcullis`) or TOML; loaded & validated at start
 
 | Option | Example | Hot-reload? |
 |---|---|---|
-| `store_id` | `WMP-0731` | restart |
+| `store_id` | `SITE-0042` | restart |
 | `control_endpoint` | `https://cp.wifihub.internal:8443` | restart |
 | `wg_interface` | `wg-hub` | restart |
 | `hmac_key_file` | `/etc/portcullis/hmac.key` | restart |
@@ -328,7 +328,12 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md). TL;DR: keep crates dependent only on
 
 ## 📄 License
 
-Proprietary — © AUPHAN. All rights reserved.
+Licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](./LICENSE-APACHE) · <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](./LICENSE-MIT) · <https://opensource.org/licenses/MIT>)
+
+at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.
 
 ## 🙏 References
 

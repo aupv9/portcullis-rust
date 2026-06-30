@@ -31,7 +31,7 @@ use portcullis_types::{Error, Result};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Stable store identity, e.g. `WMP-0731`. Signed into the redirect HMAC.
+    /// Stable store identity, e.g. `SITE-0042`. Signed into the redirect HMAC.
     pub store_id: String,
 
     /// gRPC control-plane endpoint, reached over the WireGuard overlay.
@@ -366,7 +366,7 @@ mod tests {
     /// The exact §9 UCI example.
     const UCI_EXAMPLE: &str = r#"
 config portcullis 'main'
-    option store_id           'WMP-0731'
+    option store_id           'SITE-0042'
     option control_endpoint   'https://cp.wifihub.internal:8443'   # over WG overlay
     option wg_interface       'wg-hub'
     option hmac_key_file      '/etc/portcullis/hmac.key'
@@ -384,7 +384,7 @@ config portcullis 'main'
     #[test]
     fn parses_exact_uci_example() {
         let cfg = Config::from_uci_str(UCI_EXAMPLE).unwrap();
-        assert_eq!(cfg.store_id, "WMP-0731");
+        assert_eq!(cfg.store_id, "SITE-0042");
         assert_eq!(cfg.control_endpoint, "https://cp.wifihub.internal:8443");
         assert_eq!(cfg.wg_interface, "wg-hub");
         assert_eq!(cfg.hmac_key_file, "/etc/portcullis/hmac.key");
@@ -441,7 +441,7 @@ config portcullis 'main'
     #[test]
     fn toml_roundtrip_equals_original() {
         let original = Config {
-            store_id: "WMP-0731".to_string(),
+            store_id: "SITE-0042".to_string(),
             control_endpoint: "https://cp.wifihub.internal:8443".to_string(),
             wg_interface: "wg-hub".to_string(),
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
@@ -537,7 +537,7 @@ config portcullis 'main'
         let dir = std::env::temp_dir();
         let path = dir.join(format!("portcullis-config-test-{}.toml", std::process::id()));
         let cfg = Config {
-            store_id: "WMP-0731".to_string(),
+            store_id: "SITE-0042".to_string(),
             ..Config::default()
         };
         std::fs::write(&path, cfg.to_toml_string().unwrap()).unwrap();

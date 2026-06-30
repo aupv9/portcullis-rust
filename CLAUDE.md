@@ -2,13 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current state: design-only
+## Current state: implemented
 
-This repo currently contains **only the technical design doc** (`portcullis-edge-engine-TDD.md`) — no `Cargo.toml`, no crates, no commits yet. The TDD is the source of truth; read it before writing any code. The crate layout, proto contract, and commands below are the *target* described in the TDD (§6), not yet-existing files. When you scaffold the workspace, follow that layout exactly so the design's invariants survive.
+The full Cargo workspace is implemented and tested (9 crates; host build/tests + clippy green). The architecture below is real, not aspirational. Section references like `(§7.4)` point at the internal design doc, which is kept **out of this repo** (local-only); the README plus these notes are the public source of truth. (The "planned commands" / "workspace does not exist yet" phrasing further down predates the implementation — treat the workspace as present.)
 
 ## What `portcullis` is
 
-The **data-plane enforcement arm** of the WiFi Hub captive portal — a single Tokio daemon running on each WinMart+ store's Teltonika RUTM11 router (~10,000 instances, 1 router : 1 store). Its one job: **no client reaches the internet until the central control plane explicitly grants a session**, then enforce/meter/expire that grant.
+The **data-plane enforcement arm** of an ad-gated public-WiFi captive portal — a single Tokio daemon running on each site's OpenWrt router (built for the Teltonika RUTM11; one router per site, scaling to thousands of sites). Its one job: **no client reaches the internet until the central control plane explicitly grants a session**, then enforce/meter/expire that grant.
 
 It is **not** a NAS, not an ad renderer, not a business-logic owner. Hard boundaries (do not blur these):
 - **RADIUS** is spoken only by the Go control plane. `portcullis` never speaks RADIUS — it emits `SessionEvent`s; the control plane translates them to RADIUS Accounting.

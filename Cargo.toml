@@ -16,8 +16,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.96"
-license = "Proprietary"
-authors = ["AUPHAN — New Era <au.pv@newera.inc>"]
+license = "MIT OR Apache-2.0"
+authors = ["The portcullis authors"]
+repository = "https://github.com/aupv9/portcullis-rust"
 
 [workspace.dependencies]
 # internal

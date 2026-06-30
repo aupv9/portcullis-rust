@@ -6,7 +6,7 @@
 # Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port.
 
 config portcullis 'main'
-	option store_id            'WMP-0000'
+	option store_id            'SITE-0000'
 	option control_endpoint    'https://cp.wifihub.internal:8443'
 	option wg_interface        'wg-hub'
 	option hmac_key_file       '/etc/portcullis/hmac.key'

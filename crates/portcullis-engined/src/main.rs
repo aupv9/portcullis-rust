@@ -119,7 +119,7 @@ mod tests {
         let mut rx = w.event_tx.subscribe();
 
         let params = portcullis_types::GrantParams {
-            store_id: "WMP-0731".into(),
+            store_id: "SITE-0042".into(),
             mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
             ip: None,
             ttl: Duration::from_secs(1800),

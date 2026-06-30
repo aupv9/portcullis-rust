@@ -48,7 +48,7 @@ use portcullis_types::{
 
 /// Upper bound on concurrently-tracked sessions held in RAM.
 ///
-/// One RUTM11 serves a single WinMart+ store; realistic concurrent client counts
+/// One RUTM11 serves a single site/venue; realistic concurrent client counts
 /// are in the low hundreds. The cap is a defensive ceiling against a runaway
 /// control plane or a memory-exhaustion attack via the grant path — each
 /// [`Session`] is a handful of words, so 4096 is roughly a few hundred KB,
