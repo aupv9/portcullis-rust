@@ -95,11 +95,6 @@ jobs:
             --target ${{ matrix.triple }} \
             -p portcullis-engined
 
-      - name: Install opkg-utils (git — not in Ubuntu apt)
-        run: |
-          git clone --depth=1 https://git.yoctoproject.org/opkg-utils /tmp/opkg-utils
-          echo "/tmp/opkg-utils" >> "$GITHUB_PATH"
-
       - name: Package .ipk
         run: |
           deploy/ci/pack-ipk.sh \
@@ -127,11 +122,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - name: Install opkg-utils (git — not in Ubuntu apt)
-        run: |
-          git clone --depth=1 https://git.yoctoproject.org/opkg-utils /tmp/opkg-utils
-          echo "/tmp/opkg-utils" >> "$GITHUB_PATH"
-
       - uses: actions/download-artifact@v4
         with:
           path: dl
@@ -145,7 +135,20 @@ jobs:
             arch="${d#dl/ipk-}"
             mkdir -p "public/$arch"
             cp "$d"/*.ipk "public/$arch/"
-            ( cd "public/$arch" && opkg-make-index . > Packages && gzip -9kf Packages )
+            ( cd "public/$arch"
+              : > Packages
+              for ipk in *.ipk; do
+                tmp="$(mktemp -d)"
+                ar p "$ipk" control.tar.gz | tar xzf - -C "$tmp" ./control
+                cat "$tmp/control" >> Packages
+                echo "Filename: $ipk" >> Packages
+                echo "Size: $(stat -c%s "$ipk")" >> Packages
+                echo "SHA256sum: $(sha256sum "$ipk" | cut -d' ' -f1)" >> Packages
+                echo "MD5Sum: $(md5sum "$ipk" | cut -d' ' -f1)" >> Packages
+                echo >> Packages
+                rm -rf "$tmp"
+              done
+              gzip -9kf Packages )
             echo "<li>$arch: <code>src/gz portcullis https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/$arch</code></li>" >> public/index.html
           done
           echo "</ul>" >> public/index.html
