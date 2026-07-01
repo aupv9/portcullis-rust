@@ -173,24 +173,33 @@ impl<N: NeighResolver> CounterSource for ConntrackSource<N> {
         let raw = self.reader.dump().await?;
         let per_ip = parse_conntrack(&raw);
 
+        // Resolve every source IP to its MAC in ONE neighbour-table dump rather
+        // than one `ip neigh` fork/exec per client (embedded-perf, TDD §14): the
+        // production resolver overrides `resolve_many` to spawn a single process
+        // per tick regardless of client count. IPs with no neighbour entry are
+        // omitted (never fabricate a MAC); a whole-batch failure skips the tick.
+        // (A dump failure now drops *all* clients' bytes for that one tick rather
+        // than one flow, but conntrack counters are absolute and re-based on the
+        // next good tick — see `delta()` — so nothing is permanently lost and the
+        // kernel set-element timeout remains the expiry backstop, §11.)
+        let ips: Vec<IpAddr> = per_ip.iter().map(|(ip, _)| *ip).collect();
+        let resolved: HashMap<IpAddr, MacAddr> =
+            self.neigh.resolve_many(&ips).await?.into_iter().collect();
+
         // At most one MAC per source IP, so size to the flow count up front to
         // avoid rehash churn on the 15 s tick.
         let mut by_mac: HashMap<MacAddr, Counters> = HashMap::with_capacity(per_ip.len());
         for (ip, counters) in per_ip {
-            match self.neigh.resolve(ip).await {
-                Ok(Some(mac)) => {
+            match resolved.get(&ip) {
+                Some(&mac) => {
                     let e = by_mac.entry(mac).or_default();
                     e.bytes_in = e.bytes_in.saturating_add(counters.bytes_in);
                     e.bytes_out = e.bytes_out.saturating_add(counters.bytes_out);
                 }
-                Ok(None) => {
+                None => {
                     // No neighbour entry: client gone / not L2-local. Drop it —
                     // do not fabricate a MAC.
                     tracing::debug!(%ip, "conntrack flow has no neighbour entry; dropping");
-                }
-                Err(e) => {
-                    // A single resolve failure must not sink the whole tick.
-                    tracing::warn!(%ip, error = %e, "neighbour resolve failed; dropping flow");
                 }
             }
         }

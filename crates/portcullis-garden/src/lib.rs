@@ -147,11 +147,12 @@ pub async fn reconcile(path: impl AsRef<Path>, cfg: &GardenConfig) -> Result<boo
     let desired = render_dnsmasq(cfg);
 
     // Compare against current contents. A missing file is "different" -> write.
-    // `std::fs` is used (not `tokio::fs`) because the garden config is a tiny
-    // text file reconciled at most every few seconds; the blocking cost is
-    // negligible and it keeps the dependency surface minimal on MIPS. It is
-    // fully cross-platform, so host (aarch64-apple-darwin) tests run unchanged.
-    match std::fs::read_to_string(path) {
+    // `tokio::fs` (not `std::fs`): this runs on every `run_garden_loop` tick,
+    // and the daemon uses a single-threaded runtime (embedded-perf, TDD §14), so
+    // a blocking read/write here would stall *every* other task — the redirect
+    // responder and gRPC grant path included. `tokio::fs` offloads to the
+    // blocking pool instead. It stays fully cross-platform for host tests.
+    match tokio::fs::read_to_string(path).await {
         Ok(current) if current == desired => return Ok(false),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -165,12 +166,14 @@ pub async fn reconcile(path: impl AsRef<Path>, cfg: &GardenConfig) -> Result<boo
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| Error::Io(format!("creating dir {}: {e}", parent.display())))?;
         }
     }
 
-    std::fs::write(path, desired.as_bytes())
+    tokio::fs::write(path, desired.as_bytes())
+        .await
         .map_err(|e| Error::Io(format!("writing garden config {}: {e}", path.display())))?;
 
     Ok(true)

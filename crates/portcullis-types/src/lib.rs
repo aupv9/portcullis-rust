@@ -349,6 +349,34 @@ pub trait EventSink: Send + Sync {
 #[async_trait]
 pub trait NeighResolver: Send + Sync {
     async fn resolve(&self, ip: IpAddr) -> Result<Option<MacAddr>>;
+
+    /// Resolve a batch of IPs to MACs in **one** shot (embedded-perf, TDD §14).
+    ///
+    /// The accounting loop resolves every conntrack source IP each tick; doing
+    /// that one `resolve` at a time makes an adapter that forks a process (the
+    /// production `ip neigh` resolver) spawn one child *per client per tick* —
+    /// O(n) fork/exec on the 15 s cadence. Adapters backed by a process or
+    /// socket SHOULD override this to dump the whole neighbour table once and
+    /// serve all lookups from it, turning that into O(1) per tick.
+    ///
+    /// Contract: IPs with no neighbour entry are simply **omitted** from the
+    /// result (the caller treats a missing IP as "no MAC"); a transient per-IP
+    /// failure is likewise dropped rather than sinking the whole batch. An
+    /// error is returned only for a whole-batch failure (e.g. the dump command
+    /// itself failed), so the caller can skip the tick and fall back to the
+    /// kernel set-element timeout (§11, never fail open).
+    ///
+    /// The default implementation calls [`resolve`](Self::resolve) per IP; it is
+    /// correct but not batched — override it where the per-lookup cost matters.
+    async fn resolve_many(&self, ips: &[IpAddr]) -> Result<Vec<(IpAddr, MacAddr)>> {
+        let mut out = Vec::with_capacity(ips.len());
+        for &ip in ips {
+            if let Ok(Some(mac)) = self.resolve(ip).await {
+                out.push((ip, mac));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Snapshot of per-client byte counters from conntrack (TDD §7.6). Implemented
