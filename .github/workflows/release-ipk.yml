@@ -38,23 +38,28 @@ jobs:
   build:
     needs: meta
     runs-on: ubuntu-latest
-    env:
-      # Strip symbols from the final binary at link time (zig provides no target
-      # strip; this keeps the .ipk small without an external strip step).
-      RUSTFLAGS: "-C strip=symbols"
     strategy:
       fail-fast: false
       matrix:
         include:
-          # RUTM (MediaTek MT7621, ramips/mt7621) — the RUTM11.
+          # RUTM (MediaTek MT7621, ramips/mt7621) — the RUTM11. OpenWrt mips is
+          # soft-float and the Rust target is soft-float, but zig links mips
+          # hard/double-float by default → force soft-float at link (`-msoft-float`)
+          # or ld.lld rejects the float-ABI mismatch.
           - arch: mipsel_24kc
             triple: mipsel-unknown-linux-musl
-          # RUT9xx / RUT2xx (Atheros ath79, big-endian MIPS).
+            rustflags: "-C strip=symbols -C link-arg=-msoft-float"
+          # RUT9xx / RUT2xx (Atheros ath79, big-endian MIPS). Same soft-float fix.
           - arch: mips_24kc
             triple: mips-unknown-linux-musl
-          # RUTX (Qualcomm IPQ40xx, ARMv7 cortex-a7).
+            rustflags: "-C strip=symbols -C link-arg=-msoft-float"
+          # RUTX (Qualcomm IPQ40xx, ARMv7 cortex-a7). Hard-float (eabihf) matches
+          # zig, but Rust's self-contained CRT passes crtend.o/crtn.o that zig
+          # doesn't ship under those names → let zig own the CRT
+          # (`link-self-contained=no`).
           - arch: arm_cortex-a7_neon-vfpv4
             triple: armv7-unknown-linux-musleabihf
+            rustflags: "-C strip=symbols -C link-self-contained=no"
     steps:
       - uses: actions/checkout@v4
 
@@ -81,6 +86,8 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Cross-build the engine
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           cargo +nightly zigbuild --release --locked \
             -Z build-std=std,panic_abort \
