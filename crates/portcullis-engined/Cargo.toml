@@ -21,6 +21,7 @@ portcullis-garden.workspace = true
 portcullis-accounting.workspace = true
 portcullis-control.workspace = true
 tonic = { workspace = true, features = ["tls"] }
+axum.workspace = true
 tokio = { workspace = true }
 async-trait.workspace = true
 tracing.workspace = true

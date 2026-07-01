@@ -33,18 +33,23 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
 use portcullis_types::{
     AuthElement, Counters, Enforcer, Error, EventKind, EventSink, GrantParams, HealthStatus,
-    MacAddr, MeteringSink, Result, RevokeReason, RulesetWriter, SessionEvent, SessionId,
-    SessionInfo, Tier,
+    MacAddr, Metric, MeteringSink, MetricsSink, NoopMetrics, ReconcileReport, Result, RevokeReason,
+    RulesetWriter, SessionEvent, SessionId, SessionInfo, Tier, UnknownKernelPolicy,
 };
+
+/// Minimum remaining TTL for the reconciler to bother re-adding a kernel-missing
+/// element (TDD §7.8). Below this the session is expiring imminently — let the
+/// daemon expiry sweep handle it rather than racing a re-add against removal.
+const RECONCILE_MIN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Upper bound on concurrently-tracked sessions held in RAM.
 ///
@@ -130,6 +135,11 @@ pub struct SessionManager {
     /// `kernel_table_present`, the control task sets `cp_connected`). Defaults to
     /// `backend_ok = true`; the rest default to `false`.
     health: Mutex<HealthStatus>,
+    /// Metrics recorder (TDD §12). Defaults to [`NoopMetrics`]; the composition
+    /// root installs the real atomic-backed recorder via [`set_metrics`]. Held
+    /// behind a mutex because it is set once at startup and read cheaply
+    /// thereafter (an `Arc` clone), avoiding a hard dependency in `new`.
+    metrics: Mutex<Arc<dyn MetricsSink>>,
 }
 
 impl SessionManager {
@@ -145,12 +155,37 @@ impl SessionManager {
                 cp_connected: false,
                 last_reconcile_ok: false,
             }),
+            metrics: Mutex::new(Arc::new(NoopMetrics)),
         }
+    }
+
+    /// Install the metrics recorder (composition root, once at startup).
+    pub fn set_metrics(&self, metrics: Arc<dyn MetricsSink>) {
+        *self.metrics.lock().expect("metrics mutex poisoned") = metrics;
+    }
+
+    /// Clone the current metrics handle (cheap `Arc` clone).
+    fn metrics(&self) -> Arc<dyn MetricsSink> {
+        self.metrics.lock().expect("metrics mutex poisoned").clone()
     }
 
     /// Overwrite the health snapshot the integrator reports over gRPC.
     pub fn set_health(&self, status: HealthStatus) {
         *self.health.lock().expect("health mutex poisoned") = status;
+    }
+
+    /// Set the reconcile-derived health flags (`last_reconcile_ok`,
+    /// `kernel_table_present`) without disturbing the others (TDD §12).
+    pub fn mark_reconcile(&self, ok: bool, table_present: bool) {
+        let mut h = self.health.lock().expect("health mutex poisoned");
+        h.last_reconcile_ok = ok;
+        h.kernel_table_present = table_present;
+    }
+
+    /// Set the `cp_connected` health flag (flipped by the control-plane liveness
+    /// poll in the composition root — a live `StreamEvents` subscriber, TDD §12).
+    pub fn set_cp_connected(&self, connected: bool) {
+        self.health.lock().expect("health mutex poisoned").cp_connected = connected;
     }
 
     /// Number of sessions currently tracked in RAM (test/observability helper).
@@ -236,6 +271,7 @@ impl SessionManager {
                 0,
             ))
             .await;
+        self.metrics().incr(Metric::Grant);
 
         Ok(session_id)
     }
@@ -270,6 +306,10 @@ impl SessionManager {
                 session.bytes_out,
             ))
             .await;
+        self.metrics().incr(match reason {
+            RevokeReason::Quota => Metric::QuotaExceeded,
+            RevokeReason::Admin | RevokeReason::MacChange => Metric::Revoke,
+        });
 
         Ok(())
     }
@@ -291,6 +331,7 @@ impl SessionManager {
                 .collect()
         };
 
+        let metrics = self.metrics();
         for session in &expired {
             if let Err(e) = self.writer.del_auth(session.mac).await {
                 tracing::warn!(mac = %session.mac, error = %e, "del_auth failed during expiry tick");
@@ -304,6 +345,7 @@ impl SessionManager {
                     session.bytes_out,
                 ))
                 .await;
+            metrics.incr(Metric::Expire);
         }
 
         expired.len()
@@ -386,26 +428,128 @@ impl SessionManager {
                 );
                 continue;
             }
-            let session = Session {
-                session_id: SessionId::from(format!("adopted:{}", el.mac)),
-                mac: el.mac,
-                ip: None,
-                tier: Tier::default(),
-                granted_at: now,
-                expires_at: now + el.remaining,
-                quota_bytes: 0,
-                rate_bps: 0,
-                bytes_in: 0,
-                bytes_out: 0,
-                baseline_in: None,
-                baseline_out: None,
-                granted_at_unix,
-            };
+            let session = Self::synth_session(el.mac, el.remaining, now, granted_at_unix);
             if map.insert(el.mac, session).is_none() {
                 adopted += 1;
             }
         }
         adopted
+    }
+
+    /// Build a synthetic (adopted) session for a kernel `auth` element whose
+    /// control-plane metadata we don't have. Shared by [`adopt`](Self::adopt) and
+    /// the reconciler's Adopt branch. No quota (0 = unlimited) and a placeholder
+    /// `adopted:<mac>` id — the control plane re-issues a real grant to restore
+    /// quota/tier; until then the kernel timeout bounds it.
+    fn synth_session(mac: MacAddr, remaining: Duration, now: Instant, granted_at_unix: i64) -> Session {
+        Session {
+            session_id: SessionId::from(format!("adopted:{mac}")),
+            mac,
+            ip: None,
+            tier: Tier::default(),
+            granted_at: now,
+            expires_at: now + remaining,
+            quota_bytes: 0,
+            rate_bps: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            baseline_in: None,
+            baseline_out: None,
+            granted_at_unix,
+        }
+    }
+
+    /// Periodic drift reconciliation against the kernel `auth` set (TDD §7.8).
+    ///
+    /// Diff/repair rules (chosen to NOT fight the kernel-timeout expiry backstop):
+    /// - **in RAM, missing from kernel** → the kernel dropped an element the daemon
+    ///   still believes active: re-add with the session's *remaining* TTL, but only
+    ///   if that remaining exceeds [`RECONCILE_MIN_TTL`] (else it is expiring this
+    ///   instant — leave it to `tick_expiry`).
+    /// - **in kernel, unknown to RAM** → `Adopt` (default; never drop an authorized
+    ///   client, and a just-granted element whose in-RAM insert hasn't committed is
+    ///   preserved) or `Delete` (strict desired-state, opt-in).
+    /// - **in both** → no-op (crucially, we do NOT refresh the timeout — that would
+    ///   defeat kernel expiry).
+    ///
+    /// The plan is computed under a single `sessions` lock; writer ops run after the
+    /// lock is released. Writer errors are tallied, never fatal, never fail open.
+    pub async fn reconcile_at(
+        &self,
+        kernel: Vec<AuthElement>,
+        policy: UnknownKernelPolicy,
+        now: Instant,
+    ) -> ReconcileReport {
+        let mut report = ReconcileReport { kernel_count: kernel.len(), ..Default::default() };
+        let kernel_macs: HashSet<MacAddr> = kernel.iter().map(|e| e.mac).collect();
+
+        let mut to_readd: Vec<(MacAddr, Duration)> = Vec::new();
+        let mut to_delete: Vec<MacAddr> = Vec::new();
+
+        // Build the repair plan under a single lock; execute writer ops after.
+        {
+            let mut map = self.sessions.lock().expect("sessions mutex poisoned");
+            report.ram_count = map.len();
+
+            // RAM-believed-active but kernel-dropped → schedule re-add (unless it
+            // is expiring imminently, in which case leave it to tick_expiry).
+            for (mac, s) in map.iter() {
+                if !kernel_macs.contains(mac) {
+                    let remaining = s.expires_at.saturating_duration_since(now);
+                    if remaining > RECONCILE_MIN_TTL {
+                        to_readd.push((*mac, remaining));
+                    }
+                }
+            }
+
+            // Kernel elements unknown to RAM → adopt (default) or delete.
+            let unknown_els: Vec<AuthElement> =
+                kernel.iter().copied().filter(|e| !map.contains_key(&e.mac)).collect();
+            match policy {
+                UnknownKernelPolicy::Adopt => {
+                    let granted_at_unix = now_unix();
+                    for el in &unknown_els {
+                        if !map.contains_key(&el.mac) && map.len() >= MAX_SESSIONS {
+                            continue;
+                        }
+                        let s = Self::synth_session(el.mac, el.remaining, now, granted_at_unix);
+                        if map.insert(el.mac, s).is_none() {
+                            report.adopted += 1;
+                        }
+                    }
+                }
+                UnknownKernelPolicy::Delete => {
+                    to_delete = unknown_els.iter().map(|e| e.mac).collect();
+                }
+            }
+        }
+
+        // Execute writer mutations outside the lock (writer calls await + retry).
+        for (mac, remaining) in to_readd {
+            match self.writer.add_auth(mac, remaining).await {
+                Ok(()) => report.readded += 1,
+                Err(e) => {
+                    report.errors += 1;
+                    tracing::warn!(mac = %mac, error = %e, "reconcile re-add failed");
+                }
+            }
+        }
+        for mac in to_delete {
+            match self.writer.del_auth(mac).await {
+                Ok(()) => report.deleted += 1,
+                Err(e) => {
+                    report.errors += 1;
+                    tracing::warn!(mac = %mac, error = %e, "reconcile delete failed");
+                }
+            }
+        }
+
+        let metrics = self.metrics();
+        metrics.incr(Metric::Reconcile);
+        if report.repaired() {
+            metrics.incr(Metric::ReconcileRepair);
+        }
+        report
     }
 }
 
@@ -832,5 +976,125 @@ mod tests {
         let h = m.health().await;
         assert!(h.cp_connected);
         assert!(h.kernel_table_present);
+    }
+
+    #[tokio::test]
+    async fn mark_reconcile_and_cp_connected_set_individual_flags() {
+        let (m, _w, _s) = mgr();
+        m.mark_reconcile(true, true);
+        m.set_cp_connected(true);
+        let h = m.health().await;
+        assert!(h.backend_ok && h.last_reconcile_ok && h.kernel_table_present && h.cp_connected);
+
+        // mark_reconcile must not clobber cp_connected.
+        m.mark_reconcile(false, false);
+        let h = m.health().await;
+        assert!(!h.last_reconcile_ok && !h.kernel_table_present);
+        assert!(h.cp_connected, "cp_connected must be untouched by mark_reconcile");
+    }
+
+    fn auth_el(m: MacAddr, secs: u64) -> AuthElement {
+        AuthElement { mac: m, remaining: Duration::from_secs(secs) }
+    }
+
+    #[tokio::test]
+    async fn reconcile_readds_mac_missing_from_kernel() {
+        let (m, writer, _s) = mgr();
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(1), 60, 0), now).await.unwrap();
+
+        // Kernel lost the element → reconcile must re-add it with remaining TTL.
+        let report = m.reconcile_at(vec![], UnknownKernelPolicy::Adopt, now).await;
+        assert_eq!(report.readded, 1);
+        assert_eq!(report.adopted, 0);
+        assert!(report.ok() && report.repaired());
+
+        let adds = writer
+            .ops()
+            .into_iter()
+            .filter(|o| matches!(o, WriterOp::AddAuth(x, _) if *x == mac(1)))
+            .count();
+        assert_eq!(adds, 2, "one AddAuth from grant + one from reconcile re-add");
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_readd_when_ttl_below_floor() {
+        let (m, writer, _s) = mgr();
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(1), 10, 0), now).await.unwrap();
+
+        // 2s remaining (< RECONCILE_MIN_TTL) → let tick_expiry handle it, don't re-add.
+        let report = m
+            .reconcile_at(vec![], UnknownKernelPolicy::Adopt, now + Duration::from_secs(8))
+            .await;
+        assert_eq!(report.readded, 0);
+        let adds = writer
+            .ops()
+            .into_iter()
+            .filter(|o| matches!(o, WriterOp::AddAuth(x, _) if *x == mac(1)))
+            .count();
+        assert_eq!(adds, 1, "only the original grant's AddAuth; no reconcile re-add");
+    }
+
+    #[tokio::test]
+    async fn reconcile_adopts_unknown_kernel_mac() {
+        let (m, _writer, sink) = mgr();
+        let now = Instant::now();
+        let report = m
+            .reconcile_at(vec![auth_el(mac(9), 120)], UnknownKernelPolicy::Adopt, now)
+            .await;
+        assert_eq!(report.adopted, 1);
+        assert_eq!(m.len(), 1);
+        let info = m.get(mac(9)).await.unwrap().unwrap();
+        assert_eq!(info.session_id, SessionId::from(format!("adopted:{}", mac(9))));
+        assert!(sink.events().is_empty(), "adoption must NOT emit GRANTED");
+    }
+
+    #[tokio::test]
+    async fn reconcile_deletes_unknown_when_policy_delete() {
+        let (m, writer, _s) = mgr();
+        let now = Instant::now();
+        let report = m
+            .reconcile_at(vec![auth_el(mac(9), 120)], UnknownKernelPolicy::Delete, now)
+            .await;
+        assert_eq!(report.deleted, 1);
+        assert_eq!(m.len(), 0);
+        assert!(writer.ops().contains(&WriterOp::DelAuth(mac(9))));
+    }
+
+    #[tokio::test]
+    async fn reconcile_noops_when_in_sync() {
+        let (m, writer, _s) = mgr();
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(1), 60, 0), now).await.unwrap();
+
+        let report = m
+            .reconcile_at(vec![auth_el(mac(1), 60)], UnknownKernelPolicy::Adopt, now)
+            .await;
+        assert!(!report.repaired(), "in-sync set needs no repair");
+        assert_eq!(report.readded + report.adopted + report.deleted, 0);
+        // Crucially, no refresh AddAuth beyond the original grant (don't fight expiry).
+        let adds = writer
+            .ops()
+            .into_iter()
+            .filter(|o| matches!(o, WriterOp::AddAuth(x, _) if *x == mac(1)))
+            .count();
+        assert_eq!(adds, 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_report_flags_writer_errors() {
+        // Failing writer + a session present via adopt (adopt does not call the
+        // writer) → reconcile's re-add hits the failing add_auth.
+        let writer = Arc::new(MockWriter::failing());
+        let sink = Arc::new(CapturingSink::new());
+        let m = SessionManager::new(writer, sink);
+        let now = Instant::now();
+        m.adopt(vec![auth_el(mac(1), 60)], now);
+
+        let report = m.reconcile_at(vec![], UnknownKernelPolicy::Adopt, now).await;
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.readded, 0);
+        assert!(!report.ok());
     }
 }

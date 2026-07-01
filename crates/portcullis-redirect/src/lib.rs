@@ -35,7 +35,7 @@ pub mod sign;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use portcullis_types::{MacAddr, NeighResolver};
+use portcullis_types::{MacAddr, Metric, MetricsSink, NeighResolver};
 
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use resolver::{IpNeighResolver, MockNeighResolver};
@@ -151,6 +151,7 @@ struct AppState<R: NeighResolver + 'static> {
     cfg: RedirectConfig,
     resolver: R,
     limiter: RateLimiter,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
@@ -197,6 +198,9 @@ async fn handle<R: NeighResolver + 'static>(
     }
 
     let outcome = respond(&state.resolver, &state.cfg, src_ip, unix_now()).await;
+    if matches!(outcome, RedirectOutcome::Redirect { .. }) {
+        state.metrics.incr(Metric::DnatRedirect);
+    }
     into_response(outcome)
 }
 
@@ -217,6 +221,7 @@ fn build_router<R: NeighResolver + 'static>(state: Arc<AppState<R>>) -> Router {
 pub async fn serve<R: NeighResolver + 'static>(
     cfg: RedirectConfig,
     resolver: R,
+    metrics: Arc<dyn MetricsSink>,
 ) -> portcullis_types::Result<()> {
     use portcullis_types::Error;
 
@@ -225,6 +230,7 @@ pub async fn serve<R: NeighResolver + 'static>(
         cfg,
         resolver,
         limiter: RateLimiter::new(RateLimitConfig::default()),
+        metrics,
     });
     let app = build_router(state);
 
@@ -376,6 +382,7 @@ mod tests {
             cfg: cfg(),
             resolver: MockNeighResolver::new(),
             limiter: RateLimiter::new(RateLimitConfig::default()),
+            metrics: Arc::new(portcullis_types::NoopMetrics),
         });
         let _router = build_router(state);
     }
