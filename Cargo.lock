@@ -696,6 +696,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "indexmap 1.9.3",
  "portcullis-accounting",
  "portcullis-config",
  "portcullis-control",
