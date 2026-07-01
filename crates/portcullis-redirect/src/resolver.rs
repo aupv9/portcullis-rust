@@ -47,49 +47,46 @@ impl IpNeighResolver {
         Self { ip_bin: ip_bin.into() }
     }
 
-    /// Parse the output of `ip neigh show <ip>` and extract the `lladdr` MAC for
-    /// the given IP, if present and in a usable (`REACHABLE`/`STALE`/`DELAY`/
-    /// `PERMANENT`) state.
+    /// Parse a single `ip neigh` line into its `(ip, lladdr-mac)` pair, if the
+    /// entry is usable.
     ///
     /// Format of a line (fields after the IP are order-stable in iproute2):
     /// `192.168.1.10 dev br-lan lladdr aa:bb:cc:dd:ee:ff REACHABLE`
-    /// Entries with no `lladdr` (e.g. `FAILED`, `INCOMPLETE`) yield `None`.
+    /// Entries with no `lladdr` (e.g. `FAILED`, `INCOMPLETE`) or a garbage MAC
+    /// yield `None`.
     ///
-    /// Total: tolerates empty output, extra whitespace, missing fields, and
+    /// Total: tolerates empty lines, extra whitespace, missing fields, and
     /// garbage `lladdr` values (rejected by MAC parsing) without panicking.
-    fn parse_neigh_output(output: &str, want_ip: IpAddr) -> Option<MacAddr> {
-        for line in output.lines() {
-            let mut tokens = line.split_whitespace();
-            // First token is the neighbour IP.
-            let ip_tok = match tokens.next() {
-                Some(t) => t,
-                None => continue,
-            };
-            let line_ip: IpAddr = match ip_tok.parse() {
-                Ok(ip) => ip,
-                Err(_) => continue,
-            };
-            if line_ip != want_ip {
-                continue;
+    fn parse_neigh_line(line: &str) -> Option<(IpAddr, MacAddr)> {
+        let mut tokens = line.split_whitespace();
+        // First token is the neighbour IP.
+        let line_ip: IpAddr = tokens.next()?.parse().ok()?;
+        // Scan remaining tokens for `lladdr <mac>`.
+        while let Some(tok) = tokens.next() {
+            if tok == "lladdr" {
+                // Validate via the frozen MacAddr parser; reject junk.
+                return tokens.next()?.parse::<MacAddr>().ok().map(|mac| (line_ip, mac));
             }
-            // Scan remaining tokens for `lladdr <mac>`.
-            let mut rest = tokens;
-            while let Some(tok) = rest.next() {
-                if tok == "lladdr" {
-                    if let Some(mac_tok) = rest.next() {
-                        // Validate via the frozen MacAddr parser; reject junk.
-                        if let Ok(mac) = mac_tok.parse::<MacAddr>() {
-                            return Some(mac);
-                        }
-                    }
-                    // `lladdr` present but unparsable -> treat as no MAC.
-                    return None;
-                }
-            }
-            // Matched the IP but no lladdr field -> unresolved.
-            return None;
         }
         None
+    }
+
+    /// Parse the output of `ip neigh show <ip>` and extract the `lladdr` MAC for
+    /// the given IP, if present and usable.
+    fn parse_neigh_output(output: &str, want_ip: IpAddr) -> Option<MacAddr> {
+        output
+            .lines()
+            .filter_map(Self::parse_neigh_line)
+            .find(|(ip, _)| *ip == want_ip)
+            .map(|(_, mac)| mac)
+    }
+
+    /// Parse the output of a full `ip neigh show` (no IP filter) into every
+    /// usable `(ip, mac)` mapping. This is the batch path (see
+    /// [`resolve_many`](NeighResolver::resolve_many)) — a single kernel dump
+    /// serves all of a tick's lookups instead of one fork/exec per client.
+    fn parse_neigh_table(output: &str) -> Vec<(IpAddr, MacAddr)> {
+        output.lines().filter_map(Self::parse_neigh_line).collect()
     }
 }
 
@@ -116,6 +113,39 @@ impl NeighResolver for IpNeighResolver {
 
         let text = String::from_utf8_lossy(&out.stdout);
         Ok(Self::parse_neigh_output(&text, ip))
+    }
+
+    /// Batch resolve via a **single** full-table `ip neigh show` (no IP arg),
+    /// then filter to the requested IPs. This collapses the accounting loop's
+    /// per-client fork/exec into one process spawn per tick (embedded-perf, TDD
+    /// §14). An empty request needs no dump. A failed dump returns an error so
+    /// the caller skips the tick (the kernel timeout is the backstop, §11).
+    async fn resolve_many(&self, ips: &[IpAddr]) -> Result<Vec<(IpAddr, MacAddr)>> {
+        use std::collections::HashSet;
+        if ips.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let out = Command::new(&self.ip_bin)
+            .arg("neigh")
+            .arg("show")
+            .output()
+            .await
+            .map_err(|e| Error::NeighLookup(ips[0], e.to_string()))?;
+
+        if !out.status.success() {
+            return Err(Error::NeighLookup(
+                ips[0],
+                format!("ip neigh show exited with status {}", out.status),
+            ));
+        }
+
+        let text = String::from_utf8_lossy(&out.stdout);
+        let want: HashSet<IpAddr> = ips.iter().copied().collect();
+        Ok(Self::parse_neigh_table(&text)
+            .into_iter()
+            .filter(|(ip, _)| want.contains(ip))
+            .collect())
     }
 }
 
@@ -228,5 +258,59 @@ mod tests {
         let r = MockNeighResolver::new().with(ip("192.168.1.10"), mac);
         assert_eq!(r.resolve(ip("192.168.1.10")).await.unwrap(), Some(mac));
         assert_eq!(r.resolve(ip("192.168.1.99")).await.unwrap(), None);
+    }
+
+    #[test]
+    fn parse_neigh_table_collects_all_usable_entries() {
+        let out = "\
+10.0.0.1 dev eth0 lladdr 00:11:22:33:44:55 STALE
+192.168.1.10 dev br-lan lladdr aa:bb:cc:dd:ee:ff DELAY
+192.168.1.11 dev br-lan FAILED
+192.168.1.12 dev br-lan lladdr zz:zz:zz:zz:zz:zz REACHABLE
+fe80::1 dev br-lan lladdr 66:77:88:99:aa:bb REACHABLE
+";
+        let table: HashMap<IpAddr, MacAddr> = IpNeighResolver::parse_neigh_table(out).into_iter().collect();
+        // Two IPv4 + one IPv6 usable entry; FAILED (no lladdr) and the garbage
+        // MAC line are dropped.
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&ip("10.0.0.1")), Some(&"00:11:22:33:44:55".parse().unwrap()));
+        assert_eq!(table.get(&ip("192.168.1.10")), Some(&"aa:bb:cc:dd:ee:ff".parse().unwrap()));
+        assert_eq!(table.get(&ip("fe80::1")), Some(&"66:77:88:99:aa:bb".parse().unwrap()));
+        assert!(!table.contains_key(&ip("192.168.1.11")));
+        assert!(!table.contains_key(&ip("192.168.1.12")));
+    }
+
+    #[test]
+    fn parse_neigh_table_agrees_with_single_lookup() {
+        // The batch parser and the single-IP parser must never disagree on a MAC.
+        let out = "192.168.1.10 dev br-lan lladdr aa:bb:cc:dd:ee:ff REACHABLE\n";
+        let table: HashMap<IpAddr, MacAddr> = IpNeighResolver::parse_neigh_table(out).into_iter().collect();
+        assert_eq!(
+            table.get(&ip("192.168.1.10")).copied(),
+            IpNeighResolver::parse_neigh_output(out, ip("192.168.1.10")),
+        );
+    }
+
+    #[tokio::test]
+    async fn default_resolve_many_batches_over_resolve_and_omits_misses() {
+        // MockNeighResolver only implements `resolve`; the default `resolve_many`
+        // should fan out over it, returning only the resolvable IPs (misses are
+        // omitted, never fabricated).
+        let mac10: MacAddr = "aa:bb:cc:00:00:10".parse().unwrap();
+        let mac20: MacAddr = "aa:bb:cc:00:00:20".parse().unwrap();
+        let r = MockNeighResolver::new()
+            .with(ip("192.168.1.10"), mac10)
+            .with(ip("192.168.1.20"), mac20);
+
+        let got: HashMap<IpAddr, MacAddr> = r
+            .resolve_many(&[ip("192.168.1.10"), ip("192.168.1.20"), ip("10.9.9.9")])
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(got.len(), 2, "the unknown IP must be omitted, not fabricated");
+        assert_eq!(got.get(&ip("192.168.1.10")), Some(&mac10));
+        assert_eq!(got.get(&ip("192.168.1.20")), Some(&mac20));
     }
 }
