@@ -33,15 +33,16 @@ define Package/portcullis
   CATEGORY:=Network
   TITLE:=Per-store captive-portal edge enforcement engine
   URL:=https://github.com/aupv9/portcullis-rust
-  # Runtime deps: the nftables backend + dnsmasq nftset support (§5.2, §7.3).
-  DEPENDS:=+nftables +kmod-nft-core +kmod-nft-nat +dnsmasq-full
+  # Runtime deps: the ipset + iptables/ip6tables backend (stock RutOS has no
+  # nftables NAT support — TDD §17 option B) + dnsmasq ipset population (§7.3).
+  DEPENDS:=+ipset +iptables +ip6tables +iptables-mod-ipset +iptables-mod-nat-extra +dnsmasq-full
 endef
 
 define Package/portcullis/description
   portcullis holds the internet gate shut until the WiFi Hub control plane
-  authorizes a client, then enforces, meters, and expires that grant. Owns one
-  nftables table (inet wifihub); speaks gRPC/mTLS to the control plane over
-  WireGuard. RAM-only state; CAP_NET_ADMIN, non-root.
+  authorizes a client, then enforces, meters, and expires that grant. Owns its
+  own ipset sets + iptables chains (wifihub_*); speaks gRPC/mTLS to the control
+  plane over WireGuard. RAM-only state; CAP_NET_ADMIN, non-root.
 endef
 
 # Copy the workspace into the build dir (deploy/.. == repo root).

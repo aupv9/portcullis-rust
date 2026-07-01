@@ -21,9 +21,12 @@ const EXPIRY_TICK: Duration = Duration::from_secs(1);
 const GARDEN_TICK: Duration = Duration::from_secs(30);
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
-    // 1. nft backend + single-owner writer actor (§7.9). The only path to
+    // 1. Firewall backend + single-owner writer actor (§7.9). The only path to
     //    netfilter; every mutation is serialized through this actor.
-    let backend = Box::new(portcullis_nft::NftJsonBackend::default());
+    //    Stock RutOS has no nftables NAT chain support (CONFIG_NFT_NAT unset), so
+    //    the production backend is ipset + iptables/ip6tables (TDD §17 option B),
+    //    not NftJsonBackend. Both implement the same FirewallBackend seam.
+    let backend = Box::new(portcullis_nft::IpsetIptablesBackend::default());
     let (writer_handle, _writer_join) = portcullis_nft::spawn(backend);
     let writer: Arc<dyn RulesetWriter> = Arc::new(writer_handle);
 
