@@ -30,8 +30,11 @@ portcullis-redirect = { path = "crates/portcullis-redirect" }
 portcullis-garden = { path = "crates/portcullis-garden" }
 portcullis-accounting = { path = "crates/portcullis-accounting" }
 portcullis-control = { path = "crates/portcullis-control" }
-# async / runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util", "process"] }
+# async / runtime. `rt` (current-thread scheduler) — NOT `rt-multi-thread`: the
+# daemon is I/O-bound control/metering (the data plane is in the kernel), so the
+# engined binary runs a `current_thread` runtime. Dropping the multi-thread
+# scheduler trims the binary and worker-thread stacks (embedded-perf, TDD §14).
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "signal", "net", "io-util", "process", "fs"] }
 async-trait = "0.1"
 futures = "0.3"
 # error / log
@@ -51,9 +54,11 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
-# http (redirect responder)
+# http (redirect responder). axum pulls the hyper features it needs itself; we
+# deliberately do NOT pin `hyper = { features = ["full"] }` here — nothing in the
+# workspace uses hyper directly, and `full` would drag in the client + http2 +
+# extra machinery the responder never touches (embedded-perf, TDD §14).
 axum = "0.7"
-hyper = { version = "1", features = ["full"] }
 # grpc (control)
 tonic = "0.12"
 prost = "0.13"
