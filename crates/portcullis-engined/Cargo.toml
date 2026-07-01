@@ -20,7 +20,6 @@ portcullis-redirect.workspace = true
 portcullis-garden.workspace = true
 portcullis-accounting.workspace = true
 portcullis-control.workspace = true
-tonic = { workspace = true, features = ["tls"] }
 tokio = { workspace = true }
 async-trait.workspace = true
 tracing.workspace = true

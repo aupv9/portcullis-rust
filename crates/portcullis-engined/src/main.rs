@@ -28,8 +28,6 @@ mod compose;
 /// Default portal base for the signed redirect (§7.2). Overridable via the
 /// `PORTCULLIS_PORTAL_URL` env var; the UCI config (§9) doesn't carry it.
 const DEFAULT_PORTAL_URL: &str = "https://portal.wifihub.vn";
-/// Directory holding the mTLS material, provisioned per store at first boot (§13).
-const TLS_DIR: &str = "/etc/portcullis/tls";
 /// dnsmasq conf-dir file the garden reconciler owns (§7.3). tmpfs.
 const GARDEN_CONF_PATH: &str = "/tmp/dnsmasq.d/portcullis-garden.conf";
 
