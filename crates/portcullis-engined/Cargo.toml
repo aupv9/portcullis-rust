@@ -20,6 +20,12 @@ portcullis-redirect.workspace = true
 portcullis-garden.workspace = true
 portcullis-accounting.workspace = true
 portcullis-control.workspace = true
+# Under `-Z build-std` (required to cross-compile the tier-3 MIPS routers),
+# feature unification otherwise drops indexmap 1.x's `std` feature, which removes
+# the std-only `RandomState` default for its 3rd generic param — breaking
+# tower 0.4's `ready_cache` (`IndexMap<K,V>` → E0107). Force `std` on here so the
+# transitive indexmap keeps it. Not otherwise used by this binary.
+indexmap = { version = "1", features = ["std"] }
 tokio = { workspace = true }
 async-trait.workspace = true
 tracing.workspace = true
