@@ -58,9 +58,28 @@ pub struct Config {
     /// Default per-session rate limit in kbps (`0` == unlimited).
     pub default_rate_kbps: u64,
 
+    /// TCP port for the Prometheus `/metrics` endpoint, bound on the WG overlay
+    /// (TDD §12). `0` disables the endpoint. `#[serde(default)]` so existing
+    /// configs (which predate this field) still parse under `deny_unknown_fields`.
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+
+    /// Seconds between drift-reconciliation passes against the kernel `auth`
+    /// set (TDD §7.8). Defaulted for backward-compatible configs.
+    #[serde(default = "default_reconcile_interval")]
+    pub reconcile_interval: u64,
+
     /// Walled-garden FQDNs always reachable pre-auth (portal, CDN, OTP, pay).
     #[serde(default)]
     pub garden_fqdn: Vec<String>,
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+fn default_reconcile_interval() -> u64 {
+    60
 }
 
 impl Default for Config {
@@ -76,6 +95,8 @@ impl Default for Config {
             default_ttl: 1800,
             default_quota_mb: 0,
             default_rate_kbps: 2048,
+            metrics_port: default_metrics_port(),
+            reconcile_interval: default_reconcile_interval(),
             garden_fqdn: Vec::new(),
         }
     }
@@ -246,6 +267,8 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "default_ttl" => cfg.default_ttl = parse_u64(val)?,
         "default_quota_mb" => cfg.default_quota_mb = parse_u64(val)?,
         "default_rate_kbps" => cfg.default_rate_kbps = parse_u64(val)?,
+        "metrics_port" => cfg.metrics_port = parse_u16(val)?,
+        "reconcile_interval" => cfg.reconcile_interval = parse_u64(val)?,
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -450,6 +473,8 @@ config portcullis 'main'
             default_ttl: 1800,
             default_quota_mb: 0,
             default_rate_kbps: 2048,
+            metrics_port: 9090,
+            reconcile_interval: 60,
             garden_fqdn: vec![
                 "portal.wifihub.vn".to_string(),
                 "cdn.wifihub.vn".to_string(),

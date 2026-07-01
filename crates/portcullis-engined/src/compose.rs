@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portcullis_config::Config;
-use portcullis_types::{CounterSource, Enforcer, MeteringSink, RulesetWriter};
+use portcullis_types::{
+    CounterSource, Enforcer, Metric, MeteringSink, MetricsSink, RulesetWriter, UnknownKernelPolicy,
+};
 
+use crate::metrics::Metrics;
 use crate::{wire, DEFAULT_PORTAL_URL, GARDEN_CONF_PATH, TLS_DIR};
 
 /// How often the daemon-side expiry sweep runs. The kernel set-element timeout
@@ -19,12 +22,21 @@ use crate::{wire, DEFAULT_PORTAL_URL, GARDEN_CONF_PATH, TLS_DIR};
 const EXPIRY_TICK: Duration = Duration::from_secs(1);
 /// Walled-garden reconcile cadence.
 const GARDEN_TICK: Duration = Duration::from_secs(30);
+/// Control-plane liveness poll cadence (drives the `cp_connected` flag + the
+/// `cp_disconnects_total` metric).
+const CP_POLL_TICK: Duration = Duration::from_secs(10);
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
+    // 0. Metrics recorder (§12). Created first so it can be injected into the nft
+    //    writer actor (for nft_txn_errors), the session manager, and the redirect
+    //    responder before any of them start.
+    let metrics = Arc::new(Metrics::default());
+
     // 1. nft backend + single-owner writer actor (§7.9). The only path to
     //    netfilter; every mutation is serialized through this actor.
     let backend = Box::new(portcullis_nft::NftJsonBackend::default());
-    let (writer_handle, _writer_join) = portcullis_nft::spawn(backend);
+    let (writer_handle, _writer_join) =
+        portcullis_nft::spawn_with_metrics(backend, metrics.clone());
     let writer: Arc<dyn RulesetWriter> = Arc::new(writer_handle);
 
     // 1a. Idempotent bootstrap (create-if-missing, adopt-if-present, never
@@ -46,6 +58,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let w = wire(writer.clone());
     let adopted_n = w.mgr.adopt(adopted, Instant::now());
     tracing::info!(adopted = adopted_n, "restart adoption complete");
+    w.mgr.set_metrics(metrics.clone());
+    // ensure_base + adoption succeeded → the kernel table is present and the
+    // initial view is consistent; the periodic reconcile loop refreshes these.
+    w.mgr.mark_reconcile(true, true);
 
     let svc = portcullis_control::EnforcementService::from_parts(
         w.mgr.clone() as Arc<dyn Enforcer>,
@@ -93,9 +109,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     ) {
         Some(rcfg) => {
             let resolver = portcullis_redirect::IpNeighResolver::new();
+            let rmetrics = metrics.clone();
             tasks.push(tokio::spawn(async move {
                 tracing::info!(port = rcfg.listen_port, "redirect responder listening");
-                if let Err(e) = portcullis_redirect::serve(rcfg, resolver).await {
+                if let Err(e) = portcullis_redirect::serve(rcfg, resolver, rmetrics).await {
                     tracing::error!(error = %e, "redirect responder exited");
                 }
             }));
@@ -146,6 +163,75 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }));
     }
 
+    // 9b. Drift reconciliation (§7.8) + control-plane liveness poll (§12), folded
+    //     into one task to keep the task/stack count low (embedded-perf).
+    {
+        let mgr = w.mgr.clone();
+        let writer = writer.clone();
+        let sink = w.grpc_sink.clone();
+        let m = metrics.clone();
+        let reconcile_interval = Duration::from_secs(cfg.reconcile_interval.max(5));
+        tasks.push(tokio::spawn(async move {
+            let mut recon = tokio::time::interval(reconcile_interval);
+            recon.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut poll = tokio::time::interval(CP_POLL_TICK);
+            let mut cp_up = false;
+            loop {
+                tokio::select! {
+                    _ = recon.tick() => {
+                        match writer.list_auth().await {
+                            Ok(kernel) => {
+                                let report = mgr
+                                    .reconcile_at(kernel, UnknownKernelPolicy::default(), Instant::now())
+                                    .await;
+                                mgr.mark_reconcile(report.ok(), true);
+                                if report.repaired() || !report.ok() {
+                                    tracing::info!(
+                                        readded = report.readded,
+                                        adopted = report.adopted,
+                                        deleted = report.deleted,
+                                        errors = report.errors,
+                                        "reconcile pass repaired drift"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "reconcile: list_auth failed");
+                                mgr.mark_reconcile(false, false);
+                            }
+                        }
+                    }
+                    _ = poll.tick() => {
+                        // A live StreamEvents subscriber == the control plane is connected.
+                        let up = sink.subscriber_count() > 0;
+                        if up != cp_up {
+                            if !up {
+                                m.incr(Metric::CpDisconnect);
+                            }
+                            cp_up = up;
+                            mgr.set_cp_connected(up);
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // 9c. Prometheus /metrics endpoint (§12), bound on the WG address. Disabled
+    //     when metrics_port == 0.
+    if cfg.metrics_port != 0 {
+        let addr = metrics_listen_addr(&cfg);
+        let m = metrics.clone();
+        let mgr = w.mgr.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = crate::metrics::serve(addr, m, mgr).await {
+                tracing::error!(error = %e, "metrics endpoint exited");
+            }
+        }));
+    } else {
+        tracing::info!("metrics endpoint disabled (metrics_port = 0)");
+    }
+
     // 10. Block until SIGTERM (procd stop) or Ctrl-C, then shut down.
     wait_for_shutdown().await;
     tracing::info!("shutdown signal received; stopping tasks");
@@ -168,6 +254,13 @@ fn grpc_listen_addr(cfg: &Config) -> std::net::SocketAddr {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8443);
     std::net::SocketAddr::from(([0, 0, 0, 0], port))
+}
+
+/// Metrics endpoint listen address. Bound on all interfaces; in production the
+/// WG address is used so it is only reachable over the overlay (same trust
+/// boundary as gRPC, §12/§13).
+fn metrics_listen_addr(cfg: &Config) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([0, 0, 0, 0], cfg.metrics_port))
 }
 
 /// Load the engine's server identity + the control-plane client CA from
