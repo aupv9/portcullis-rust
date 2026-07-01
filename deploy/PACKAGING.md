@@ -224,16 +224,19 @@ install -d -m700 -o portcullis -g portcullis /etc/portcullis
 head -c32 /dev/urandom > /etc/portcullis/hmac.key
 chmod 600 /etc/portcullis/hmac.key && chown portcullis:portcullis /etc/portcullis/hmac.key
 
-# 7c. mTLS material for the gRPC control channel (provisioned, not generated here)
-install -d -m700 -o portcullis -g portcullis /etc/portcullis/tls
-#   place: server.crt  server.key  client-ca.crt   (all 0600, owned by portcullis)
-
-# 7d. WireGuard overlay (wg-hub) must be up so the control plane is reachable.
-#     dnsmasq-full must be the active resolver for the walled-garden nftset to work.
+# 7c. WireGuard overlay (wg-hub) must be up: the gRPC control server binds ONLY
+#     on the WG interface address, and WG peer auth + encryption is the
+#     authorization gate (§13). No app-layer mTLS material is needed.
+#     dnsmasq-full must be the active resolver for the walled-garden ipset to work.
 ```
 
-> Until the mTLS material is present the daemon **disables the control plane**
-> (no new grants) rather than serving an unauthenticated one — fail-closed.
+> The gRPC control server binds **only** on the WireGuard interface address. If
+> that interface has no address yet (WG down / not provisioned) the daemon
+> **disables the control plane** (no new grants) rather than exposing enforcement
+> on another interface — fail-closed. App-layer mTLS was dropped: rustls' only
+> pure-Rust crypto provider is alpha-grade and its C/asm providers (ring,
+> aws-lc-rs) don't build for MIPS; WireGuard is the sufficient gate for this
+> point-to-point link.
 
 ---
 

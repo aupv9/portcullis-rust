@@ -5,13 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "tonic gRPC server (Enforcement service) + mTLS over WireGuard; bridges proto <-> domain and fans events to the control plane (TDD §7.5, §13)."
+description = "tonic gRPC server (Enforcement service) over the WireGuard overlay; bridges proto <-> domain and fans events to the control plane (TDD §7.5, §13)."
 
 [dependencies]
 portcullis-types.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-tonic = { workspace = true, features = ["tls"] }
+tonic = { workspace = true }
 prost.workspace = true
 prost-types.workspace = true
 futures.workspace = true

@@ -11,7 +11,7 @@ use anyhow::Context;
 use portcullis_config::Config;
 use portcullis_types::{CounterSource, Enforcer, MeteringSink, RulesetWriter};
 
-use crate::{wire, DEFAULT_PORTAL_URL, GARDEN_CONF_PATH, TLS_DIR};
+use crate::{wire, DEFAULT_PORTAL_URL, GARDEN_CONF_PATH};
 
 /// How often the daemon-side expiry sweep runs. The kernel set-element timeout
 /// is the authoritative backstop (§7.4); this loop only emits the accounting
@@ -57,28 +57,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // 5. gRPC control server over mutual TLS (§13). Bind only on the WG overlay
-    //    address in production; here we bind the configured endpoint's port.
-    match load_tls() {
-        Ok(Some(tls)) => {
-            let addr = grpc_listen_addr(&cfg);
+    // 5. gRPC control server over the WireGuard overlay (§13). Bind ONLY on the
+    //    WG interface address — reachability over WG is the authorization gate
+    //    (WG gives mutual auth + encryption between the two peers). If the WG
+    //    interface has no address yet, fail closed: keep enforcing existing
+    //    sessions but do NOT expose enforcement on any other interface (§11).
+    match wg_bind_addr(&cfg) {
+        Some(addr) => {
             tasks.push(tokio::spawn(async move {
-                tracing::info!(%addr, "gRPC Enforcement server (mTLS) listening");
-                if let Err(e) = portcullis_control::serve(addr, svc, tls).await {
+                tracing::info!(%addr, "gRPC Enforcement server listening (WireGuard overlay)");
+                if let Err(e) = portcullis_control::serve(addr, svc).await {
                     tracing::error!(error = %e, "gRPC server exited");
                 }
             }));
         }
-        Ok(None) => {
-            // No cert material yet (pre-provisioning). Do NOT serve an
-            // unauthenticated control plane — fail closed: existing sessions
-            // keep being enforced, but no new grants are accepted (§11, §13).
+        None => {
             tracing::warn!(
-                dir = TLS_DIR,
-                "mTLS material absent; control plane disabled (no new grants)"
+                iface = %cfg.wg_interface,
+                "WireGuard interface has no address; control plane disabled (no new grants) — fail closed"
             );
         }
-        Err(e) => return Err(e).context("load mTLS material"),
     }
 
     // 6. :8080 redirect responder (§7.2). Reads the per-store HMAC key.
@@ -160,36 +158,41 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the gRPC listen address from the control endpoint's port (the host
-/// part is the WG interface address in production; we bind all interfaces and
-/// rely on mTLS + the WG network, §13).
-fn grpc_listen_addr(cfg: &Config) -> std::net::SocketAddr {
+/// Resolve the address to bind the gRPC control server on: the IPv4 address of
+/// the configured WireGuard interface, with the control endpoint's port.
+///
+/// Returns `None` if the interface has no IPv4 address yet (WG down / not
+/// provisioned) — the caller then fails closed and does not expose enforcement
+/// on any other interface (§13). Reads the address via `ip -o -4 addr show dev
+/// <iface>`, matching how the rest of the daemon shells to iproute2/nft/ipset.
+fn wg_bind_addr(cfg: &Config) -> Option<std::net::SocketAddr> {
     let port = cfg
         .control_endpoint
         .rsplit(':')
         .next()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8443);
-    std::net::SocketAddr::from(([0, 0, 0, 0], port))
-}
 
-/// Load the engine's server identity + the control-plane client CA from
-/// [`TLS_DIR`]. Returns `Ok(None)` if the material isn't present yet (the
-/// daemon then runs without the control plane rather than failing open).
-fn load_tls() -> anyhow::Result<Option<tonic::transport::ServerTlsConfig>> {
-    let dir = std::path::Path::new(TLS_DIR);
-    let cert_p = dir.join("server.crt");
-    let key_p = dir.join("server.key");
-    let ca_p = dir.join("client-ca.crt");
-    if !cert_p.exists() || !key_p.exists() || !ca_p.exists() {
-        return Ok(None);
+    let out = std::process::Command::new("ip")
+        .args(["-o", "-4", "addr", "show", "dev", &cfg.wg_interface])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    let cert = std::fs::read(&cert_p).context("read server.crt")?;
-    let key = std::fs::read(&key_p).context("read server.key")?;
-    let ca = std::fs::read(&ca_p).context("read client-ca.crt")?;
-    let tls = portcullis_control::tls_config(&cert, &key, &ca)
-        .map_err(|e| anyhow::anyhow!("build mTLS config: {e}"))?;
-    Ok(Some(tls))
+    // e.g. "12: wg-hub    inet 10.88.0.7/32 scope global wg-hub\..."
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut toks = text.split_whitespace();
+    while let Some(t) = toks.next() {
+        if t == "inet" {
+            let cidr = toks.next()?;
+            let ip = cidr.split('/').next()?;
+            if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
+                return Some(std::net::SocketAddr::from((addr, port)));
+            }
+        }
+    }
+    None
 }
 
 /// Wait for SIGTERM (procd stop) or Ctrl-C.

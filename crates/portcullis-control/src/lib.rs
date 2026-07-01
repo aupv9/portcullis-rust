@@ -10,13 +10,14 @@
 //!   with [`GrpcEventSink`] implementing `portcullis_types::EventSink` so
 //!   `portcullis-session` can emit into it (§11: bounded RAM, slow consumers
 //!   drop oldest, enforcement never blocks);
-//! - enforces **mutual TLS** ([`transport::tls_config`] / [`transport::serve`]):
-//!   the engine accepts grants only from a peer with a control-plane client
-//!   cert; WireGuard is defence in depth, not the only gate (§13).
+//! - serves over the **WireGuard overlay** ([`transport::serve`]): the server
+//!   binds only on the WG interface, and WireGuard's peer authentication +
+//!   encryption is the authorization gate (§13). See [`transport`] for why
+//!   app-layer mTLS was dropped (no MIPS-capable production crypto provider).
 //!
 //! The composition root (`portcullis-engined`) constructs the
 //! `(EnforcementService, GrpcEventSink)` pair, hands the sink to the session
-//! layer, and calls [`transport::serve`].
+//! layer, and calls [`transport::serve`] on the WireGuard address.
 
 #![forbid(unsafe_code)]
 
@@ -30,4 +31,4 @@ pub mod service;
 pub mod transport;
 
 pub use service::{EnforcementService, GrpcEventSink, DEFAULT_EVENT_BUFFER};
-pub use transport::{build_server, serve, tls_config};
+pub use transport::{build_server, serve};
