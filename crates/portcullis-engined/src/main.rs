@@ -33,7 +33,14 @@ const TLS_DIR: &str = "/etc/portcullis/tls";
 /// dnsmasq conf-dir file the garden reconciler owns (§7.3). tmpfs.
 const GARDEN_CONF_PATH: &str = "/tmp/dnsmasq.d/portcullis-garden.conf";
 
-#[tokio::main]
+// Single-threaded scheduler (embedded-perf, TDD §14): the data plane lives in
+// the kernel (nftables), so this daemon is purely control/metering — a handful
+// of long-lived, I/O-bound tasks (gRPC, redirect, accounting, garden, expiry)
+// with tiny per-store churn. On the 2-core RUTM11 a multi-thread runtime buys
+// nothing here but costs worker-thread stacks (RSS) and the multi-thread
+// scheduler code (binary). The current-thread flavour also lets the workspace
+// drop tokio's `rt-multi-thread` feature.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Global max level from RUST_LOG (default INFO). We deliberately avoid
     // `EnvFilter` (per-target, regex-backed) to keep ~290 KiB of regex engine
