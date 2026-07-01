@@ -8,7 +8,8 @@ name: release-ipk
 # only publishes the feed (no Release) so you can smoke-test.
 #
 # Add hardware by adding a matrix row: {arch = OpenWrt opkg arch, triple = Rust
-# target, cross = musl.cc toolchain prefix}.
+# target, rustflags = per-arch link flags}. Cross-linking is done by zig via
+# cargo-zigbuild; opkg-utils (git) packages the .ipk.
 
 on:
   push:
@@ -94,8 +95,10 @@ jobs:
             --target ${{ matrix.triple }} \
             -p portcullis-engined
 
-      - name: Install opkg-utils
-        run: sudo apt-get update && sudo apt-get install -y opkg-utils
+      - name: Install opkg-utils (git — not in Ubuntu apt)
+        run: |
+          git clone --depth=1 https://git.yoctoproject.org/opkg-utils /tmp/opkg-utils
+          echo "/tmp/opkg-utils" >> "$GITHUB_PATH"
 
       - name: Package .ipk
         run: |
@@ -124,8 +127,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - name: Install opkg-utils
-        run: sudo apt-get update && sudo apt-get install -y opkg-utils
+      - name: Install opkg-utils (git — not in Ubuntu apt)
+        run: |
+          git clone --depth=1 https://git.yoctoproject.org/opkg-utils /tmp/opkg-utils
+          echo "/tmp/opkg-utils" >> "$GITHUB_PATH"
 
       - uses: actions/download-artifact@v4
         with:
