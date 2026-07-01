@@ -263,6 +263,49 @@ pub struct HealthStatus {
     pub last_reconcile_ok: bool,
 }
 
+/// Policy for a MAC found in the kernel `auth` set but unknown to the daemon's
+/// in-RAM view during reconciliation (TDD §7.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UnknownKernelPolicy {
+    /// Adopt it (never drop an authorized client) — the safe default, matching
+    /// restart adoption. A grant that just landed in the kernel but whose in-RAM
+    /// insert has not yet committed is preserved.
+    #[default]
+    Adopt,
+    /// Delete it from the kernel (strict desired-state). Opt-in only.
+    Delete,
+}
+
+/// Outcome of one drift-reconciliation pass (TDD §7.8). Counts only — bounded,
+/// no per-MAC growth — so it is cheap to log and to feed a metric.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Elements present in the kernel `auth` set.
+    pub kernel_count: usize,
+    /// Sessions present in the daemon's in-RAM view.
+    pub ram_count: usize,
+    /// In RAM but missing from the kernel → re-added with the remaining TTL.
+    pub readded: usize,
+    /// In the kernel but unknown to RAM → adopted.
+    pub adopted: usize,
+    /// In the kernel but unknown to RAM → deleted (non-default policy).
+    pub deleted: usize,
+    /// Writer ops that failed during this pass.
+    pub errors: usize,
+}
+
+impl ReconcileReport {
+    /// A pass is "ok" when every attempted repair succeeded.
+    pub fn ok(&self) -> bool {
+        self.errors == 0
+    }
+
+    /// Whether the pass changed anything (repaired drift).
+    pub fn repaired(&self) -> bool {
+        self.readded + self.adopted + self.deleted > 0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -406,6 +449,47 @@ pub trait MeteringSink: Send + Sync {
     async fn apply_counters(&self, snapshot: Vec<(MacAddr, Counters)>) -> Result<()>;
 }
 
+/// A monotonically-increasing counter exported over the `/metrics` endpoint
+/// (TDD §12). Kept as a small fixed enum so the sink is a couple of atomics —
+/// no label maps, no per-metric heap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Metric {
+    Grant,
+    Revoke,
+    Expire,
+    QuotaExceeded,
+    NftTxnError,
+    DnatRedirect,
+    Reconcile,
+    ReconcileRepair,
+    CpDisconnect,
+}
+
+/// A point-in-time gauge exported over `/metrics` (TDD §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gauge {
+    ActiveSessions,
+}
+
+/// Port for recording metrics. Implemented by the concrete atomic-backed
+/// recorder in `portcullis-engined`; injected into the crates that have the
+/// increment sites (session, nft writer, redirect). Sync + cheap on purpose —
+/// an increment is one `AtomicU64::fetch_add`, never blocks the hot path.
+pub trait MetricsSink: Send + Sync {
+    fn incr(&self, metric: Metric);
+    fn set_gauge(&self, gauge: Gauge, value: u64);
+}
+
+/// No-op metrics sink — the default when metrics are disabled or in tests
+/// (mirrors the accounting `NoopShaper`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopMetrics;
+
+impl MetricsSink for NoopMetrics {
+    fn incr(&self, _metric: Metric) {}
+    fn set_gauge(&self, _gauge: Gauge, _value: u64) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +542,27 @@ mod tests {
     fn counters_total_saturates() {
         let c = Counters { bytes_in: u64::MAX, bytes_out: 10 };
         assert_eq!(c.total(), u64::MAX);
+    }
+
+    #[test]
+    fn reconcile_report_ok_and_repaired() {
+        let clean = ReconcileReport { kernel_count: 3, ram_count: 3, ..Default::default() };
+        assert!(clean.ok() && !clean.repaired());
+        let fixed = ReconcileReport { readded: 1, ..Default::default() };
+        assert!(fixed.ok() && fixed.repaired());
+        let bad = ReconcileReport { errors: 2, ..Default::default() };
+        assert!(!bad.ok());
+    }
+
+    #[test]
+    fn unknown_kernel_policy_defaults_to_adopt() {
+        assert_eq!(UnknownKernelPolicy::default(), UnknownKernelPolicy::Adopt);
+    }
+
+    #[test]
+    fn noop_metrics_is_a_noop() {
+        let m = NoopMetrics;
+        m.incr(Metric::Grant);
+        m.set_gauge(Gauge::ActiveSessions, 42);
     }
 }

@@ -30,11 +30,21 @@ use crate::pb;
 /// - `client_ip` is optional/informational: empty => `None`; a non-empty but
 ///   unparseable IP is rejected (it would otherwise be silently dropped).
 /// - `ttl_seconds` -> [`Duration`] (the nft set-element timeout).
-/// - `quota_bytes == 0` and `rate_bps == 0` both mean *unlimited* and are
-///   carried through verbatim (the domain layer interprets `0`).
+/// - `quota_bytes == 0` means *unlimited* and is carried through verbatim.
+/// - `rate_bps` MUST be `0` in Phase 1: bandwidth shaping (`tc`/HTB) is not yet
+///   enforced, so a non-zero value is **rejected** rather than silently ignored
+///   — the control plane must not believe a rate cap is in effect when it is not
+///   (TDD §7.7; the `tc` shaper stays as the Phase-2 seam in `portcullis-accounting`).
 pub fn grant_request_to_params(req: pb::GrantRequest) -> Result<GrantParams> {
     let mac = MacAddr::from_str(&req.client_mac)?;
     let tier = Tier::from_str(&req.tier)?;
+
+    if req.rate_bps != 0 {
+        return Err(Error::BadRequest(format!(
+            "rate_bps unsupported in Phase 1 (got {}); omit it or set 0",
+            req.rate_bps
+        )));
+    }
 
     let ip = parse_optional_ip(&req.client_ip)?;
 
@@ -206,6 +216,15 @@ mod tests {
         g.tier = "platinum".into();
         let err = grant_request_to_params(g).unwrap_err();
         assert!(matches!(err, Error::InvalidTier(_)));
+    }
+
+    #[test]
+    fn grant_request_rate_bps_rejected_phase1() {
+        // Non-zero rate must be rejected, not silently ignored (Phase-1 §7.7).
+        let mut g = sample_grant();
+        g.rate_bps = 2_000_000;
+        let err = grant_request_to_params(g).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
     }
 
     #[test]

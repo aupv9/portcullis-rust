@@ -24,6 +24,7 @@ use portcullis_config::Config;
 use portcullis_types::{EventSink, RulesetWriter};
 
 mod compose;
+mod metrics;
 
 /// Default portal base for the signed redirect (§7.2). Overridable via the
 /// `PORTCULLIS_PORTAL_URL` env var; the UCI config (§9) doesn't carry it.
@@ -88,6 +89,9 @@ fn load_config() -> anyhow::Result<Config> {
 pub(crate) struct Wired {
     pub mgr: Arc<portcullis_session::SessionManager>,
     pub event_tx: tokio::sync::broadcast::Sender<portcullis_types::SessionEvent>,
+    /// Retained so the composition root can poll `subscriber_count()` for the
+    /// `cp_connected` health flag / metric (a live `StreamEvents` client).
+    pub grpc_sink: portcullis_control::GrpcEventSink,
 }
 
 /// Assemble the core domain wiring around a given nft writer (real or mock).
@@ -98,9 +102,9 @@ pub(crate) struct Wired {
 pub(crate) fn wire(writer: Arc<dyn RulesetWriter>) -> Wired {
     let (event_tx, grpc_sink) =
         portcullis_control::service::event_channel(portcullis_control::DEFAULT_EVENT_BUFFER);
-    let sink: Arc<dyn EventSink> = Arc::new(grpc_sink);
+    let sink: Arc<dyn EventSink> = Arc::new(grpc_sink.clone());
     let mgr = Arc::new(portcullis_session::SessionManager::new(writer, sink));
-    Wired { mgr, event_tx }
+    Wired { mgr, event_tx, grpc_sink }
 }
 
 #[cfg(test)]

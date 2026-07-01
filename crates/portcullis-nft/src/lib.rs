@@ -24,4 +24,4 @@ pub mod writer;
 pub use backend::{FirewallBackend, MockBackend, MockOp};
 pub use nftables_json::{parse_auth_set, NftJsonBackend};
 pub use ruleset::{build_base_ruleset, build_base_script};
-pub use writer::{spawn, spawn_with_capacity, WriterHandle};
+pub use writer::{spawn, spawn_with_capacity, spawn_with_metrics, WriterHandle};

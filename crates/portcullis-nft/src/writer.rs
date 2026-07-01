@@ -10,10 +10,13 @@
 //! **once**; if it still fails, the error is propagated as
 //! [`Error::NftTransaction`]. The actor never flushes, never silently succeeds.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use portcullis_types::{AuthElement, Error, MacAddr, Result, RulesetWriter};
+use portcullis_types::{
+    AuthElement, Error, MacAddr, Metric, MetricsSink, NoopMetrics, Result, RulesetWriter,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::FirewallBackend;
@@ -85,7 +88,7 @@ impl RulesetWriter for WriterHandle {
 pub fn spawn(
     backend: Box<dyn FirewallBackend>,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>) {
-    spawn_with_capacity(backend, DEFAULT_CHANNEL_CAP)
+    spawn_full(backend, DEFAULT_CHANNEL_CAP, Arc::new(NoopMetrics))
 }
 
 /// As [`spawn`], with an explicit channel capacity.
@@ -93,8 +96,25 @@ pub fn spawn_with_capacity(
     backend: Box<dyn FirewallBackend>,
     capacity: usize,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>) {
+    spawn_full(backend, capacity, Arc::new(NoopMetrics))
+}
+
+/// As [`spawn`], with a metrics recorder so transaction failures increment
+/// `nft_txn_errors_total` (TDD §12).
+pub fn spawn_with_metrics(
+    backend: Box<dyn FirewallBackend>,
+    metrics: Arc<dyn MetricsSink>,
+) -> (WriterHandle, tokio::task::JoinHandle<()>) {
+    spawn_full(backend, DEFAULT_CHANNEL_CAP, metrics)
+}
+
+fn spawn_full(
+    backend: Box<dyn FirewallBackend>,
+    capacity: usize,
+    metrics: Arc<dyn MetricsSink>,
+) -> (WriterHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    let actor = WriterActor { backend, rx };
+    let actor = WriterActor { backend, rx, metrics };
     let join = tokio::spawn(actor.run());
     (WriterHandle { tx }, join)
 }
@@ -103,6 +123,7 @@ pub fn spawn_with_capacity(
 struct WriterActor {
     backend: Box<dyn FirewallBackend>,
     rx: mpsc::Receiver<Command>,
+    metrics: Arc<dyn MetricsSink>,
 }
 
 impl WriterActor {
@@ -111,21 +132,32 @@ impl WriterActor {
             match cmd {
                 Command::EnsureBase(reply) => {
                     let r = retry_once(|| self.backend.ensure_base()).await;
+                    self.count_err(&r);
                     let _ = reply.send(r);
                 }
                 Command::AddAuth { mac, ttl, reply } => {
                     let r = retry_once(|| self.backend.add_auth(mac, ttl)).await;
+                    self.count_err(&r);
                     let _ = reply.send(r);
                 }
                 Command::DelAuth { mac, reply } => {
                     let r = retry_once(|| self.backend.del_auth(mac)).await;
+                    self.count_err(&r);
                     let _ = reply.send(r);
                 }
                 Command::ListAuth(reply) => {
                     let r = retry_once(|| self.backend.list_auth()).await;
+                    self.count_err(&r);
                     let _ = reply.send(r);
                 }
             }
+        }
+    }
+
+    /// Record a transaction failure (after the single retry) as `nft_txn_errors`.
+    fn count_err<T>(&self, r: &Result<T>) {
+        if r.is_err() {
+            self.metrics.incr(Metric::NftTxnError);
         }
     }
 }
