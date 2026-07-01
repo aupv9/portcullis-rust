@@ -26,16 +26,16 @@ chown portcullis:portcullis /etc/portcullis /etc/portcullis/tls 2>/dev/null || t
 # 3) tmpfs runtime state dir (never NAND — §5.4).
 mkdir -p /tmp/portcullis
 
-# 4) Wire the walled garden into dnsmasq-full via nftset (§7.3). dnsmasq resolves
-#    each garden FQDN and injects the IPs into the inet portcullis garden4/garden6
-#    sets. portcullis-garden reconciles this list at runtime; this seeds it.
+# 4) Wire the walled garden into dnsmasq-full via ipset (§7.3). dnsmasq resolves
+#    each garden FQDN and injects the IPs into the portcullis_g4/portcullis_g6 ipsets
+#    (the daemon creates the sets on start). portcullis-garden reconciles this
+#    list at runtime; this only seeds it.
 GARDEN_CONF=/etc/dnsmasq.d/portcullis-garden.conf
 mkdir -p /etc/dnsmasq.d
 if [ ! -f "$GARDEN_CONF" ]; then
 	cat >"$GARDEN_CONF" <<'EOF'
 # Managed by portcullis (seed). Runtime reconcile may rewrite this.
-nftset=/portal.portcullis.example/cdn.portcullis.example/otp.gateway/pay.example/4#inet#portcullis#garden4
-nftset=/portal.portcullis.example/cdn.portcullis.example/otp.gateway/pay.example/6#inet#portcullis#garden6
+ipset=/portal.portcullis.example/cdn.portcullis.example/otp.gateway/pay.example/portcullis_g4,portcullis_g6
 EOF
 fi
 # dnsmasq must include conf-dir /etc/dnsmasq.d (default on RutOS); reload to apply.

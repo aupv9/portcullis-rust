@@ -1,0 +1,176 @@
+name: release-ipk
+
+# Cross-build the portcullis .ipk for every supported OpenWrt arch (NO SDK — a
+# static-musl userspace daemon with no kmod needs only a cross toolchain), then
+# publish an opkg feed to GitHub Pages and attach the .ipk files to the Release.
+#
+# Trigger: push a version tag (e.g. `v0.2.0`). `workflow_dispatch` builds too but
+# only publishes the feed (no Release) so you can smoke-test.
+#
+# Add hardware by adding a matrix row: {arch = OpenWrt opkg arch, triple = Rust
+# target, cross = musl.cc toolchain prefix}.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-ipk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+            echo "version=$V" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # RUTM (MediaTek MT7621, ramips/mt7621) — the RUTM11.
+          - arch: mipsel_24kc
+            triple: mipsel-unknown-linux-musl
+            cross: mipsel-linux-musl
+          # RUT9xx / RUT2xx (Atheros ath79, big-endian MIPS).
+          - arch: mips_24kc
+            triple: mips-unknown-linux-musl
+            cross: mips-linux-musl
+          # RUTX (Qualcomm IPQ40xx, ARMv7 cortex-a7).
+          - arch: arm_cortex-a7_neon-vfpv4
+            triple: armv7-unknown-linux-musleabihf
+            cross: armv7l-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly + rust-src (for -Z build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.triple }}
+
+      - name: Fetch musl cross toolchain
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o cross.tgz "https://musl.cc/${{ matrix.cross }}-cross.tgz"
+          sudo tar -xzf cross.tgz -C /opt
+          echo "/opt/${{ matrix.cross }}-cross/bin" >> "$GITHUB_PATH"
+
+      - name: Configure cross linker
+        run: |
+          set -euo pipefail
+          ENV_TRIPLE="$(echo '${{ matrix.triple }}' | tr 'a-z-' 'A-Z_')"
+          GCC="${{ matrix.cross }}-gcc"
+          echo "CARGO_TARGET_${ENV_TRIPLE}_LINKER=${GCC}" >> "$GITHUB_ENV"
+          echo "CC_$(echo '${{ matrix.triple }}' | tr '-' '_')=${GCC}" >> "$GITHUB_ENV"
+
+      - name: Cross-build the engine
+        run: |
+          cargo +nightly build --release --locked \
+            -Z build-std=std,panic_abort \
+            --target ${{ matrix.triple }} \
+            -p portcullis-engined
+
+      - name: Strip
+        run: ${{ matrix.cross }}-strip target/${{ matrix.triple }}/release/portcullis
+
+      - name: Install opkg-utils
+        run: sudo apt-get update && sudo apt-get install -y opkg-utils
+
+      - name: Package .ipk
+        run: |
+          deploy/ci/pack-ipk.sh \
+            "${{ matrix.arch }}" \
+            "target/${{ matrix.triple }}/release/portcullis" \
+            "${{ needs.meta.outputs.version }}" \
+            dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ matrix.arch }}
+          path: dist/*.ipk
+          if-no-files-found: error
+
+  # Publish a per-arch opkg feed to GitHub Pages (repo is public → routers pull
+  # over the internet). Router: add
+  #   src/gz portcullis https://<owner>.github.io/portcullis-rust/<arch>
+  pages:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Install opkg-utils
+        run: sudo apt-get update && sudo apt-get install -y opkg-utils
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Assemble opkg feed
+        run: |
+          set -euo pipefail
+          mkdir -p public
+          echo "<h1>portcullis opkg feed</h1><ul>" > public/index.html
+          for d in dl/ipk-*; do
+            arch="${d#dl/ipk-}"
+            mkdir -p "public/$arch"
+            cp "$d"/*.ipk "public/$arch/"
+            ( cd "public/$arch" && opkg-make-index . > Packages && gzip -9kf Packages )
+            echo "<li>$arch: <code>src/gz portcullis https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/$arch</code></li>" >> public/index.html
+          done
+          echo "</ul>" >> public/index.html
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  release:
+    needs: [meta, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Collect .ipk
+        run: mkdir -p dist && find dl -name '*.ipk' -exec cp {} dist/ \;
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipk
+          fail_on_unmatched_files: true
+          body: |
+            portcullis ${{ needs.meta.outputs.version }} — OpenWrt `.ipk` per arch.
+
+            Install on a router (opkg resolves deps from its own feeds):
+            ```sh
+            opkg update
+            opkg install https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/portcullis_${{ needs.meta.outputs.version }}-1_<arch>.ipk
+            ```
+            Or add the Pages opkg feed (see the run's Pages deployment).
