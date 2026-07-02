@@ -130,6 +130,10 @@ pub struct SessionManager {
     /// `kernel_table_present`, the control task sets `cp_connected`). Defaults to
     /// `backend_ok = true`; the rest default to `false`.
     health: Mutex<HealthStatus>,
+    /// Global enforcement gate mirror. Source of truth is the kernel ruleset
+    /// (via the writer); this caches the last-applied value for `health()` and
+    /// `enforcement_enabled()`. Boots `true` (fail-closed, §11/G5).
+    enforcement_enabled: Mutex<bool>,
 }
 
 impl SessionManager {
@@ -144,8 +148,23 @@ impl SessionManager {
                 kernel_table_present: false,
                 cp_connected: false,
                 last_reconcile_ok: false,
+                enforcement_enabled: true,
             }),
+            enforcement_enabled: Mutex::new(true),
         }
+    }
+
+    /// Set the global enforcement gate through the writer, then mirror the new
+    /// state into the health snapshot. Fail-closed: if the writer errors the
+    /// prior state is untouched and the error propagates (§11/G2).
+    pub async fn set_enforcement_at(&self, enabled: bool) -> Result<()> {
+        self.writer.set_enforcement(enabled).await?;
+        *self.enforcement_enabled.lock().expect("enforcement mutex poisoned") = enabled;
+        self.health
+            .lock()
+            .expect("health mutex poisoned")
+            .enforcement_enabled = enabled;
+        Ok(())
     }
 
     /// Overwrite the health snapshot the integrator reports over gRPC.
@@ -453,6 +472,14 @@ impl Enforcer for SessionManager {
     async fn health(&self) -> HealthStatus {
         *self.health.lock().expect("health mutex poisoned")
     }
+
+    async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+        self.set_enforcement_at(enabled).await
+    }
+
+    async fn enforcement_enabled(&self) -> bool {
+        *self.enforcement_enabled.lock().expect("enforcement mutex poisoned")
+    }
 }
 
 #[async_trait]
@@ -474,21 +501,26 @@ mod tests {
     enum WriterOp {
         AddAuth(MacAddr, Duration),
         DelAuth(MacAddr),
+        SetEnforcement(bool),
     }
 
-    /// Records every writer op. `fail` makes `add_auth` fail (to exercise the
-    /// fail-closed grant path).
+    /// Records every writer op. `fail_add` makes `add_auth` fail (to exercise the
+    /// fail-closed grant path); `fail_set` makes `set_enforcement` fail.
     struct MockWriter {
         ops: StdMutex<Vec<WriterOp>>,
         fail_add: bool,
+        fail_set: bool,
     }
 
     impl MockWriter {
         fn new() -> Self {
-            MockWriter { ops: StdMutex::new(Vec::new()), fail_add: false }
+            MockWriter { ops: StdMutex::new(Vec::new()), fail_add: false, fail_set: false }
         }
         fn failing() -> Self {
-            MockWriter { ops: StdMutex::new(Vec::new()), fail_add: true }
+            MockWriter { ops: StdMutex::new(Vec::new()), fail_add: true, fail_set: false }
+        }
+        fn failing_set() -> Self {
+            MockWriter { ops: StdMutex::new(Vec::new()), fail_add: false, fail_set: true }
         }
         fn ops(&self) -> Vec<WriterOp> {
             self.ops.lock().unwrap().clone()
@@ -513,6 +545,13 @@ mod tests {
         }
         async fn list_auth(&self) -> Result<Vec<AuthElement>> {
             Ok(Vec::new())
+        }
+        async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+            if self.fail_set {
+                return Err(Error::NftTransaction("injected failure".into()));
+            }
+            self.ops.lock().unwrap().push(WriterOp::SetEnforcement(enabled));
+            Ok(())
         }
     }
 
@@ -828,9 +867,58 @@ mod tests {
             kernel_table_present: true,
             cp_connected: true,
             last_reconcile_ok: true,
+            enforcement_enabled: true,
         });
         let h = m.health().await;
         assert!(h.cp_connected);
         assert!(h.kernel_table_present);
+    }
+
+    #[tokio::test]
+    async fn enforcement_defaults_enabled_fail_closed() {
+        let (m, _writer, _sink) = mgr();
+        assert!(m.enforcement_enabled().await, "boots enabled (fail-closed)");
+        assert!(m.health().await.enforcement_enabled);
+    }
+
+    #[tokio::test]
+    async fn set_enforcement_toggles_writer_and_state() {
+        let (m, writer, _sink) = mgr();
+
+        m.set_enforcement(false).await.unwrap();
+        assert!(!m.enforcement_enabled().await);
+        assert!(!m.health().await.enforcement_enabled);
+
+        m.set_enforcement(true).await.unwrap();
+        assert!(m.enforcement_enabled().await);
+
+        assert_eq!(
+            writer.ops(),
+            vec![WriterOp::SetEnforcement(false), WriterOp::SetEnforcement(true)],
+        );
+    }
+
+    #[tokio::test]
+    async fn set_enforcement_does_not_disturb_sessions() {
+        // Toggling the gate must never add/remove auth elements — session state
+        // is orthogonal to the global gate.
+        let (m, writer, _sink) = mgr();
+        m.grant(grant_params(mac(1), 1800, 0)).await.unwrap();
+        m.set_enforcement(false).await.unwrap();
+        assert_eq!(m.len(), 1, "session survives a gate toggle");
+        // No DelAuth was issued by the toggle.
+        assert!(!writer.ops().iter().any(|o| matches!(o, WriterOp::DelAuth(_))));
+    }
+
+    #[tokio::test]
+    async fn set_enforcement_fails_closed_keeps_prior_state() {
+        // Writer error -> state unchanged, error propagates (§11/G2).
+        let writer = Arc::new(MockWriter::failing_set());
+        let sink = Arc::new(CapturingSink::new());
+        let m = SessionManager::new(writer.clone(), sink.clone());
+        let before = m.enforcement_enabled().await;
+        let err = m.set_enforcement(false).await.unwrap_err();
+        assert!(matches!(err, Error::NftTransaction(_)));
+        assert_eq!(m.enforcement_enabled().await, before, "state unchanged on error");
     }
 }

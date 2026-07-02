@@ -30,8 +30,9 @@ pub const SET_AUTH: &str = "auth";
 pub const CHAIN_PREROUTING: &str = "prerouting";
 pub const CHAIN_FORWARD: &str = "forward";
 
-/// The local redirect responder port (§7.2).
-pub const REDIRECT_PORT: u16 = 8080;
+/// Default local redirect responder port (§7.2). 8082, not 8080: RutOS's own
+/// `uhttpd` already binds :8080. Overridable per-store via `responder_port`.
+pub const REDIRECT_PORT: u16 = 8082;
 
 /// Hook-priority offset placing our chains *before* fw3's equivalent hooks
 /// (§7.1 subtlety 2). These are starting points; verified on-device (§18).
@@ -113,6 +114,51 @@ fn verdict_only(verdict: &str) -> Value {
     json!([ { verdict: null } ])
 }
 
+/// `flush chain inet wifihub <name>` — empties a chain without deleting it.
+fn flush_chain(name: &str) -> Value {
+    json!({
+        "flush": {
+            "chain": { "family": TABLE_FAMILY, "table": TABLE_NAME, "name": name }
+        }
+    })
+}
+
+/// The ordered gating rules for the `prerouting` chain: exempt authed + garden,
+/// else redirect tcp:80 to the responder. Shared by [`build_base_ruleset`] and
+/// [`build_set_enforcement`] so the two never drift.
+fn prerouting_gate_rules() -> Vec<Value> {
+    vec![
+        add(rule_obj(CHAIN_PREROUTING, match_set_accept("ether", "saddr", SET_AUTH))),
+        add(rule_obj(CHAIN_PREROUTING, match_set_accept("ip", "daddr", SET_GARDEN4))),
+        add(rule_obj(CHAIN_PREROUTING, match_set_accept("ip6", "daddr", SET_GARDEN6))),
+        add(rule_obj(
+            CHAIN_PREROUTING,
+            json!([
+                {
+                    "match": {
+                        "op": "==",
+                        "left": { "payload": { "protocol": "tcp", "field": "dport" } },
+                        "right": 80
+                    }
+                },
+                { "redirect": { "port": REDIRECT_PORT } }
+            ]),
+        )),
+    ]
+}
+
+/// The ordered gating rules for the `forward` chain: accept established + authed
+/// + garden, terminal `drop` last (the only globally-terminal verdict, §7.1).
+fn forward_gate_rules() -> Vec<Value> {
+    vec![
+        add(rule_obj(CHAIN_FORWARD, ct_established_accept())),
+        add(rule_obj(CHAIN_FORWARD, match_set_accept("ether", "saddr", SET_AUTH))),
+        add(rule_obj(CHAIN_FORWARD, match_set_accept("ip", "daddr", SET_GARDEN4))),
+        add(rule_obj(CHAIN_FORWARD, match_set_accept("ip6", "daddr", SET_GARDEN6))),
+        add(rule_obj(CHAIN_FORWARD, verdict_only("drop"))),
+    ]
+}
+
 /// Build the full base ruleset as the `nft -j` command array.
 ///
 /// The returned value is `{"nftables": [ ... ]}` — the exact shape `nft -j -f -`
@@ -136,50 +182,33 @@ pub fn build_base_ruleset() -> Value {
     cmds.push(add(chain_obj(CHAIN_PREROUTING, "prerouting", prio_dstnat, "nat")));
     cmds.push(add(chain_obj(CHAIN_FORWARD, "forward", prio_filter, "filter")));
 
-    // prerouting rules, in order.
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        match_set_accept("ether", "saddr", SET_AUTH),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        match_set_accept("ip", "daddr", SET_GARDEN4),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        match_set_accept("ip6", "daddr", SET_GARDEN6),
-    )));
-    // tcp dport 80 redirect to :8080
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        json!([
-            {
-                "match": {
-                    "op": "==",
-                    "left": { "payload": { "protocol": "tcp", "field": "dport" } },
-                    "right": 80
-                }
-            },
-            { "redirect": { "port": REDIRECT_PORT } }
-        ]),
-    )));
+    // Rules, in evaluation order.
+    cmds.extend(prerouting_gate_rules());
+    cmds.extend(forward_gate_rules());
 
-    // forward rules, in order; terminal drop last.
-    cmds.push(add(rule_obj(CHAIN_FORWARD, ct_established_accept())));
-    cmds.push(add(rule_obj(
-        CHAIN_FORWARD,
-        match_set_accept("ether", "saddr", SET_AUTH),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_FORWARD,
-        match_set_accept("ip", "daddr", SET_GARDEN4),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_FORWARD,
-        match_set_accept("ip6", "daddr", SET_GARDEN6),
-    )));
-    cmds.push(add(rule_obj(CHAIN_FORWARD, verdict_only("drop"))));
+    json!({ "nftables": cmds })
+}
 
+/// Build the atomic `nft -j` batch that toggles the global enforcement gate.
+///
+/// Unlike the ipset/iptables backend (which adds/removes a base-hook jump), the
+/// nft base chains are hooked intrinsically, so the gate is toggled by flushing
+/// their rules. Applied as one atomic batch so `enabled = true` never exposes a
+/// fail-open window:
+/// - `enabled = false`: flush `prerouting` + `forward` → both keep `policy
+///   accept` with no rules, so all traffic flows and nothing is redirected.
+/// - `enabled = true`: flush then re-add the gate rules → exactly one copy each,
+///   idempotent regardless of the prior state.
+///
+/// The `auth`/`garden` sets are never touched, so session state survives a
+/// toggle. Assumes the base table/chains exist (created by [`build_base_ruleset`]
+/// at boot).
+pub fn build_set_enforcement(enabled: bool) -> Value {
+    let mut cmds: Vec<Value> = vec![flush_chain(CHAIN_PREROUTING), flush_chain(CHAIN_FORWARD)];
+    if enabled {
+        cmds.extend(prerouting_gate_rules());
+        cmds.extend(forward_gate_rules());
+    }
     json!({ "nftables": cmds })
 }
 
@@ -301,12 +330,12 @@ mod tests {
                     })
                     .unwrap_or(false)
             });
-            let has_redirect_8080 = expr
+            let has_redirect = expr
                 .iter()
-                .any(|e| e.get("redirect").map(|r| r["port"] == 8080).unwrap_or(false));
-            has_dport_80 && has_redirect_8080
+                .any(|e| e.get("redirect").map(|r| r["port"] == REDIRECT_PORT).unwrap_or(false));
+            has_dport_80 && has_redirect
         });
-        assert!(redirect, "prerouting must redirect tcp dport 80 to :8080");
+        assert!(redirect, "prerouting must redirect tcp dport 80 to :{REDIRECT_PORT}");
     }
 
     #[test]
@@ -345,12 +374,47 @@ mod tests {
     }
 
     #[test]
+    fn set_enforcement_disabled_only_flushes_no_rules() {
+        let rs = build_set_enforcement(false);
+        let c = cmds(&rs);
+        // Exactly two flushes (prerouting + forward), no rules.
+        let flushes: Vec<&Value> = c.iter().filter_map(|v| v.get("flush")).collect();
+        assert_eq!(flushes.len(), 2);
+        assert!(c.iter().all(|v| v.get("add").and_then(|a| a.get("rule")).is_none()));
+        // Must not touch the auth set.
+        let s = serde_json::to_string(&rs).unwrap();
+        assert!(!s.contains("\"set\""), "toggle must not touch sets");
+    }
+
+    #[test]
+    fn set_enforcement_enabled_flushes_then_readds_gate_with_terminal_drop() {
+        let rs = build_set_enforcement(true);
+        let c = cmds(&rs);
+        assert_eq!(c.iter().filter_map(|v| v.get("flush")).count(), 2);
+        // Re-adds the forward chain ending in a terminal drop.
+        let forward_rules: Vec<&Value> = c
+            .iter()
+            .filter_map(|v| v.get("add").and_then(|a| a.get("rule")))
+            .filter(|r| r["chain"] == "forward")
+            .collect();
+        let last = forward_rules.last().unwrap();
+        assert!(last["expr"].as_array().unwrap()[0].get("drop").is_some());
+        // Flushes come before the re-added rules (atomic ordering).
+        let first_flush = c.iter().position(|v| v.get("flush").is_some()).unwrap();
+        let first_rule = c
+            .iter()
+            .position(|v| v.get("add").and_then(|a| a.get("rule")).is_some())
+            .unwrap();
+        assert!(first_flush < first_rule, "flush must precede re-add");
+    }
+
+    #[test]
     fn script_form_matches_invariants() {
         let script = build_base_script();
         assert!(script.contains("table inet wifihub"));
         assert!(script.contains("priority dstnat - 50"));
         assert!(script.contains("priority filter - 50"));
-        assert!(script.contains("redirect to :8080"));
+        assert!(script.contains(&format!("redirect to :{REDIRECT_PORT}")));
         assert!(script.trim_end().ends_with("}"));
         assert!(script.contains("drop"));
         assert!(!script.contains("masquerade"));

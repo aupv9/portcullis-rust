@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::backend::FirewallBackend;
-use crate::ruleset::{build_base_ruleset, SET_AUTH, TABLE_FAMILY, TABLE_NAME};
+use crate::ruleset::{build_base_ruleset, build_set_enforcement, SET_AUTH, TABLE_FAMILY, TABLE_NAME};
 
 /// Backend that builds `nft -j` JSON and invokes the `nft` binary.
 pub struct NftJsonBackend {
@@ -189,6 +189,10 @@ impl FirewallBackend for NftJsonBackend {
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         let doc = self.list_set_json(SET_AUTH).await?;
         parse_auth_set(&doc)
+    }
+
+    async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+        self.apply_json(&build_set_enforcement(enabled)).await
     }
 }
 

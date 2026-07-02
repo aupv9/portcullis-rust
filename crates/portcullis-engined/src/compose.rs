@@ -26,7 +26,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //    Stock RutOS has no nftables NAT chain support (CONFIG_NFT_NAT unset), so
     //    the production backend is ipset + iptables/ip6tables (TDD §17 option B),
     //    not NftJsonBackend. Both implement the same FirewallBackend seam.
-    let backend = Box::new(portcullis_nft::IpsetIptablesBackend::default());
+    // The tcp:80 REDIRECT must target the same port the responder listens on.
+    let backend = Box::new(
+        portcullis_nft::IpsetIptablesBackend::default().with_redirect_port(cfg.responder_port),
+    );
     let (writer_handle, _writer_join) = portcullis_nft::spawn(backend);
     let writer: Arc<dyn RulesetWriter> = Arc::new(writer_handle);
 
@@ -49,6 +52,21 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let w = wire(writer.clone());
     let adopted_n = w.mgr.adopt(adopted, Instant::now());
     tracing::info!(adopted = adopted_n, "restart adoption complete");
+
+    // 1c. Apply the boot enforcement state. `ensure_base` already installed the
+    //     gating jumps (fail-closed), so `enforcement_default = true` is an
+    //     idempotent re-assert; `false` lifts the gate. The control plane later
+    //     re-pushes the persisted admin choice on connect. On error we keep the
+    //     fail-closed jumps from ensure_base rather than abort (§11/G5).
+    if let Err(e) = w.mgr.set_enforcement_at(cfg.enforcement_default).await {
+        tracing::warn!(
+            error = %e,
+            enforcement_default = cfg.enforcement_default,
+            "could not apply boot enforcement state; staying fail-closed"
+        );
+    } else {
+        tracing::info!(enforcement_enabled = cfg.enforcement_default, "boot enforcement state applied");
+    }
 
     let svc = portcullis_control::EnforcementService::from_parts(
         w.mgr.clone() as Arc<dyn Enforcer>,

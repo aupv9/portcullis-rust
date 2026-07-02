@@ -261,6 +261,10 @@ pub struct HealthStatus {
     pub kernel_table_present: bool,
     pub cp_connected: bool,
     pub last_reconcile_ok: bool,
+    /// Global enforcement gate: `true` = the engine is blocking unauthorized
+    /// traffic (FORWARD/PREROUTING jumps installed); `false` = gate lifted, all
+    /// traffic flows. Toggled via [`Enforcer::set_enforcement`].
+    pub enforcement_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +339,11 @@ pub trait RulesetWriter: Send + Sync {
 
     /// List the current `auth` set elements (for restart adoption / reconcile).
     async fn list_auth(&self) -> Result<Vec<AuthElement>>;
+
+    /// Toggle the global enforcement gate. `true` installs the FORWARD/PREROUTING
+    /// jump rules (block unauthorized traffic); `false` removes them so all
+    /// traffic flows. MUST leave the `auth` set and chains intact (idempotent).
+    async fn set_enforcement(&self, enabled: bool) -> Result<()>;
 }
 
 /// Sink for session lifecycle events flowing engine -> control plane (TDD §7.5).
@@ -395,6 +404,14 @@ pub trait Enforcer: Send + Sync {
     async fn get(&self, mac: MacAddr) -> Result<Option<SessionInfo>>;
     async fn list(&self) -> Result<Vec<SessionInfo>>;
     async fn health(&self) -> HealthStatus;
+
+    /// Set the global enforcement gate (admin toggle via control plane). On
+    /// success the reported [`HealthStatus::enforcement_enabled`] reflects the
+    /// new state. Fails closed: on backend error the prior state is kept.
+    async fn set_enforcement(&self, enabled: bool) -> Result<()>;
+
+    /// Current global enforcement gate state.
+    async fn enforcement_enabled(&self) -> bool;
 }
 
 /// Accounting-facing sink, implemented by the SessionManager and called by the

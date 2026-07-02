@@ -35,6 +35,10 @@ enum Command {
         reply: oneshot::Sender<Result<()>>,
     },
     ListAuth(oneshot::Sender<Result<Vec<AuthElement>>>),
+    SetEnforcement {
+        enabled: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Cloneable handle to the writer actor. Implements [`RulesetWriter`].
@@ -77,6 +81,10 @@ impl RulesetWriter for WriterHandle {
 
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         self.call(Command::ListAuth).await
+    }
+
+    async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+        self.call(|reply| Command::SetEnforcement { enabled, reply }).await
     }
 }
 
@@ -123,6 +131,10 @@ impl WriterActor {
                 }
                 Command::ListAuth(reply) => {
                     let r = retry_once(|| self.backend.list_auth()).await;
+                    let _ = reply.send(r);
+                }
+                Command::SetEnforcement { enabled, reply } => {
+                    let r = retry_once(|| self.backend.set_enforcement(enabled)).await;
                     let _ = reply.send(r);
                 }
             }
@@ -179,6 +191,9 @@ mod tests {
         }
         async fn list_auth(&self) -> Result<Vec<AuthElement>> {
             self.0.list_auth().await
+        }
+        async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+            self.0.set_enforcement(enabled).await
         }
     }
 
@@ -262,6 +277,25 @@ mod tests {
         assert_eq!(ops.len(), 50);
         assert!(ops.iter().all(|o| matches!(o, MockOp::AddAuth { .. })));
         assert_eq!(mock.auth_len(), 50);
+    }
+
+    #[tokio::test]
+    async fn set_enforcement_roundtrips_and_records_op() {
+        let mock = Arc::new(MockBackend::new());
+        let (h, _join) = spawn(Box::new(SharedMock(mock.clone())));
+
+        h.set_enforcement(false).await.unwrap();
+        assert!(!mock.enforcement_enabled());
+        h.set_enforcement(true).await.unwrap();
+        assert!(mock.enforcement_enabled());
+
+        assert_eq!(
+            mock.ops(),
+            vec![
+                MockOp::SetEnforcement { enabled: false },
+                MockOp::SetEnforcement { enabled: true },
+            ]
+        );
     }
 
     #[tokio::test]
