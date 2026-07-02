@@ -41,9 +41,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use portcullis_types::{
-    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, GrantParams, HealthStatus,
-    MacAddr, MeteringSink, Result, RevokeReason, RulesetWriter, SessionEvent, SessionId,
-    SessionInfo, Tier,
+    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, GardenControl, GrantParams,
+    HealthStatus, MacAddr, MeteringSink, Result, RevokeReason, RulesetWriter, SessionEvent,
+    SessionId, SessionInfo, Tier,
 };
 
 /// Upper bound on concurrently-tracked sessions held in RAM.
@@ -134,6 +134,9 @@ pub struct SessionManager {
     /// (via the writer); this caches the last-applied value for `health()` and
     /// `enforcement_enabled()`. Boots `true` (fail-closed, §11/G5).
     enforcement_enabled: Mutex<bool>,
+    /// Control-plane-managed walled garden, wired by the composition root.
+    /// `None` until `set_garden_control` is called (then `set_garden` works).
+    garden: Mutex<Option<Arc<dyn GardenControl>>>,
 }
 
 impl SessionManager {
@@ -151,7 +154,13 @@ impl SessionManager {
                 enforcement_enabled: true,
             }),
             enforcement_enabled: Mutex::new(true),
+            garden: Mutex::new(None),
         }
+    }
+
+    /// Wire the control-plane-managed walled-garden controller (composition root).
+    pub fn set_garden_control(&self, g: Arc<dyn GardenControl>) {
+        *self.garden.lock().expect("garden mutex poisoned") = Some(g);
     }
 
     /// Set the global enforcement gate through the writer, then mirror the new
@@ -479,6 +488,14 @@ impl Enforcer for SessionManager {
 
     async fn enforcement_enabled(&self) -> bool {
         *self.enforcement_enabled.lock().expect("enforcement mutex poisoned")
+    }
+
+    async fn set_garden(&self, fqdns: Vec<String>) -> Result<()> {
+        let garden = self.garden.lock().expect("garden mutex poisoned").clone();
+        match garden {
+            Some(g) => g.set_fqdns(fqdns).await,
+            None => Err(Error::BadRequest("garden control not configured".into())),
+        }
     }
 }
 

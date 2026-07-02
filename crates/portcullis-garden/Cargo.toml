@@ -9,6 +9,7 @@ description = "Walled-garden management: owns the FQDN list, renders/reconciles 
 
 [dependencies]
 portcullis-types.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
