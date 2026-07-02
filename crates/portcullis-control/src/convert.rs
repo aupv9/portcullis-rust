@@ -206,6 +206,8 @@ pub fn session_event_to_pb(ev: &SessionEvent) -> pb::SessionEvent {
         bytes_in: ev.bytes_in,
         bytes_out: ev.bytes_out,
         ts_unix: ev.ts_unix,
+        // The replay seq is owned by the EventLog; the stream layer stamps it.
+        seq: 0,
     }
 }
 

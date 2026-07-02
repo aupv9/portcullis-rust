@@ -85,24 +85,25 @@ fn load_config() -> anyhow::Result<Config> {
 /// testable without binding sockets.
 pub(crate) struct Wired {
     pub mgr: Arc<portcullis_session::SessionManager>,
-    pub event_tx: tokio::sync::broadcast::Sender<portcullis_types::SessionEvent>,
+    pub event_log: Arc<portcullis_control::EventLog>,
 }
 
 /// Assemble the core domain wiring around a given nft writer (real or mock).
 ///
 /// Order matters for the construction cycle (§ see `control::event_channel`):
-/// mint the event channel + sink first, build the `SessionManager` with the
-/// sink, then the gRPC service from the manager + the shared sender.
+/// mint the event log + sink first, build the `SessionManager` with the
+/// sink, then the gRPC service from the manager + the shared log.
 pub(crate) fn wire(writer: Arc<dyn RulesetWriter>, cfg: &Config) -> Wired {
-    let (event_tx, grpc_sink) =
+    let (event_log, grpc_sink) =
         portcullis_control::service::event_channel(cfg.event_buffer_size.max(1) as usize);
     let sink: Arc<dyn EventSink> = Arc::new(grpc_sink);
     let mgr = Arc::new(
         portcullis_session::SessionManager::new(writer, sink)
             .with_tier_policies(initial_tier_policies(cfg))
-            .with_engine_params(initial_engine_params(cfg)),
+            .with_engine_params(initial_engine_params(cfg))
+            .with_garden_fqdns(cfg.garden_fqdn.clone()),
     );
-    Wired { mgr, event_tx }
+    Wired { mgr, event_log }
 }
 
 /// Seed the runtime engine parameters from the boot config (§9): only the
@@ -146,11 +147,6 @@ mod tests {
         let writer: Arc<dyn RulesetWriter> = Arc::new(handle);
         let w = wire(writer, &Config::default());
 
-        // A subscriber on the shared channel must receive the GRANTED event the
-        // session layer emits — proving the cycle-break actually connects the
-        // session sink to the gRPC fan-out.
-        let mut rx = w.event_tx.subscribe();
-
         let params = portcullis_types::GrantParams {
             store_id: "SITE-0042".into(),
             mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
@@ -165,9 +161,14 @@ mod tests {
         assert_eq!(id.as_str(), "s-1");
         assert_eq!(w.mgr.len(), 1);
 
-        let ev = rx.recv().await.expect("event");
-        assert_eq!(ev.kind, portcullis_types::EventKind::Granted);
-        assert_eq!(ev.session_id.as_str(), "s-1");
+        // The GRANTED event the session layer emits must land in the shared
+        // event log with a replay seq — proving the cycle-break actually
+        // connects the session sink to the gRPC fan-out.
+        let events = w.event_log.snapshot_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[0].1.kind, portcullis_types::EventKind::Granted);
+        assert_eq!(events[0].1.session_id.as_str(), "s-1");
     }
 
     #[tokio::test]
