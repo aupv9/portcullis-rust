@@ -81,10 +81,20 @@ jobs:
         with:
           version: 0.13.0
 
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
+      # Install cargo-zigbuild from crates.io with retries. We deliberately do
+      # NOT use taiki-e/install-action here: its prebuilt-binary mirror has
+      # returned HTTP 503 and failed the whole build. `cargo install` pulls from
+      # crates.io (highly available) and the source + target are rust-cached, so
+      # the retry loop makes this resilient to transient network blips.
+      - name: Install cargo-zigbuild (crates.io, retry)
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            if cargo install cargo-zigbuild --locked; then exit 0; fi
+            echo "::warning::cargo-zigbuild install attempt $i failed; retrying in 20s"
+            sleep 20
+          done
+          echo "::error::cargo-zigbuild install failed after 5 attempts"; exit 1
 
       - name: Cross-build the engine
         env:
