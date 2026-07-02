@@ -3,7 +3,8 @@
 # provisioning pipeline / first-boot bootstrap (uci-defaults/99-portcullis).
 #
 # Hot-reloadable: garden_fqdn, tier defaults, accounting_interval.
-# Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port.
+# Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port,
+#                   redirect_rl_*, event_buffer_size.
 
 config portcullis 'main'
 	option store_id            'SITE-0000'
@@ -20,6 +21,12 @@ config portcullis 'main'
 	# captive redirect) — useful for staging/maintenance. The control plane can
 	# flip it live via the SetEnforcement gRPC without a restart.
 	option enforcement_default '1'
+	# Redirect responder rate limit (per source IP) + gRPC event buffer bound.
+	# Optional — omitting them keeps these built-in values. RequiresRestart.
+	option redirect_rl_capacity       '5'
+	option redirect_rl_refill_per_sec '1'
+	option redirect_rl_max_keys       '10000'
+	option event_buffer_size          '512'
 	list   garden_fqdn         'portal.wifihub.vn'
 	list   garden_fqdn         'cdn.wifihub.vn'
 	list   garden_fqdn         'otp.gateway'

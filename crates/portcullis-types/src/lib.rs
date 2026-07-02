@@ -124,6 +124,102 @@ impl FromStr for Tier {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Engine defaults (single source of truth). The control plane mirrors these so
+// a `0` on the wire resolves to the same fallback on both sides.
+// ---------------------------------------------------------------------------
+
+/// Built-in session TTL used when neither the grant nor the tier policy carries
+/// one (see [`TierPolicy`]). Chosen to match the §9 config default (`1800s`).
+pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
+
+/// Upper bound on concurrently-tracked sessions held in RAM. See
+/// `portcullis-session::MAX_SESSIONS` (which re-exports this) for the RSS-budget
+/// rationale (TDD §5, §14).
+pub const DEFAULT_MAX_SESSIONS: usize = 4096;
+
+/// Built-in accounting/metering poll cadence (openNDS-proven 15s, §7.6).
+pub const DEFAULT_ACCOUNTING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Built-in walled-garden reconcile cadence (§7.3).
+pub const DEFAULT_GARDEN_TICK: Duration = Duration::from_secs(30);
+
+/// Built-in session-expiry sweep cadence (§7.8 dual-path expiry).
+pub const DEFAULT_EXPIRY_TICK: Duration = Duration::from_secs(1);
+
+/// Fleet-wide per-[`Tier`] grant defaults (TDD §7.4/§7.5). The control plane
+/// pushes these via `SetTierPolicies`; the engine fills any 0-valued grant field
+/// from the matching tier's policy before applying the grant. A field of `0`
+/// here means *unset*: it resolves to the built-in default ([`DEFAULT_TTL`] for
+/// `ttl`) or to *unlimited* (`quota_bytes` / `rate_bps`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierPolicy {
+    pub tier: Tier,
+    pub ttl: Duration,
+    pub quota_bytes: u64,
+    pub rate_bps: u64,
+}
+
+/// Full snapshot of the runtime-adjustable engine parameters
+/// (`SetEngineParameters`). Every push replaces the whole set; a `0` on the
+/// wire resolves to the matching `DEFAULT_*` const before this struct is built,
+/// so the values here are always concrete. **RAM-only** — the control plane
+/// re-pushes on reconnect (§5.4 no-NAND).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineParams {
+    pub accounting_interval: Duration,
+    pub garden_tick: Duration,
+    pub expiry_tick: Duration,
+    pub max_sessions: usize,
+}
+
+impl Default for EngineParams {
+    fn default() -> Self {
+        EngineParams {
+            accounting_interval: DEFAULT_ACCOUNTING_INTERVAL,
+            garden_tick: DEFAULT_GARDEN_TICK,
+            expiry_tick: DEFAULT_EXPIRY_TICK,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
+}
+
+impl EngineParams {
+    /// Bounds (validated post zero-substitution, mirrored by the control
+    /// plane): accounting 1..=3600 s, expiry 1..=60 s, garden 5..=3600 s,
+    /// max_sessions 1..=16384. The session cap's upper bound protects the
+    /// <30 MB RSS budget (§14); the lower interval bounds keep
+    /// `tokio::time::interval` from panicking on a zero period.
+    pub fn validate(&self) -> Result<()> {
+        let secs = |d: Duration| d.as_secs();
+        if !(1..=3600).contains(&secs(self.accounting_interval)) {
+            return Err(Error::BadRequest(format!(
+                "accounting_interval {}s out of bounds [1, 3600]",
+                secs(self.accounting_interval)
+            )));
+        }
+        if !(1..=60).contains(&secs(self.expiry_tick)) {
+            return Err(Error::BadRequest(format!(
+                "expiry_tick {}s out of bounds [1, 60]",
+                secs(self.expiry_tick)
+            )));
+        }
+        if !(5..=3600).contains(&secs(self.garden_tick)) {
+            return Err(Error::BadRequest(format!(
+                "garden_tick {}s out of bounds [5, 3600]",
+                secs(self.garden_tick)
+            )));
+        }
+        if !(1..=16384).contains(&self.max_sessions) {
+            return Err(Error::BadRequest(format!(
+                "max_sessions {} out of bounds [1, 16384]",
+                self.max_sessions
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Control-plane-issued session id (== RADIUS `Acct-Session-Id`, TDD §7.4/§7.5).
 ///
 /// Backed by `Box<str>` rather than `String`: a session id is immutable once
@@ -425,6 +521,21 @@ pub trait Enforcer: Send + Sync {
     /// Replace the pre-auth walled-garden FQDN list (control-plane managed).
     /// Full set, not a delta. Returns Err if no garden controller is wired.
     async fn set_garden(&self, fqdns: Vec<String>) -> Result<()>;
+
+    /// Replace the fleet-wide per-tier grant defaults (control-plane managed).
+    /// Full replacement, not a delta: any tier absent from `policies` is reset
+    /// to its built-in default. Applied to subsequent grants (fills 0-valued
+    /// grant fields, see [`TierPolicy`]). **RAM-only** — the control plane
+    /// re-pushes on reconnect, so implementations MUST NOT persist this to flash
+    /// (§5.4 no-NAND).
+    async fn set_tier_policies(&self, policies: Vec<TierPolicy>) -> Result<()>;
+
+    /// Apply a full snapshot of the runtime engine parameters (control-plane
+    /// managed, see [`EngineParams`]). Implementations re-validate (defence in
+    /// depth) and MUST NOT evict existing sessions when `max_sessions` drops
+    /// below the current count — the lowered cap only blocks new grants (G2).
+    /// **RAM-only**, like the tier policies.
+    async fn set_engine_parameters(&self, params: EngineParams) -> Result<()>;
 }
 
 /// Control-plane-managed walled garden, implemented by `portcullis-garden`'s
@@ -483,6 +594,18 @@ mod tests {
         assert_eq!(Tier::Home.to_string(), "home");
         assert_eq!("".parse::<Tier>().unwrap(), Tier::Public);
         assert!("gold".parse::<Tier>().is_err());
+    }
+
+    #[test]
+    fn tier_policy_default_is_public_and_zeroed() {
+        let p = TierPolicy::default();
+        assert_eq!(p.tier, Tier::Public);
+        assert_eq!(p.ttl, Duration::ZERO);
+        assert_eq!(p.quota_bytes, 0);
+        assert_eq!(p.rate_bps, 0);
+        // Built-in TTL fallback matches the §9 config default.
+        assert_eq!(DEFAULT_TTL, Duration::from_secs(1800));
+        assert_eq!(DEFAULT_MAX_SESSIONS, 4096);
     }
 
     #[test]

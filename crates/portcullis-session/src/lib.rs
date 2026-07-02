@@ -39,11 +39,12 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use tokio::sync::watch;
 
 use portcullis_types::{
-    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, GardenControl, GrantParams,
-    HealthStatus, MacAddr, MeteringSink, Result, RevokeReason, RulesetWriter, SessionEvent,
-    SessionId, SessionInfo, Tier,
+    AuthElement, Counters, Enforcer, EngineParams, Error, EventKind, EventSink, GardenControl,
+    GrantParams, HealthStatus, MacAddr, MeteringSink, Result, RevokeReason, RulesetWriter,
+    SessionEvent, SessionId, SessionInfo, Tier, TierPolicy, DEFAULT_MAX_SESSIONS, DEFAULT_TTL,
 };
 
 /// Upper bound on concurrently-tracked sessions held in RAM.
@@ -55,7 +56,50 @@ use portcullis_types::{
 /// comfortably inside the <30 MB RSS budget (TDD §5, embedded-perf). Grants past
 /// the cap are rejected ([`Error::Backend`]) and logged; nothing is evicted, so
 /// existing authorized clients are never silently dropped.
-pub const MAX_SESSIONS: usize = 4096;
+///
+/// Re-exported from `portcullis_types::DEFAULT_MAX_SESSIONS` so the cap has a
+/// single source of truth shared with the control plane; the local name is kept
+/// for the many call sites and tests that reference it.
+pub const MAX_SESSIONS: usize = DEFAULT_MAX_SESSIONS;
+
+/// Fleet-wide per-tier grant defaults held in RAM (TDD §7.4/§7.5).
+///
+/// One slot per [`Tier`]; a grant with a 0-valued field inherits the matching
+/// tier's policy (see [`SessionManager::effective_params`]). Seeded to
+/// [`TierPolicy::default`] (all-zero → built-in defaults) and replaced wholesale
+/// by the control plane via `SetTierPolicies`. RAM-only: never persisted, the
+/// control plane re-pushes on reconnect (§5.4 no-NAND).
+#[derive(Clone, Copy, Debug, Default)]
+struct TierPolicyTable {
+    public: TierPolicy,
+    home: TierPolicy,
+    retail: TierPolicy,
+}
+
+impl TierPolicyTable {
+    /// The policy for `tier` (a copy — the table is tiny, TDD §14).
+    fn get(&self, tier: Tier) -> TierPolicy {
+        match tier {
+            Tier::Public => self.public,
+            Tier::Home => self.home,
+            Tier::Retail => self.retail,
+        }
+    }
+
+    /// Full replacement (`SetTierPolicies` semantics): any tier absent from
+    /// `policies` is reset to its built-in default; a tier repeated in the list
+    /// takes the last occurrence (last-wins).
+    fn replace_all(&mut self, policies: &[TierPolicy]) {
+        *self = TierPolicyTable::default();
+        for p in policies {
+            match p.tier {
+                Tier::Public => self.public = *p,
+                Tier::Home => self.home = *p,
+                Tier::Retail => self.retail = *p,
+            }
+        }
+    }
+}
 
 /// In-RAM per-client session record (TDD §7.4).
 ///
@@ -137,6 +181,19 @@ pub struct SessionManager {
     /// Control-plane-managed walled garden, wired by the composition root.
     /// `None` until `set_garden_control` is called (then `set_garden` works).
     garden: Mutex<Option<Arc<dyn GardenControl>>>,
+    /// Fleet-wide per-tier grant defaults, replaced wholesale by the control
+    /// plane via `set_tier_policies`. Seeded to built-in defaults; the
+    /// composition root can override the seed with [`with_tier_policies`]
+    /// (from engine config). RAM-only (§5.4 no-NAND).
+    ///
+    /// [`with_tier_policies`]: SessionManager::with_tier_policies
+    tier_policies: Mutex<TierPolicyTable>,
+    /// Runtime-adjustable engine parameters (`set_engine_parameters`). The
+    /// watch channel fans the snapshot out to the timer loops in the
+    /// composition root (expiry sweep, garden reconcile, metering), which
+    /// rebuild their tickers on change; the grant path reads `max_sessions`
+    /// from it directly. RAM-only (§5.4 no-NAND).
+    params: watch::Sender<EngineParams>,
 }
 
 impl SessionManager {
@@ -155,7 +212,41 @@ impl SessionManager {
             }),
             enforcement_enabled: Mutex::new(true),
             garden: Mutex::new(None),
+            tier_policies: Mutex::new(TierPolicyTable::default()),
+            params: watch::Sender::new(EngineParams::default()),
         }
+    }
+
+    /// Override the seeded tier-policy table (composition root, before the
+    /// manager is `Arc`-ed). `wire()` uses this to seed policies from the engine
+    /// config; the control plane replaces them wholesale afterwards via
+    /// [`Enforcer::set_tier_policies`].
+    pub fn with_tier_policies(self, policies: Vec<TierPolicy>) -> Self {
+        self.tier_policies
+            .lock()
+            .expect("tier policies mutex poisoned")
+            .replace_all(&policies);
+        self
+    }
+
+    /// Override the seeded engine parameters (composition root, before the
+    /// manager is `Arc`-ed); the control plane replaces them afterwards via
+    /// [`Enforcer::set_engine_parameters`]. The seed is NOT validated — it
+    /// comes from local config, which has its own validation.
+    pub fn with_engine_params(self, params: EngineParams) -> Self {
+        self.params.send_replace(params);
+        self
+    }
+
+    /// Subscribe to engine-parameter snapshots (composition root: the timer
+    /// loops rebuild their tickers when this changes).
+    pub fn subscribe_params(&self) -> watch::Receiver<EngineParams> {
+        self.params.subscribe()
+    }
+
+    /// The current engine-parameter snapshot.
+    pub fn current_params(&self) -> EngineParams {
+        *self.params.borrow()
     }
 
     /// Wire the control-plane-managed walled-garden controller (composition root).
@@ -207,26 +298,53 @@ impl SessionManager {
         }
     }
 
+    /// Fill 0-valued grant fields from the grant's tier policy (§7.4): `ttl` 0 →
+    /// policy ttl (itself 0 → [`DEFAULT_TTL`]); `quota_bytes`/`rate_bps` 0 →
+    /// policy value (policy 0 = unlimited). Non-zero grant fields always win.
+    /// The policy is copied out under the `tier_policies` lock alone — never
+    /// held together with the `sessions` lock.
+    fn effective_params(&self, mut p: GrantParams) -> GrantParams {
+        let policy = self
+            .tier_policies
+            .lock()
+            .expect("tier policies mutex poisoned")
+            .get(p.tier);
+        if p.ttl.is_zero() {
+            p.ttl = if policy.ttl.is_zero() { DEFAULT_TTL } else { policy.ttl };
+        }
+        if p.quota_bytes == 0 {
+            p.quota_bytes = policy.quota_bytes;
+        }
+        if p.rate_bps == 0 {
+            p.rate_bps = policy.rate_bps;
+        }
+        p
+    }
+
     /// Time-injected grant. The trait method calls this with `Instant::now()`.
     ///
     /// Fail-closed ordering (G2): `add_auth` runs **first**. Only on success do
     /// we insert the session and emit `GRANTED`. If the writer errors, no session
     /// exists and the error propagates — the client is never let through.
     pub async fn grant_at(&self, params: GrantParams, now: Instant) -> Result<SessionId> {
+        // Resolve tier-policy defaults first so the kernel timeout, the in-RAM
+        // expiry and the reported SessionInfo all see the *effective* values.
+        let params = self.effective_params(params);
+
         // Reject past the RAM cap before touching the kernel. Re-granting an
         // existing MAC is allowed (it refreshes the element) and does not count
-        // against the cap.
+        // against the cap — so lowering the cap at runtime never evicts or
+        // locks out an existing session, it only blocks new MACs.
         {
+            let cap = self.params.borrow().max_sessions;
             let map = self.sessions.lock().expect("sessions mutex poisoned");
-            if !map.contains_key(&params.mac) && map.len() >= MAX_SESSIONS {
+            if !map.contains_key(&params.mac) && map.len() >= cap {
                 tracing::warn!(
                     mac = %params.mac,
-                    cap = MAX_SESSIONS,
+                    cap,
                     "session cap reached; rejecting grant (fail-closed, no eviction)"
                 );
-                return Err(Error::Backend(format!(
-                    "session cap {MAX_SESSIONS} reached"
-                )));
+                return Err(Error::Backend(format!("session cap {cap} reached")));
             }
         }
 
@@ -402,14 +520,15 @@ impl SessionManager {
     /// which is the re-baseline behaviour §7.6 requires. Returns the number
     /// adopted (capped at [`MAX_SESSIONS`]).
     pub fn adopt(&self, elements: Vec<AuthElement>, now: Instant) -> usize {
+        let cap = self.params.borrow().max_sessions;
         let mut map = self.sessions.lock().expect("sessions mutex poisoned");
         let mut adopted = 0usize;
         let granted_at_unix = now_unix();
         for el in elements {
-            if !map.contains_key(&el.mac) && map.len() >= MAX_SESSIONS {
+            if !map.contains_key(&el.mac) && map.len() >= cap {
                 tracing::warn!(
                     mac = %el.mac,
-                    cap = MAX_SESSIONS,
+                    cap,
                     "session cap reached during adoption; skipping element"
                 );
                 continue;
@@ -496,6 +615,30 @@ impl Enforcer for SessionManager {
             Some(g) => g.set_fqdns(fqdns).await,
             None => Err(Error::BadRequest("garden control not configured".into())),
         }
+    }
+
+    async fn set_tier_policies(&self, policies: Vec<TierPolicy>) -> Result<()> {
+        self.tier_policies
+            .lock()
+            .expect("tier policies mutex poisoned")
+            .replace_all(&policies);
+        tracing::info!(n = policies.len(), "tier policies replaced");
+        Ok(())
+    }
+
+    async fn set_engine_parameters(&self, params: EngineParams) -> Result<()> {
+        // Defence in depth: the gRPC layer already validated, but the bounds
+        // also guard every other caller (a zero interval would panic a ticker).
+        params.validate()?;
+        self.params.send_replace(params);
+        tracing::info!(
+            accounting_interval_secs = params.accounting_interval.as_secs(),
+            garden_tick_secs = params.garden_tick.as_secs(),
+            expiry_tick_secs = params.expiry_tick.as_secs(),
+            max_sessions = params.max_sessions,
+            "engine parameters applied"
+        );
+        Ok(())
     }
 }
 
@@ -628,7 +771,156 @@ mod tests {
         (m, writer, sink)
     }
 
+    fn policy(tier: Tier, ttl_secs: u64, quota: u64, rate: u64) -> TierPolicy {
+        TierPolicy {
+            tier,
+            ttl: Duration::from_secs(ttl_secs),
+            quota_bytes: quota,
+            rate_bps: rate,
+        }
+    }
+
+    /// Session snapshot for assertions on effective (post-policy) values.
+    fn session_of(m: &SessionManager, mac: MacAddr) -> Session {
+        m.sessions
+            .lock()
+            .unwrap()
+            .get(&mac)
+            .expect("session present")
+            .clone()
+    }
+
     // ---- tests ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn grant_zero_fields_filled_from_tier_policy() {
+        let (m, writer, _sink) = mgr();
+        m.set_tier_policies(vec![policy(Tier::Public, 300, 10_000_000, 2_000_000)])
+            .await
+            .unwrap();
+
+        // ttl 0, quota 0, rate 0 → all inherited from the public policy.
+        m.grant_at(grant_params(mac(1), 0, 0), Instant::now()).await.unwrap();
+        assert_eq!(
+            writer.ops(),
+            vec![WriterOp::AddAuth(mac(1), Duration::from_secs(300))]
+        );
+        let s = session_of(&m, mac(1));
+        assert_eq!(s.quota_bytes, 10_000_000);
+        assert_eq!(s.rate_bps, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn grant_explicit_fields_win_over_policy() {
+        let (m, writer, _sink) = mgr();
+        m.set_tier_policies(vec![policy(Tier::Public, 300, 10_000_000, 2_000_000)])
+            .await
+            .unwrap();
+
+        let mut p = grant_params(mac(1), 60, 555);
+        p.rate_bps = 777;
+        m.grant_at(p, Instant::now()).await.unwrap();
+        assert_eq!(
+            writer.ops(),
+            vec![WriterOp::AddAuth(mac(1), Duration::from_secs(60))]
+        );
+        let s = session_of(&m, mac(1));
+        assert_eq!(s.quota_bytes, 555);
+        assert_eq!(s.rate_bps, 777);
+    }
+
+    #[tokio::test]
+    async fn grant_policy_zero_ttl_falls_back_to_builtin() {
+        let (m, writer, _sink) = mgr();
+        // No policy pushed at all: ttl 0 resolves to the built-in default and
+        // quota/rate stay unlimited.
+        m.grant_at(grant_params(mac(1), 0, 0), Instant::now()).await.unwrap();
+        assert_eq!(writer.ops(), vec![WriterOp::AddAuth(mac(1), DEFAULT_TTL)]);
+        let s = session_of(&m, mac(1));
+        assert_eq!(s.quota_bytes, 0);
+        assert_eq!(s.rate_bps, 0);
+    }
+
+    fn params_with_cap(cap: usize) -> EngineParams {
+        EngineParams { max_sessions: cap, ..EngineParams::default() }
+    }
+
+    #[tokio::test]
+    async fn lowering_cap_blocks_new_macs_without_eviction() {
+        let (m, _writer, _sink) = mgr();
+        for i in 1..=3u8 {
+            let mut p = grant_params(mac(i), 60, 0);
+            p.session_id = SessionId::from(format!("s-{i}"));
+            m.grant_at(p, Instant::now()).await.unwrap();
+        }
+
+        m.set_engine_parameters(params_with_cap(2)).await.unwrap();
+
+        // Existing sessions are untouched.
+        assert_eq!(m.len(), 3);
+        // A new MAC is rejected fail-closed...
+        let err = m.grant_at(grant_params(mac(9), 60, 0), Instant::now()).await.unwrap_err();
+        assert!(matches!(err, Error::Backend(_)));
+        // ...but a re-grant of an existing MAC still refreshes fine.
+        m.grant_at(grant_params(mac(1), 120, 0), Instant::now()).await.unwrap();
+        assert_eq!(m.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn adopt_respects_runtime_cap() {
+        let (m, _writer, _sink) = mgr();
+        m.set_engine_parameters(params_with_cap(2)).await.unwrap();
+
+        let elements: Vec<AuthElement> = (1..=4u8)
+            .map(|i| AuthElement { mac: mac(i), remaining: Duration::from_secs(60) })
+            .collect();
+        let adopted = m.adopt(elements, Instant::now());
+        assert_eq!(adopted, 2);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_engine_parameters_validates_and_fans_out() {
+        let (m, _writer, _sink) = mgr();
+        let mut rx = m.subscribe_params();
+
+        // Out-of-bounds snapshot is rejected and nothing is published.
+        let bad = EngineParams { expiry_tick: Duration::ZERO, ..EngineParams::default() };
+        assert!(m.set_engine_parameters(bad).await.is_err());
+        assert!(!rx.has_changed().unwrap());
+
+        let good = EngineParams {
+            accounting_interval: Duration::from_secs(60),
+            ..EngineParams::default()
+        };
+        m.set_engine_parameters(good).await.unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), good);
+        assert_eq!(m.current_params(), good);
+    }
+
+    #[tokio::test]
+    async fn set_tier_policies_is_full_replacement() {
+        let (m, writer, _sink) = mgr();
+        m.set_tier_policies(vec![
+            policy(Tier::Public, 300, 1, 1),
+            policy(Tier::Home, 600, 2, 2),
+        ])
+        .await
+        .unwrap();
+        // Second push omits Public → it resets to built-ins for later grants.
+        m.set_tier_policies(vec![policy(Tier::Home, 900, 3, 3)]).await.unwrap();
+
+        m.grant_at(grant_params(mac(1), 0, 0), Instant::now()).await.unwrap();
+        assert_eq!(writer.ops(), vec![WriterOp::AddAuth(mac(1), DEFAULT_TTL)]);
+        assert_eq!(session_of(&m, mac(1)).quota_bytes, 0);
+
+        let mut p = grant_params(mac(2), 0, 0);
+        p.tier = Tier::Home;
+        p.session_id = SessionId::from("sess-home");
+        m.grant_at(p, Instant::now()).await.unwrap();
+        assert_eq!(session_of(&m, mac(2)).quota_bytes, 3);
+    }
 
     #[tokio::test]
     async fn grant_adds_element_inserts_and_emits_granted() {

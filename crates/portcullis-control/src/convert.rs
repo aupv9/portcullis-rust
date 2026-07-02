@@ -10,8 +10,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use portcullis_types::{
-    Error, GrantParams, HealthStatus, MacAddr, Result, RevokeReason, SessionEvent, SessionId,
-    SessionInfo, Tier,
+    EngineParams, Error, GrantParams, HealthStatus, MacAddr, Result, RevokeReason, SessionEvent,
+    SessionId, SessionInfo, Tier, TierPolicy, DEFAULT_ACCOUNTING_INTERVAL, DEFAULT_EXPIRY_TICK,
+    DEFAULT_GARDEN_TICK, DEFAULT_MAX_SESSIONS,
 };
 
 use crate::pb;
@@ -65,6 +66,65 @@ fn parse_optional_ip(s: &str) -> Result<Option<IpAddr>> {
     s.parse::<IpAddr>()
         .map(Some)
         .map_err(|_| Error::BadRequest(format!("invalid client_ip: {s}")))
+}
+
+// ---------------------------------------------------------------------------
+// SetTierPoliciesRequest -> Vec<TierPolicy>
+// ---------------------------------------------------------------------------
+
+/// Parse and validate a wire [`pb::SetTierPoliciesRequest`] into domain
+/// [`TierPolicy`] entries (full-replacement semantics, §7.4).
+///
+/// - `tier` is parsed via [`Tier::from_str`] (empty string => `public`, matching
+///   the grant path); an unknown tier is **rejected**.
+/// - A tier repeated within one request is rejected as a bad request — the
+///   control plane's intent would be ambiguous.
+/// - An empty `policies` list is valid: it resets every tier to built-ins.
+pub fn tier_policies_from_pb(req: pb::SetTierPoliciesRequest) -> Result<Vec<TierPolicy>> {
+    let mut out = Vec::with_capacity(req.policies.len());
+    for p in req.policies {
+        let tier = Tier::from_str(&p.tier)?;
+        if out.iter().any(|q: &TierPolicy| q.tier == tier) {
+            return Err(Error::BadRequest(format!("duplicate tier: {tier}")));
+        }
+        out.push(TierPolicy {
+            tier,
+            ttl: Duration::from_secs(u64::from(p.ttl_seconds)),
+            quota_bytes: p.quota_bytes,
+            rate_bps: p.rate_bps,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// SetEngineParametersRequest -> EngineParams
+// ---------------------------------------------------------------------------
+
+/// Parse and validate a wire [`pb::SetEngineParametersRequest`] into a concrete
+/// [`EngineParams`] snapshot: every `0` field resolves to the matching
+/// `DEFAULT_*` built-in first, then the whole snapshot is bounds-checked
+/// (out-of-bounds -> `Error::BadRequest` -> `InvalidArgument` on the wire).
+pub fn engine_params_from_pb(req: pb::SetEngineParametersRequest) -> Result<EngineParams> {
+    let or_default = |secs: u32, default: Duration| {
+        if secs == 0 {
+            default
+        } else {
+            Duration::from_secs(u64::from(secs))
+        }
+    };
+    let params = EngineParams {
+        accounting_interval: or_default(req.accounting_interval_secs, DEFAULT_ACCOUNTING_INTERVAL),
+        garden_tick: or_default(req.garden_tick_secs, DEFAULT_GARDEN_TICK),
+        expiry_tick: or_default(req.expiry_tick_secs, DEFAULT_EXPIRY_TICK),
+        max_sessions: if req.max_sessions == 0 {
+            DEFAULT_MAX_SESSIONS
+        } else {
+            req.max_sessions as usize
+        },
+    };
+    params.validate()?;
+    Ok(params)
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +289,98 @@ mod tests {
         g.client_ip = "999.999.999.999".into();
         let err = grant_request_to_params(g).unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    fn pb_policy(tier: &str, ttl: u32, quota: u64, rate: u64) -> pb::TierPolicy {
+        pb::TierPolicy { tier: tier.into(), ttl_seconds: ttl, quota_bytes: quota, rate_bps: rate }
+    }
+
+    #[test]
+    fn tier_policies_parse_all_tiers() {
+        let req = pb::SetTierPoliciesRequest {
+            policies: vec![
+                pb_policy("public", 300, 1, 2),
+                pb_policy("home", 600, 3, 4),
+                pb_policy("retail", 900, 5, 6),
+            ],
+        };
+        let ps = tier_policies_from_pb(req).unwrap();
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps[0].tier, Tier::Public);
+        assert_eq!(ps[0].ttl, Duration::from_secs(300));
+        assert_eq!(ps[1].quota_bytes, 3);
+        assert_eq!(ps[2].rate_bps, 6);
+    }
+
+    #[test]
+    fn tier_policies_unknown_tier_rejected() {
+        let req = pb::SetTierPoliciesRequest { policies: vec![pb_policy("platinum", 1, 0, 0)] };
+        assert!(matches!(tier_policies_from_pb(req).unwrap_err(), Error::InvalidTier(_)));
+    }
+
+    #[test]
+    fn tier_policies_duplicate_tier_rejected() {
+        let req = pb::SetTierPoliciesRequest {
+            policies: vec![pb_policy("home", 1, 0, 0), pb_policy("home", 2, 0, 0)],
+        };
+        assert!(matches!(tier_policies_from_pb(req).unwrap_err(), Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn tier_policies_empty_tier_is_public() {
+        let req = pb::SetTierPoliciesRequest { policies: vec![pb_policy("", 1, 0, 0)] };
+        assert_eq!(tier_policies_from_pb(req).unwrap()[0].tier, Tier::Public);
+    }
+
+    #[test]
+    fn tier_policies_empty_list_is_valid() {
+        let req = pb::SetTierPoliciesRequest { policies: vec![] };
+        assert!(tier_policies_from_pb(req).unwrap().is_empty());
+    }
+
+    fn pb_params(acct: u32, garden: u32, expiry: u32, max: u32) -> pb::SetEngineParametersRequest {
+        pb::SetEngineParametersRequest {
+            accounting_interval_secs: acct,
+            garden_tick_secs: garden,
+            expiry_tick_secs: expiry,
+            max_sessions: max,
+        }
+    }
+
+    #[test]
+    fn engine_params_zeros_become_builtin_defaults() {
+        let p = engine_params_from_pb(pb_params(0, 0, 0, 0)).unwrap();
+        assert_eq!(p, EngineParams::default());
+    }
+
+    #[test]
+    fn engine_params_explicit_values_carried_through() {
+        let p = engine_params_from_pb(pb_params(60, 120, 5, 1000)).unwrap();
+        assert_eq!(p.accounting_interval, Duration::from_secs(60));
+        assert_eq!(p.garden_tick, Duration::from_secs(120));
+        assert_eq!(p.expiry_tick, Duration::from_secs(5));
+        assert_eq!(p.max_sessions, 1000);
+    }
+
+    #[test]
+    fn engine_params_bounds_accept_edges_reject_beyond() {
+        // Upper edges accepted.
+        assert!(engine_params_from_pb(pb_params(3600, 3600, 60, 16384)).is_ok());
+        // Lower edges accepted (garden's is 5).
+        assert!(engine_params_from_pb(pb_params(1, 5, 1, 1)).is_ok());
+        // One step past every bound rejected.
+        for bad in [
+            pb_params(3601, 30, 1, 100),
+            pb_params(15, 3601, 1, 100),
+            pb_params(15, 4, 1, 100),
+            pb_params(15, 30, 61, 100),
+            pb_params(15, 30, 1, 16385),
+        ] {
+            assert!(
+                matches!(engine_params_from_pb(bad).unwrap_err(), Error::BadRequest(_)),
+                "expected BadRequest for {bad:?}"
+            );
+        }
     }
 
     #[test]
