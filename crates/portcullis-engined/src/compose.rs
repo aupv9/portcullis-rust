@@ -146,7 +146,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //    replaces the list at runtime) and guarded by dnsmasq ipset support — on
     //    a stock dnsmasq it disables itself instead of killing LAN DNS.
     {
-        let garden = portcullis_garden::GardenManager::new(GARDEN_CONF_PATH, cfg.garden_fqdn.clone());
+        let garden = portcullis_garden::GardenManager::new(
+            GARDEN_CONF_PATH,
+            cfg.garden_fqdn.clone(),
+            Some(writer.clone()),
+        );
         w.mgr.set_garden_control(garden.clone() as Arc<dyn portcullis_types::GardenControl>);
         let garden_run = garden.clone();
         tasks.push(tokio::spawn(async move {

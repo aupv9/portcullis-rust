@@ -344,6 +344,15 @@ pub trait RulesetWriter: Send + Sync {
     /// jump rules (block unauthorized traffic); `false` removes them so all
     /// traffic flows. MUST leave the `auth` set and chains intact (idempotent).
     async fn set_enforcement(&self, enabled: bool) -> Result<()>;
+
+    /// Replace the walled-garden IP sets atomically with the given resolved
+    /// addresses (engine-resolver garden for routers without dnsmasq ipset
+    /// support). Full-replace; MUST be atomic (no fail-open window).
+    async fn replace_garden(
+        &self,
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+    ) -> Result<()>;
 }
 
 /// Sink for session lifecycle events flowing engine -> control plane (TDD §7.5).

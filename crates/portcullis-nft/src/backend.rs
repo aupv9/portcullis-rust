@@ -36,6 +36,15 @@ pub trait FirewallBackend: Send + Sync {
     /// `auth` set or flush the gating chains — only the base-hook jump changes.
     /// Idempotent (safe to call repeatedly with the same value).
     async fn set_enforcement(&self, enabled: bool) -> Result<()>;
+
+    /// Atomically replace the walled-garden IP sets (v4/v6) with the given
+    /// resolved addresses — the engine-resolver garden path for routers whose
+    /// dnsmasq can't populate the sets itself.
+    async fn replace_garden(
+        &self,
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+    ) -> Result<()>;
 }
 
 /// A mutation recorded by [`MockBackend`], for test assertions.
@@ -46,6 +55,7 @@ pub enum MockOp {
     DelAuth { mac: MacAddr },
     ListAuth,
     SetEnforcement { enabled: bool },
+    ReplaceGarden { v4: Vec<std::net::Ipv4Addr>, v6: Vec<std::net::Ipv6Addr> },
 }
 
 /// In-memory [`FirewallBackend`] for unit tests and host smoke use.
@@ -176,6 +186,17 @@ impl FirewallBackend for MockBackend {
         Self::maybe_fail(&mut inner, "set_enforcement")?;
         inner.enforcement_enabled = enabled;
         inner.ops.push(MockOp::SetEnforcement { enabled });
+        Ok(())
+    }
+
+    async fn replace_garden(
+        &self,
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::maybe_fail(&mut inner, "replace_garden")?;
+        inner.ops.push(MockOp::ReplaceGarden { v4, v6 });
         Ok(())
     }
 }

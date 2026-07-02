@@ -39,6 +39,11 @@ enum Command {
         enabled: bool,
         reply: oneshot::Sender<Result<()>>,
     },
+    ReplaceGarden {
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Cloneable handle to the writer actor. Implements [`RulesetWriter`].
@@ -85,6 +90,14 @@ impl RulesetWriter for WriterHandle {
 
     async fn set_enforcement(&self, enabled: bool) -> Result<()> {
         self.call(|reply| Command::SetEnforcement { enabled, reply }).await
+    }
+
+    async fn replace_garden(
+        &self,
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+    ) -> Result<()> {
+        self.call(|reply| Command::ReplaceGarden { v4, v6, reply }).await
     }
 }
 
@@ -135,6 +148,10 @@ impl WriterActor {
                 }
                 Command::SetEnforcement { enabled, reply } => {
                     let r = retry_once(|| self.backend.set_enforcement(enabled)).await;
+                    let _ = reply.send(r);
+                }
+                Command::ReplaceGarden { v4, v6, reply } => {
+                    let r = retry_once(|| self.backend.replace_garden(v4.clone(), v6.clone())).await;
                     let _ = reply.send(r);
                 }
             }
@@ -194,6 +211,13 @@ mod tests {
         }
         async fn set_enforcement(&self, enabled: bool) -> Result<()> {
             self.0.set_enforcement(enabled).await
+        }
+        async fn replace_garden(
+            &self,
+            v4: Vec<std::net::Ipv4Addr>,
+            v6: Vec<std::net::Ipv6Addr>,
+        ) -> Result<()> {
+            self.0.replace_garden(v4, v6).await
         }
     }
 

@@ -30,12 +30,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use portcullis_types::{Error, GardenControl, Result};
+use portcullis_types::{Error, GardenControl, Result, RulesetWriter};
 use tokio::sync::Mutex;
 
 /// The set of garden FQDNs plus the ipset names that dnsmasq should populate.
@@ -248,47 +250,90 @@ pub async fn run_garden_loop(path: impl AsRef<Path>, cfg: GardenConfig, interval
 /// it just holds the list in RAM, ready for a dnsmasq-full box.
 pub struct GardenManager {
     path: PathBuf,
+    /// dnsmasq ipset support, probed once at construction. `true` → use the
+    /// dnsmasq `ipset=` path; `false` → use the engine-resolver path (if a writer
+    /// is present) so the garden works on a stock dnsmasq too.
     supported: bool,
+    /// Writer for the engine-resolver path (populates the garden ipsets directly).
+    /// `None` disables the resolver fallback.
+    writer: Option<Arc<dyn RulesetWriter>>,
     cfg: Mutex<GardenConfig>,
 }
 
 impl GardenManager {
     /// Build a manager seeded with `fqdns`, probing dnsmasq ipset support now.
-    pub fn new(path: impl Into<PathBuf>, fqdns: Vec<String>) -> Arc<Self> {
+    /// `writer` enables the engine-resolver garden path on a stock dnsmasq.
+    pub fn new(
+        path: impl Into<PathBuf>,
+        fqdns: Vec<String>,
+        writer: Option<Arc<dyn RulesetWriter>>,
+    ) -> Arc<Self> {
         Arc::new(GardenManager {
             path: path.into(),
             supported: dnsmasq_supports_ipset("dnsmasq"),
+            writer,
             cfg: Mutex::new(GardenConfig::with_fqdns(fqdns)),
         })
     }
 
-    /// Reconcile the dnsmasq garden config from the current FQDN list, reloading
-    /// dnsmasq on change. No-op that removes any stale conf when dnsmasq lacks
-    /// ipset support (protects LAN DNS).
-    pub async fn reconcile_now(&self) -> Result<bool> {
-        if !self.supported {
-            let _ = tokio::fs::remove_file(&self.path).await;
-            return Ok(false);
-        }
-        let cfg = self.cfg.lock().await.clone();
-        let changed = reconcile(&self.path, &cfg).await?;
-        if changed {
-            // best-effort reload so the new garden takes effect immediately.
-            let _ = tokio::process::Command::new("/etc/init.d/dnsmasq")
-                .arg("reload")
-                .status()
-                .await;
-        }
-        Ok(changed)
+    /// Resolve `fqdns` to sorted, de-duplicated v4/v6 addresses via the system
+    /// resolver (blocking `getaddrinfo` offloaded to the blocking pool).
+    async fn resolve_all(fqdns: Vec<String>) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+        tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            let (mut v4, mut v6) = (BTreeSet::new(), BTreeSet::new());
+            for f in fqdns.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Ok(addrs) = (f, 0u16).to_socket_addrs() {
+                    for a in addrs {
+                        match a.ip() {
+                            IpAddr::V4(x) => { v4.insert(x); }
+                            IpAddr::V6(x) => { v6.insert(x); }
+                        }
+                    }
+                }
+            }
+            (v4.into_iter().collect(), v6.into_iter().collect())
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    /// Periodic reconcile (first-boot + drift). Runs until aborted.
+    /// Apply the current garden: dnsmasq `ipset=` config when supported, else
+    /// resolve the FQDNs and push their IPs straight into the garden ipsets.
+    pub async fn reconcile_now(&self) -> Result<bool> {
+        if self.supported {
+            let cfg = self.cfg.lock().await.clone();
+            let changed = reconcile(&self.path, &cfg).await?;
+            if changed {
+                let _ = tokio::process::Command::new("/etc/init.d/dnsmasq")
+                    .arg("reload")
+                    .status()
+                    .await;
+            }
+            return Ok(changed);
+        }
+        // Stock dnsmasq: never write ipset= (would kill DNS); resolve → ipset.
+        let _ = tokio::fs::remove_file(&self.path).await;
+        let fqdns = self.cfg.lock().await.fqdns.clone();
+        if let Some(w) = &self.writer {
+            let (v4, v6) = Self::resolve_all(fqdns).await;
+            let (n4, n6) = (v4.len(), v6.len());
+            w.replace_garden(v4, v6).await?;
+            tracing::debug!(v4 = n4, v6 = n6, "engine-resolver garden applied to ipsets");
+        }
+        Ok(false)
+    }
+
+    /// Periodic reconcile (first-boot + drift + CDN churn). Runs until aborted.
     pub async fn run(self: Arc<Self>, interval: Duration) {
-        if !self.supported {
+        if !self.supported && self.writer.is_none() {
             tracing::warn!(path = %self.path.display(),
-                "dnsmasq has no ipset support (stock/slim) — walled-garden disabled; install dnsmasq-full to enable");
+                "dnsmasq has no ipset support and no resolver writer — walled-garden disabled");
             let _ = tokio::fs::remove_file(&self.path).await;
             return;
+        }
+        if !self.supported {
+            tracing::info!("dnsmasq lacks ipset support — using engine-resolver garden (resolve FQDN -> ipset)");
         }
         let mut ticker = tokio::time::interval(interval);
         loop {
@@ -296,7 +341,7 @@ impl GardenManager {
             match self.reconcile_now().await {
                 Ok(true) => tracing::info!(path = %self.path.display(), "garden config reconciled (changed)"),
                 Ok(false) => {}
-                Err(e) => tracing::warn!(path = %self.path.display(), error = %e, "garden reconcile failed; keeping prior config"),
+                Err(e) => tracing::warn!(error = %e, "garden reconcile failed; keeping prior state"),
             }
         }
     }

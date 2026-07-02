@@ -19,7 +19,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::backend::FirewallBackend;
-use crate::ruleset::{build_base_ruleset, build_set_enforcement, SET_AUTH, TABLE_FAMILY, TABLE_NAME};
+use crate::ruleset::{
+    build_base_ruleset, build_set_enforcement, SET_AUTH, SET_GARDEN4, SET_GARDEN6, TABLE_FAMILY,
+    TABLE_NAME,
+};
 
 /// Backend that builds `nft -j` JSON and invokes the `nft` binary.
 pub struct NftJsonBackend {
@@ -193,6 +196,28 @@ impl FirewallBackend for NftJsonBackend {
 
     async fn set_enforcement(&self, enabled: bool) -> Result<()> {
         self.apply_json(&build_set_enforcement(enabled)).await
+    }
+
+    async fn replace_garden(
+        &self,
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+    ) -> Result<()> {
+        let mut cmds: Vec<Value> = vec![
+            serde_json::json!({ "flush": { "set": { "family": TABLE_FAMILY, "table": TABLE_NAME, "name": SET_GARDEN4 } } }),
+            serde_json::json!({ "flush": { "set": { "family": TABLE_FAMILY, "table": TABLE_NAME, "name": SET_GARDEN6 } } }),
+        ];
+        if !v4.is_empty() {
+            let elems: Vec<Value> = v4.iter().map(|a| serde_json::json!(a.to_string())).collect();
+            cmds.push(serde_json::json!({ "add": { "element": {
+                "family": TABLE_FAMILY, "table": TABLE_NAME, "name": SET_GARDEN4, "elem": elems } } }));
+        }
+        if !v6.is_empty() {
+            let elems: Vec<Value> = v6.iter().map(|a| serde_json::json!(a.to_string())).collect();
+            cmds.push(serde_json::json!({ "add": { "element": {
+                "family": TABLE_FAMILY, "table": TABLE_NAME, "name": SET_GARDEN6, "elem": elems } } }));
+        }
+        self.apply_json(&serde_json::json!({ "nftables": cmds })).await
     }
 }
 
