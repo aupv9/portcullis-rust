@@ -82,10 +82,23 @@ pub struct Config {
     #[serde(default = "default_rl_max_keys")]
     pub redirect_rl_max_keys: u32,
 
-    /// Bound of the in-RAM event fan-out channel (gRPC StreamEvents). Slow or
-    /// disconnected consumers drop oldest past this; enforcement never blocks.
+    /// Bound of the in-RAM replayable event log (gRPC StreamEvents). This is
+    /// the at-least-once replay window: a control-plane outage shorter than
+    /// what the buffer covers loses no events. Oldest evicted past this;
+    /// enforcement never blocks. ~100 B/event: 4096 ≈ 400 KB RAM.
     #[serde(default = "default_event_buffer")]
     pub event_buffer_size: u32,
+
+    /// Enable the per-client tc/HTB download shaper (§7.7). Opt-in: requires
+    /// `tc` + HTB support on the device; when the runtime probe fails the
+    /// daemon logs and runs unshaped (QoS is best-effort, never fail-closed).
+    #[serde(default)]
+    pub shaper_enabled: bool,
+
+    /// LAN egress interface the shaper's HTB qdisc attaches to (traffic
+    /// towards clients).
+    #[serde(default = "default_shape_interface")]
+    pub shape_interface: String,
 }
 
 /// Serde default for [`Config::enforcement_default`]: boot fail-closed.
@@ -105,7 +118,10 @@ fn default_rl_max_keys() -> u32 {
     10_000
 }
 fn default_event_buffer() -> u32 {
-    512
+    4096
+}
+fn default_shape_interface() -> String {
+    "br-lan".to_string()
 }
 
 impl Default for Config {
@@ -126,7 +142,9 @@ impl Default for Config {
             redirect_rl_capacity: 5,
             redirect_rl_refill_per_sec: 1,
             redirect_rl_max_keys: 10_000,
-            event_buffer_size: 512,
+            event_buffer_size: 4096,
+            shaper_enabled: false,
+            shape_interface: "br-lan".to_string(),
         }
     }
 }
@@ -289,6 +307,11 @@ impl Config {
                 "event_buffer_size must be >= 1".to_string(),
             ));
         }
+        if self.shaper_enabled && self.shape_interface.trim().is_empty() {
+            return Err(Error::Config(
+                "shape_interface must not be empty when shaper_enabled".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -335,6 +358,8 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "redirect_rl_refill_per_sec" => cfg.redirect_rl_refill_per_sec = parse_u32(val)?,
         "redirect_rl_max_keys" => cfg.redirect_rl_max_keys = parse_u32(val)?,
         "event_buffer_size" => cfg.event_buffer_size = parse_u32(val)?,
+        "shaper_enabled" => cfg.shaper_enabled = parse_bool(val)?,
+        "shape_interface" => cfg.shape_interface = val.to_string(),
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -436,13 +461,15 @@ pub fn diff(old: &Config, new: &Config) -> ReloadImpact {
         || old.hmac_key_file != new.hmac_key_file
         || old.responder_port != new.responder_port
         || old.store_id != new.store_id
-        // The rate limiter and event channel are built once at composition;
-        // resizing either requires a restart (the CP-tunable knobs live in
-        // SetEngineParameters instead).
+        // The rate limiter, event channel, and shaper are built once at
+        // composition; changing any requires a restart (the CP-tunable knobs
+        // live in SetEngineParameters instead).
         || old.redirect_rl_capacity != new.redirect_rl_capacity
         || old.redirect_rl_refill_per_sec != new.redirect_rl_refill_per_sec
         || old.redirect_rl_max_keys != new.redirect_rl_max_keys
-        || old.event_buffer_size != new.event_buffer_size;
+        || old.event_buffer_size != new.event_buffer_size
+        || old.shaper_enabled != new.shaper_enabled
+        || old.shape_interface != new.shape_interface;
 
     if requires_restart {
         ReloadImpact::RequiresRestart
@@ -555,7 +582,7 @@ config portcullis 'main'
         assert_eq!(old.redirect_rl_capacity, 5);
         assert_eq!(old.redirect_rl_refill_per_sec, 1);
         assert_eq!(old.redirect_rl_max_keys, 10_000);
-        assert_eq!(old.event_buffer_size, 512);
+        assert_eq!(old.event_buffer_size, 4096);
         // Same for TOML documents that predate the fields.
         let toml = Config::from_toml_str(
             r#"
@@ -571,7 +598,7 @@ default_rate_kbps = 2048
 "#,
         )
         .unwrap();
-        assert_eq!(toml.event_buffer_size, 512);
+        assert_eq!(toml.event_buffer_size, 4096);
     }
 
     #[test]
@@ -627,7 +654,9 @@ default_rate_kbps = 2048
             redirect_rl_capacity: 5,
             redirect_rl_refill_per_sec: 1,
             redirect_rl_max_keys: 10_000,
-            event_buffer_size: 512,
+            event_buffer_size: 4096,
+            shaper_enabled: true,
+            shape_interface: "br-lan".to_string(),
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
