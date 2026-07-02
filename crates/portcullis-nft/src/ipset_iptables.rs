@@ -295,6 +295,36 @@ impl FirewallBackend for IpsetIptablesBackend {
         }
         Ok(())
     }
+
+    async fn replace_garden(
+        &self,
+        v4: Vec<std::net::Ipv4Addr>,
+        v6: Vec<std::net::Ipv6Addr>,
+    ) -> Result<()> {
+        let v4s: Vec<String> = v4.iter().map(|a| a.to_string()).collect();
+        let v6s: Vec<String> = v6.iter().map(|a| a.to_string()).collect();
+        self.replace_set(IPSET_G4, "inet", &v4s).await?;
+        self.replace_set(IPSET_G6, "inet6", &v6s).await?;
+        Ok(())
+    }
+}
+
+impl IpsetIptablesBackend {
+    /// Atomically replace a garden hash:net set with `addrs`: populate a tmp set
+    /// then `ipset swap` it in (no window where the set is empty), and destroy
+    /// the tmp. Used by the engine-resolver garden path.
+    async fn replace_set(&self, set: &str, family: &str, addrs: &[String]) -> Result<()> {
+        let tmp = format!("{set}_tmp");
+        Self::run(&self.ipset_bin, &["create", "-exist", &tmp, "hash:net", "family", family]).await?;
+        Self::run(&self.ipset_bin, &["flush", &tmp]).await?;
+        for a in addrs {
+            // /32|/128 host entries; best-effort per address (skip a bad one).
+            let _ = Self::run(&self.ipset_bin, &["add", "-exist", &tmp, a]).await;
+        }
+        Self::run(&self.ipset_bin, &["swap", &tmp, set]).await?;
+        let _ = Self::run_ok(&self.ipset_bin, &["destroy", &tmp]).await;
+        Ok(())
+    }
 }
 
 /// Parse `ipset list wifihub_auth` output into [`AuthElement`]s.

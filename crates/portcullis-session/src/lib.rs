@@ -570,6 +570,13 @@ mod tests {
             self.ops.lock().unwrap().push(WriterOp::SetEnforcement(enabled));
             Ok(())
         }
+        async fn replace_garden(
+            &self,
+            _v4: Vec<std::net::Ipv4Addr>,
+            _v6: Vec<std::net::Ipv6Addr>,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     /// Captures every emitted event.
