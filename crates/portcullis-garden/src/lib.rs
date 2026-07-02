@@ -172,6 +172,26 @@ pub async fn reconcile(path: impl AsRef<Path>, cfg: &GardenConfig) -> Result<boo
     Ok(true)
 }
 
+/// Parse `dnsmasq --version` output for ipset support. Stock/slim dnsmasq lists
+/// `no-ipset` in its compile-time options; dnsmasq-full lists `ipset`. Pure so
+/// it can be unit-tested without a dnsmasq binary.
+pub fn version_has_ipset(version_output: &str) -> bool {
+    version_output.contains("ipset") && !version_output.contains("no-ipset")
+}
+
+/// Probe whether the local dnsmasq was built with `ipset=` support (dnsmasq-full).
+///
+/// This matters because handing an `ipset=` directive to a STOCK/slim dnsmasq
+/// makes it fail to start — taking DNS down for the whole LAN. If we can't probe
+/// the binary we assume **unsupported** (fail safe: never risk DNS).
+pub fn dnsmasq_supports_ipset(dnsmasq_bin: &str) -> bool {
+    // One-shot probe at loop startup; a blocking exec here is fine.
+    match std::process::Command::new(dnsmasq_bin).arg("--version").output() {
+        Ok(o) => version_has_ipset(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => false,
+    }
+}
+
 /// Periodically reconcile the garden config at `path` every `interval`.
 ///
 /// Runs until cancelled (drop the task / abort the join handle). Each tick calls
@@ -179,10 +199,32 @@ pub async fn reconcile(path: impl AsRef<Path>, cfg: &GardenConfig) -> Result<boo
 /// transient I/O failure must not stop future reconciles, and (fail-closed) the
 /// previous config stays in force meanwhile.
 ///
+/// **DNS safety:** the `ipset=` directive requires dnsmasq-full. On a stock/slim
+/// dnsmasq it would crash the resolver and black-hole the whole LAN's DNS, so if
+/// dnsmasq lacks ipset support we skip the garden entirely — removing any stale
+/// config we previously wrote — and never touch it again this run.
+///
 /// Kept intentionally simple: it does not trigger the dnsmasq reload itself
 /// (out of scope, see [`reconcile`]). The first reconcile runs immediately.
 pub async fn run_garden_loop(path: impl AsRef<Path>, cfg: GardenConfig, interval: Duration) {
     let path = path.as_ref();
+
+    if !dnsmasq_supports_ipset("dnsmasq") {
+        tracing::warn!(
+            path = %path.display(),
+            "dnsmasq has no ipset support (stock/slim) — skipping walled-garden; \
+             writing ipset= would crash dnsmasq and kill LAN DNS. Install dnsmasq-full to enable."
+        );
+        // Remove any stale garden config (ours or a package postinst's) so the
+        // next dnsmasq reload doesn't choke on a lingering ipset= line.
+        if let Err(e) = tokio::fs::remove_file(path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), error = %e, "could not remove stale garden config");
+            }
+        }
+        return;
+    }
+
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
@@ -204,6 +246,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("portcullis-garden-test-{tag}-{nanos}.conf"))
+    }
+
+    #[test]
+    fn version_has_ipset_detects_full_vs_stock() {
+        assert!(version_has_ipset("Dnsmasq version 2.90 ... Compile time options: IPv6 ipset nftset"));
+        assert!(!version_has_ipset("Dnsmasq version 2.90 ... Compile time options: IPv6 no-ipset no-nftset"));
+        assert!(!version_has_ipset(""));
     }
 
     #[test]
