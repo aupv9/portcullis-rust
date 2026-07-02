@@ -156,7 +156,8 @@ jobs:
               : > Packages
               for ipk in *.ipk; do
                 tmp="$(mktemp -d)"
-                ar p "$ipk" control.tar.gz | tar xzf - -C "$tmp" ./control
+                # .ipk is a gzipped tar (pack-ipk.sh), not an ar/deb archive
+                tar xzOf "$ipk" ./control.tar.gz | tar xzf - -C "$tmp" ./control
                 cat "$tmp/control" >> Packages
                 echo "Filename: $ipk" >> Packages
                 echo "Size: $(stat -c%s "$ipk")" >> Packages
