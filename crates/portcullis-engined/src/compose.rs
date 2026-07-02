@@ -9,16 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portcullis_config::Config;
-use portcullis_types::{CounterSource, Enforcer, MeteringSink, RulesetWriter};
+use portcullis_session::SessionManager;
+use portcullis_types::{CounterSource, Enforcer, EngineParams, MeteringSink, RulesetWriter};
+use tokio::sync::watch;
 
 use crate::{wire, DEFAULT_PORTAL_URL, GARDEN_CONF_PATH};
-
-/// How often the daemon-side expiry sweep runs. The kernel set-element timeout
-/// is the authoritative backstop (§7.4); this loop only emits the accounting
-/// `EXPIRED` record and cleans the in-RAM view, so 1 s is ample.
-const EXPIRY_TICK: Duration = Duration::from_secs(1);
-/// Walled-garden reconcile cadence.
-const GARDEN_TICK: Duration = Duration::from_secs(30);
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // 1. Firewall backend + single-owner writer actor (§7.9). The only path to
@@ -49,7 +44,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     });
 
     // 2-4. Domain core: event channel + sink, SessionManager, gRPC service.
-    let w = wire(writer.clone());
+    let w = wire(writer.clone(), &cfg);
     let adopted_n = w.mgr.adopt(adopted, Instant::now());
     tracing::info!(adopted = adopted_n, "restart adoption complete");
 
@@ -112,9 +107,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     ) {
         Some(rcfg) => {
             let resolver = portcullis_redirect::IpNeighResolver::new();
+            let rl = portcullis_redirect::RateLimitConfig {
+                capacity: f64::from(cfg.redirect_rl_capacity),
+                refill_per_sec: f64::from(cfg.redirect_rl_refill_per_sec),
+                max_keys: cfg.redirect_rl_max_keys as usize,
+            };
             tasks.push(tokio::spawn(async move {
                 tracing::info!(port = rcfg.listen_port, "redirect responder listening");
-                if let Err(e) = portcullis_redirect::serve(rcfg, resolver).await {
+                if let Err(e) = portcullis_redirect::serve_with_limits(rcfg, resolver, rl).await {
                     tracing::error!(error = %e, "redirect responder exited");
                 }
             }));
@@ -123,28 +123,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // 7. Accounting metering loop (§7.6): conntrack counters -> SessionManager
-    //    (which computes deltas, emits INTERIM, enforces quota).
+    //    (which computes deltas, emits INTERIM, enforces quota). The cadence is
+    //    runtime-adjustable (SetEngineParameters) via the params watch channel.
     {
         let source: Arc<dyn CounterSource> = Arc::new(portcullis_accounting::ConntrackSource::new(
             portcullis_redirect::IpNeighResolver::new(),
         ));
         let metering_sink: Arc<dyn MeteringSink> = w.mgr.clone();
-        let interval = Duration::from_secs(cfg.accounting_interval.max(1));
+        let rx = w.mgr.subscribe_params();
         tasks.push(tokio::spawn(async move {
-            portcullis_accounting::run_metering_loop(
-                source,
-                metering_sink,
-                interval,
-                std::future::pending::<()>(),
-            )
-            .await;
+            run_metering_with_params(source, metering_sink, rx).await;
         }));
     }
 
     // 8. Walled-garden reconciler (§7.3): keep dnsmasq's config in sync with the
     //    FQDN list. The GardenManager is control-plane-managed (SetGarden gRPC
     //    replaces the list at runtime) and guarded by dnsmasq ipset support — on
-    //    a stock dnsmasq it disables itself instead of killing LAN DNS.
+    //    a stock dnsmasq it disables itself instead of killing LAN DNS. Cadence
+    //    is runtime-adjustable via the params watch channel.
     {
         let garden = portcullis_garden::GardenManager::new(
             GARDEN_CONF_PATH,
@@ -153,23 +149,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         );
         w.mgr.set_garden_control(garden.clone() as Arc<dyn portcullis_types::GardenControl>);
         let garden_run = garden.clone();
+        let rx = w.mgr.subscribe_params();
         tasks.push(tokio::spawn(async move {
-            garden_run.run(GARDEN_TICK).await;
+            garden_run.run_watch(rx).await;
         }));
     }
 
-    // 9. Daemon-side expiry sweep (dual-path expiry, §7.4).
+    // 9. Daemon-side expiry sweep (dual-path expiry, §7.4). Cadence is
+    //    runtime-adjustable via the params watch channel.
     {
         let mgr = w.mgr.clone();
+        let rx = w.mgr.subscribe_params();
         tasks.push(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(EXPIRY_TICK);
-            loop {
-                ticker.tick().await;
-                let expired = mgr.tick_expiry(Instant::now()).await;
-                if expired > 0 {
-                    tracing::debug!(expired, "expiry sweep removed sessions");
-                }
-            }
+            run_expiry_loop(mgr, rx).await;
         }));
     }
 
@@ -182,6 +174,73 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // The kernel keeps the ruleset and the auth set with their timeouts, so a
     // clean daemon stop never drops authorized clients (§7.8).
     Ok(())
+}
+
+/// The daemon-side expiry sweep (dual-path expiry, §7.4). The kernel
+/// set-element timeout is the authoritative backstop; this loop only emits the
+/// accounting `EXPIRED` record and cleans the in-RAM view. Rebuilds its ticker
+/// when the engine parameters change (`SetEngineParameters.expiry_tick_secs`).
+pub(crate) async fn run_expiry_loop(
+    mgr: Arc<SessionManager>,
+    mut rx: watch::Receiver<EngineParams>,
+) {
+    // tokio's clock rather than std so the sweep follows test-util's paused
+    // time; outside tests the two are the same instant.
+    let sweep = |mgr: Arc<SessionManager>| async move {
+        let expired = mgr.tick_expiry(tokio::time::Instant::now().into_std()).await;
+        if expired > 0 {
+            tracing::debug!(expired, "expiry sweep removed sessions");
+        }
+    };
+    let mut ticker =
+        tokio::time::interval(rx.borrow_and_update().expiry_tick.max(Duration::from_secs(1)));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => sweep(mgr.clone()).await,
+            res = rx.changed() => match res {
+                Ok(()) => {
+                    let tick = rx.borrow_and_update().expiry_tick.max(Duration::from_secs(1));
+                    tracing::info!(expiry_tick_secs = tick.as_secs(), "expiry cadence updated");
+                    ticker = tokio::time::interval(tick);
+                }
+                // Sender gone (shutdown path): a closed watch resolves
+                // immediately forever — drop out of the select to a plain loop
+                // on the last cadence instead of busy-spinning.
+                Err(_) => break,
+            },
+        }
+    }
+    loop {
+        ticker.tick().await;
+        sweep(mgr.clone()).await;
+    }
+}
+
+/// Drive `run_metering_loop` with a runtime-adjustable interval: each pass runs
+/// the loop at the current cadence and hands it `rx.changed()` as the shutdown
+/// future, so a parameter push cleanly stops the inner loop (its `biased`
+/// select lets an in-flight `meter_once` — including a quota revoke — finish
+/// first) and the outer loop re-arms it with the new interval. Trade-off: each
+/// re-arm fires the inner loop's immediate first tick — one extra conntrack
+/// snapshot per parameter push, which re-baselining makes idempotent.
+pub(crate) async fn run_metering_with_params(
+    source: Arc<dyn CounterSource>,
+    sink: Arc<dyn MeteringSink>,
+    mut rx: watch::Receiver<EngineParams>,
+) {
+    loop {
+        let interval = rx.borrow_and_update().accounting_interval.max(Duration::from_secs(1));
+        let changed = rx.changed();
+        portcullis_accounting::run_metering_loop(source.clone(), sink.clone(), interval, async {
+            if changed.await.is_err() {
+                // Sender gone: run on the last interval forever (daemon is
+                // shutting down; the task gets aborted with the rest).
+                std::future::pending::<()>().await;
+            }
+        })
+        .await;
+        // Inner loop returned => the params changed; rebuild with the new value.
+    }
 }
 
 /// Resolve the address to bind the gRPC control server on: the IPv4 address of
@@ -242,5 +301,112 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use portcullis_types::{Counters, MacAddr, Result as PResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts snapshots served; always empty (the cadence, not the data, is
+    /// under test).
+    struct CountingSource(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl CounterSource for CountingSource {
+        async fn snapshot(&self) -> PResult<Vec<(MacAddr, Counters)>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    struct NullSink;
+
+    #[async_trait::async_trait]
+    impl MeteringSink for NullSink {
+        async fn apply_counters(&self, _snapshot: Vec<(MacAddr, Counters)>) -> PResult<()> {
+            Ok(())
+        }
+    }
+
+    fn params(accounting_secs: u64, expiry_secs: u64) -> EngineParams {
+        EngineParams {
+            accounting_interval: Duration::from_secs(accounting_secs),
+            expiry_tick: Duration::from_secs(expiry_secs),
+            ..EngineParams::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metering_interval_change_takes_effect_without_restart() {
+        let source = Arc::new(CountingSource(AtomicUsize::new(0)));
+        let sink: Arc<dyn MeteringSink> = Arc::new(NullSink);
+        let (tx, rx) = watch::channel(params(15, 1));
+
+        let src: Arc<dyn CounterSource> = source.clone();
+        let loop_task = tokio::spawn(run_metering_with_params(src, sink, rx));
+
+        // Immediate first tick, then one per 15 s.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 2);
+
+        // Push a 60 s cadence: the re-arm fires one immediate tick (documented
+        // trade-off), then nothing until 60 s later.
+        tx.send_replace(params(60, 1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 3);
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 3, "no tick before the new 60s cadence");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(source.0.load(Ordering::SeqCst), 4);
+
+        loop_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_tick_change_rebuilds_ticker() {
+        // Real SessionManager over the mock nft backend (no kernel, no sockets).
+        let (handle, _join) = portcullis_nft::spawn(Box::new(portcullis_nft::MockBackend::default()));
+        let writer: Arc<dyn RulesetWriter> = Arc::new(handle);
+        let w = crate::wire(writer, &Config::default());
+
+        let (tx, rx) = watch::channel(params(15, 1));
+        let loop_task = tokio::spawn(run_expiry_loop(w.mgr.clone(), rx));
+
+        // A 5 s session is swept within ~6 s at the 1 s cadence.
+        let grant = |mac: &str, sid: &str| portcullis_types::GrantParams {
+            store_id: "SITE-T".into(),
+            mac: mac.parse().unwrap(),
+            ip: None,
+            ttl: Duration::from_secs(5),
+            quota_bytes: 0,
+            rate_bps: 0,
+            tier: portcullis_types::Tier::Public,
+            session_id: portcullis_types::SessionId(sid.into()),
+        };
+        w.mgr.grant_at(grant("aa:bb:cc:dd:ee:01", "s-1"), tokio::time::Instant::now().into_std())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(w.mgr.len(), 0, "1s cadence sweeps a 5s session within 6s");
+
+        // Switch to a 30 s cadence. The rebuild fires one immediate sweep, so a
+        // session granted after the switch outlives its 5 s TTL in RAM until
+        // the next 30 s tick.
+        tx.send_replace(params(15, 30));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        w.mgr.grant_at(grant("aa:bb:cc:dd:ee:02", "s-2"), tokio::time::Instant::now().into_std())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(w.mgr.len(), 1, "expired session lingers between 30s sweeps");
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert_eq!(w.mgr.len(), 0, "next 30s sweep removes it");
+
+        loop_task.abort();
     }
 }

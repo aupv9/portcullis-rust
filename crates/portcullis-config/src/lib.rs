@@ -67,11 +67,45 @@ pub struct Config {
     /// §11/G5): the engine always boots blocking unauthorized traffic.
     #[serde(default = "default_enforcement")]
     pub enforcement_default: bool,
+
+    /// Redirect responder rate limit: token-bucket burst capacity per source IP
+    /// (integer — `Config` is `Eq`; converted to f64 at the wiring point).
+    #[serde(default = "default_rl_capacity")]
+    pub redirect_rl_capacity: u32,
+
+    /// Redirect responder rate limit: sustained requests/second per source IP.
+    #[serde(default = "default_rl_refill")]
+    pub redirect_rl_refill_per_sec: u32,
+
+    /// Redirect responder rate limit: max distinct source IPs tracked
+    /// (anti-exhaustion cap on the limiter's memory).
+    #[serde(default = "default_rl_max_keys")]
+    pub redirect_rl_max_keys: u32,
+
+    /// Bound of the in-RAM event fan-out channel (gRPC StreamEvents). Slow or
+    /// disconnected consumers drop oldest past this; enforcement never blocks.
+    #[serde(default = "default_event_buffer")]
+    pub event_buffer_size: u32,
 }
 
 /// Serde default for [`Config::enforcement_default`]: boot fail-closed.
 fn default_enforcement() -> bool {
     true
+}
+
+/// Serde defaults for the redirect rate limiter / event buffer — mirror the
+/// previously hardcoded values so pre-0.3 config files parse unchanged.
+fn default_rl_capacity() -> u32 {
+    5
+}
+fn default_rl_refill() -> u32 {
+    1
+}
+fn default_rl_max_keys() -> u32 {
+    10_000
+}
+fn default_event_buffer() -> u32 {
+    512
 }
 
 impl Default for Config {
@@ -89,6 +123,10 @@ impl Default for Config {
             default_rate_kbps: 2048,
             garden_fqdn: Vec::new(),
             enforcement_default: true,
+            redirect_rl_capacity: 5,
+            redirect_rl_refill_per_sec: 1,
+            redirect_rl_max_keys: 10_000,
+            event_buffer_size: 512,
         }
     }
 }
@@ -231,6 +269,26 @@ impl Config {
         if self.default_ttl < 1 {
             return Err(Error::Config("default_ttl must be >= 1 second".to_string()));
         }
+        if self.redirect_rl_capacity == 0 {
+            return Err(Error::Config(
+                "redirect_rl_capacity must be >= 1".to_string(),
+            ));
+        }
+        if self.redirect_rl_refill_per_sec == 0 {
+            return Err(Error::Config(
+                "redirect_rl_refill_per_sec must be >= 1".to_string(),
+            ));
+        }
+        if self.redirect_rl_max_keys == 0 {
+            return Err(Error::Config(
+                "redirect_rl_max_keys must be >= 1".to_string(),
+            ));
+        }
+        if self.event_buffer_size == 0 {
+            return Err(Error::Config(
+                "event_buffer_size must be >= 1".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -245,6 +303,11 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
     let parse_u64 = |v: &str| -> Result<u64> {
         v.parse::<u64>().map_err(|_| {
             Error::Config(format!("UCI line {lineno}: '{key}' expects a u64, got '{v}'"))
+        })
+    };
+    let parse_u32 = |v: &str| -> Result<u32> {
+        v.parse::<u32>().map_err(|_| {
+            Error::Config(format!("UCI line {lineno}: '{key}' expects a u32, got '{v}'"))
         })
     };
     let parse_bool = |v: &str| -> Result<bool> {
@@ -268,6 +331,10 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "default_quota_mb" => cfg.default_quota_mb = parse_u64(val)?,
         "default_rate_kbps" => cfg.default_rate_kbps = parse_u64(val)?,
         "enforcement_default" => cfg.enforcement_default = parse_bool(val)?,
+        "redirect_rl_capacity" => cfg.redirect_rl_capacity = parse_u32(val)?,
+        "redirect_rl_refill_per_sec" => cfg.redirect_rl_refill_per_sec = parse_u32(val)?,
+        "redirect_rl_max_keys" => cfg.redirect_rl_max_keys = parse_u32(val)?,
+        "event_buffer_size" => cfg.event_buffer_size = parse_u32(val)?,
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -368,7 +435,14 @@ pub fn diff(old: &Config, new: &Config) -> ReloadImpact {
         || old.wg_interface != new.wg_interface
         || old.hmac_key_file != new.hmac_key_file
         || old.responder_port != new.responder_port
-        || old.store_id != new.store_id;
+        || old.store_id != new.store_id
+        // The rate limiter and event channel are built once at composition;
+        // resizing either requires a restart (the CP-tunable knobs live in
+        // SetEngineParameters instead).
+        || old.redirect_rl_capacity != new.redirect_rl_capacity
+        || old.redirect_rl_refill_per_sec != new.redirect_rl_refill_per_sec
+        || old.redirect_rl_max_keys != new.redirect_rl_max_keys
+        || old.event_buffer_size != new.event_buffer_size;
 
     if requires_restart {
         ReloadImpact::RequiresRestart
@@ -461,6 +535,77 @@ config portcullis 'main'
     }
 
     #[test]
+    fn new_boot_options_parse_from_uci_and_default_when_absent() {
+        let uci = r#"
+config portcullis 'main'
+    option store_id 'SITE-1'
+    option redirect_rl_capacity '20'
+    option redirect_rl_refill_per_sec '4'
+    option redirect_rl_max_keys '5000'
+    option event_buffer_size '1024'
+"#;
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert_eq!(cfg.redirect_rl_capacity, 20);
+        assert_eq!(cfg.redirect_rl_refill_per_sec, 4);
+        assert_eq!(cfg.redirect_rl_max_keys, 5000);
+        assert_eq!(cfg.event_buffer_size, 1024);
+
+        // Absent options (pre-0.3 config files) keep the built-in values.
+        let old = Config::from_uci_str("config portcullis 'main'\n    option store_id 'S'\n").unwrap();
+        assert_eq!(old.redirect_rl_capacity, 5);
+        assert_eq!(old.redirect_rl_refill_per_sec, 1);
+        assert_eq!(old.redirect_rl_max_keys, 10_000);
+        assert_eq!(old.event_buffer_size, 512);
+        // Same for TOML documents that predate the fields.
+        let toml = Config::from_toml_str(
+            r#"
+store_id = "S"
+control_endpoint = "https://cp:8443"
+wg_interface = "wg-hub"
+hmac_key_file = "/etc/portcullis/hmac.key"
+responder_port = 8080
+accounting_interval = 15
+default_ttl = 1800
+default_quota_mb = 0
+default_rate_kbps = 2048
+"#,
+        )
+        .unwrap();
+        assert_eq!(toml.event_buffer_size, 512);
+    }
+
+    #[test]
+    fn new_boot_options_reject_zero() {
+        let mut cfg = Config { store_id: "S".into(), ..Config::default() };
+        cfg.redirect_rl_capacity = 0;
+        assert!(cfg.validate().is_err());
+        cfg = Config { store_id: "S".into(), ..Config::default() };
+        cfg.redirect_rl_refill_per_sec = 0;
+        assert!(cfg.validate().is_err());
+        cfg = Config { store_id: "S".into(), ..Config::default() };
+        cfg.redirect_rl_max_keys = 0;
+        assert!(cfg.validate().is_err());
+        cfg = Config { store_id: "S".into(), ..Config::default() };
+        cfg.event_buffer_size = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn new_boot_options_require_restart() {
+        let old = Config::default();
+        for change in [
+            |c: &mut Config| c.redirect_rl_capacity = 9,
+            |c: &mut Config| c.redirect_rl_refill_per_sec = 9,
+            |c: &mut Config| c.redirect_rl_max_keys = 9,
+            |c: &mut Config| c.event_buffer_size = 9,
+        ] {
+            let mut new = old.clone();
+            change(&mut new);
+            assert_eq!(diff(&old, &new), ReloadImpact::RequiresRestart);
+        }
+    }
+
+    #[test]
     fn toml_roundtrip_equals_original() {
         let original = Config {
             store_id: "SITE-0042".to_string(),
@@ -479,6 +624,10 @@ config portcullis 'main'
                 "pay.example".to_string(),
             ],
             enforcement_default: true,
+            redirect_rl_capacity: 5,
+            redirect_rl_refill_per_sec: 1,
+            redirect_rl_max_keys: 10_000,
+            event_buffer_size: 512,
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();

@@ -277,6 +277,36 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
             .map_err(status_from_domain)?;
         Ok(Response::new(pb::Ack { ok: true, message: String::new() }))
     }
+
+    async fn set_tier_policies(
+        &self,
+        request: Request<pb::SetTierPoliciesRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        // Validate at the wire boundary; the enforcer is never called with a
+        // malformed policy set (unknown/duplicate tier -> InvalidArgument).
+        let policies =
+            convert::tier_policies_from_pb(request.into_inner()).map_err(status_from_domain)?;
+        self.enforcer
+            .set_tier_policies(policies)
+            .await
+            .map_err(status_from_domain)?;
+        Ok(Response::new(pb::Ack { ok: true, message: String::new() }))
+    }
+
+    async fn set_engine_parameters(
+        &self,
+        request: Request<pb::SetEngineParametersRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        // 0 -> built-in default substitution + bounds check happen at the wire
+        // boundary; the enforcer only ever sees a valid concrete snapshot.
+        let params =
+            convert::engine_params_from_pb(request.into_inner()).map_err(status_from_domain)?;
+        self.enforcer
+            .set_engine_parameters(params)
+            .await
+            .map_err(status_from_domain)?;
+        Ok(Response::new(pb::Ack { ok: true, message: String::new() }))
+    }
 }
 
 /// Adapt a bounded `broadcast::Receiver<SessionEvent>` into a `Stream` of wire
@@ -322,14 +352,26 @@ mod tests {
     struct MockEnforcer {
         fail: bool,
         grants: AtomicUsize,
+        tier_pushes: AtomicUsize,
+        param_pushes: AtomicUsize,
     }
 
     impl MockEnforcer {
         fn ok() -> Arc<Self> {
-            Arc::new(MockEnforcer { fail: false, grants: AtomicUsize::new(0) })
+            Arc::new(MockEnforcer {
+                fail: false,
+                grants: AtomicUsize::new(0),
+                tier_pushes: AtomicUsize::new(0),
+                param_pushes: AtomicUsize::new(0),
+            })
         }
         fn failing() -> Arc<Self> {
-            Arc::new(MockEnforcer { fail: true, grants: AtomicUsize::new(0) })
+            Arc::new(MockEnforcer {
+                fail: true,
+                grants: AtomicUsize::new(0),
+                tier_pushes: AtomicUsize::new(0),
+                param_pushes: AtomicUsize::new(0),
+            })
         }
     }
 
@@ -392,6 +434,26 @@ mod tests {
             true
         }
         async fn set_garden(&self, _fqdns: Vec<String>) -> PResult<()> {
+            if self.fail {
+                return Err(portcullis_types::Error::Backend("boom".into()));
+            }
+            Ok(())
+        }
+        async fn set_tier_policies(
+            &self,
+            _policies: Vec<portcullis_types::TierPolicy>,
+        ) -> PResult<()> {
+            self.tier_pushes.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(portcullis_types::Error::Backend("boom".into()));
+            }
+            Ok(())
+        }
+        async fn set_engine_parameters(
+            &self,
+            _params: portcullis_types::EngineParams,
+        ) -> PResult<()> {
+            self.param_pushes.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(portcullis_types::Error::Backend("boom".into()));
             }
@@ -487,6 +549,89 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn set_tier_policies_ok_and_error() {
+        let req = || {
+            Request::new(pb::SetTierPoliciesRequest {
+                policies: vec![pb::TierPolicy {
+                    tier: "public".into(),
+                    ttl_seconds: 300,
+                    quota_bytes: 0,
+                    rate_bps: 0,
+                }],
+            })
+        };
+
+        let enf = MockEnforcer::ok();
+        let (ok, _s1) = EnforcementService::with_default_buffer(enf.clone());
+        let ack = ok.set_tier_policies(req()).await.unwrap().into_inner();
+        assert!(ack.ok);
+        assert_eq!(enf.tier_pushes.load(Ordering::SeqCst), 1);
+
+        let (bad, _s2) = EnforcementService::with_default_buffer(MockEnforcer::failing());
+        let status = bad.set_tier_policies(req()).await.unwrap_err();
+        assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn set_tier_policies_invalid_tier_rejected_before_enforcer() {
+        let enf = MockEnforcer::ok();
+        let (svc, _sink) = EnforcementService::with_default_buffer(enf.clone());
+        let status = svc
+            .set_tier_policies(Request::new(pb::SetTierPoliciesRequest {
+                policies: vec![pb::TierPolicy {
+                    tier: "platinum".into(),
+                    ttl_seconds: 0,
+                    quota_bytes: 0,
+                    rate_bps: 0,
+                }],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        // The malformed request never reached the enforcer.
+        assert_eq!(enf.tier_pushes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn set_engine_parameters_ok_and_error() {
+        let req = || {
+            Request::new(pb::SetEngineParametersRequest {
+                accounting_interval_secs: 60,
+                garden_tick_secs: 30,
+                expiry_tick_secs: 5,
+                max_sessions: 4096,
+            })
+        };
+
+        let enf = MockEnforcer::ok();
+        let (ok, _s1) = EnforcementService::with_default_buffer(enf.clone());
+        let ack = ok.set_engine_parameters(req()).await.unwrap().into_inner();
+        assert!(ack.ok);
+        assert_eq!(enf.param_pushes.load(Ordering::SeqCst), 1);
+
+        let (bad, _s2) = EnforcementService::with_default_buffer(MockEnforcer::failing());
+        let status = bad.set_engine_parameters(req()).await.unwrap_err();
+        assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn set_engine_parameters_out_of_bounds_rejected_before_enforcer() {
+        let enf = MockEnforcer::ok();
+        let (svc, _sink) = EnforcementService::with_default_buffer(enf.clone());
+        let status = svc
+            .set_engine_parameters(Request::new(pb::SetEngineParametersRequest {
+                accounting_interval_secs: 3601, // past the [1, 3600] bound
+                garden_tick_secs: 0,
+                expiry_tick_secs: 0,
+                max_sessions: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(enf.param_pushes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -210,13 +210,24 @@ fn build_router<R: NeighResolver + 'static>(state: Arc<AppState<R>>) -> Router {
         .with_state(state)
 }
 
-/// Bind `0.0.0.0:<listen_port>` and serve until the process exits.
-///
-/// The `ConnectInfo` extractor requires
-/// `into_make_service_with_connect_info::<SocketAddr>()`.
+/// Bind `0.0.0.0:<listen_port>` and serve until the process exits, with the
+/// built-in [`RateLimitConfig::default`] limits.
 pub async fn serve<R: NeighResolver + 'static>(
     cfg: RedirectConfig,
     resolver: R,
+) -> portcullis_types::Result<()> {
+    serve_with_limits(cfg, resolver, RateLimitConfig::default()).await
+}
+
+/// Bind `0.0.0.0:<listen_port>` and serve until the process exits.
+///
+/// `rl` is the per-source-IP token-bucket configuration (config-file backed:
+/// `redirect_rl_*`, RequiresRestart §9). The `ConnectInfo` extractor requires
+/// `into_make_service_with_connect_info::<SocketAddr>()`.
+pub async fn serve_with_limits<R: NeighResolver + 'static>(
+    cfg: RedirectConfig,
+    resolver: R,
+    rl: RateLimitConfig,
 ) -> portcullis_types::Result<()> {
     use portcullis_types::Error;
 
@@ -224,7 +235,7 @@ pub async fn serve<R: NeighResolver + 'static>(
     let state = Arc::new(AppState {
         cfg,
         resolver,
-        limiter: RateLimiter::new(RateLimitConfig::default()),
+        limiter: RateLimiter::new(rl),
     });
     let app = build_router(state);
 

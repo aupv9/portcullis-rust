@@ -93,12 +93,40 @@ pub(crate) struct Wired {
 /// Order matters for the construction cycle (§ see `control::event_channel`):
 /// mint the event channel + sink first, build the `SessionManager` with the
 /// sink, then the gRPC service from the manager + the shared sender.
-pub(crate) fn wire(writer: Arc<dyn RulesetWriter>) -> Wired {
+pub(crate) fn wire(writer: Arc<dyn RulesetWriter>, cfg: &Config) -> Wired {
     let (event_tx, grpc_sink) =
-        portcullis_control::service::event_channel(portcullis_control::DEFAULT_EVENT_BUFFER);
+        portcullis_control::service::event_channel(cfg.event_buffer_size.max(1) as usize);
     let sink: Arc<dyn EventSink> = Arc::new(grpc_sink);
-    let mgr = Arc::new(portcullis_session::SessionManager::new(writer, sink));
+    let mgr = Arc::new(
+        portcullis_session::SessionManager::new(writer, sink)
+            .with_tier_policies(initial_tier_policies(cfg))
+            .with_engine_params(initial_engine_params(cfg)),
+    );
     Wired { mgr, event_tx }
+}
+
+/// Seed the runtime engine parameters from the boot config (§9): only the
+/// accounting interval is config-backed today; the other knobs start at the
+/// built-in defaults until the control plane pushes `SetEngineParameters`.
+fn initial_engine_params(cfg: &Config) -> portcullis_types::EngineParams {
+    portcullis_types::EngineParams {
+        accounting_interval: std::time::Duration::from_secs(cfg.accounting_interval.max(1)),
+        ..Default::default()
+    }
+}
+
+/// Seed tier policies from the boot config (§9): every tier starts from the
+/// same config-derived defaults until the control plane pushes real per-tier
+/// policies via `SetTierPolicies`. `0` stays `0` (built-in TTL / unlimited).
+fn initial_tier_policies(cfg: &Config) -> Vec<portcullis_types::TierPolicy> {
+    use portcullis_types::{Tier, TierPolicy};
+    let ttl = std::time::Duration::from_secs(cfg.default_ttl);
+    let quota_bytes = cfg.default_quota_mb.saturating_mul(1024 * 1024);
+    let rate_bps = cfg.default_rate_kbps.saturating_mul(1000);
+    [Tier::Public, Tier::Home, Tier::Retail]
+        .into_iter()
+        .map(|tier| TierPolicy { tier, ttl, quota_bytes, rate_bps })
+        .collect()
 }
 
 #[cfg(test)]
@@ -116,7 +144,7 @@ mod tests {
         // `compose::run` uses on the device.
         let (handle, _join) = spawn(Box::new(MockBackend::default()));
         let writer: Arc<dyn RulesetWriter> = Arc::new(handle);
-        let w = wire(writer);
+        let w = wire(writer, &Config::default());
 
         // A subscriber on the shared channel must receive the GRANTED event the
         // session layer emits — proving the cycle-break actually connects the
@@ -140,5 +168,36 @@ mod tests {
         let ev = rx.recv().await.expect("event");
         assert_eq!(ev.kind, portcullis_types::EventKind::Granted);
         assert_eq!(ev.session_id.as_str(), "s-1");
+    }
+
+    #[tokio::test]
+    async fn wire_seeds_tier_policies_from_config() {
+        let (handle, _join) = spawn(Box::new(MockBackend::default()));
+        let writer: Arc<dyn RulesetWriter> = Arc::new(handle);
+        let cfg = Config { default_ttl: 1234, default_quota_mb: 2, ..Config::default() };
+        let w = wire(writer, &cfg);
+
+        // A grant with ttl/quota 0 inherits the config-seeded tier policy.
+        let params = portcullis_types::GrantParams {
+            store_id: "SITE-0042".into(),
+            mac: "aa:bb:cc:dd:ee:01".parse().unwrap(),
+            ip: None,
+            ttl: Duration::ZERO,
+            quota_bytes: 0,
+            rate_bps: 0,
+            tier: portcullis_types::Tier::Home,
+            session_id: portcullis_types::SessionId("s-2".into()),
+        };
+        w.mgr.grant(params).await.expect("grant");
+        let info = w
+            .mgr
+            .get("aa:bb:cc:dd:ee:01".parse().unwrap())
+            .await
+            .expect("get")
+            .expect("session present");
+        // expires_in counts down from the seeded ttl; allow the elapsed tick.
+        assert!(info.expires_in > Duration::from_secs(1200));
+        assert!(info.expires_in <= Duration::from_secs(1234));
+        assert_eq!(info.quota_bytes, 2 * 1024 * 1024);
     }
 }

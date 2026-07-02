@@ -324,25 +324,77 @@ impl GardenManager {
         Ok(false)
     }
 
-    /// Periodic reconcile (first-boot + drift + CDN churn). Runs until aborted.
-    pub async fn run(self: Arc<Self>, interval: Duration) {
+    /// One reconcile pass with the standard logging (shared by the loops).
+    async fn reconcile_and_log(&self) {
+        match self.reconcile_now().await {
+            Ok(true) => tracing::info!(path = %self.path.display(), "garden config reconciled (changed)"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "garden reconcile failed; keeping prior state"),
+        }
+    }
+
+    /// Emit the support-mode diagnostics and report whether the garden can run
+    /// at all (false = disabled, caller returns).
+    async fn announce_mode(&self) -> bool {
         if !self.supported && self.writer.is_none() {
             tracing::warn!(path = %self.path.display(),
                 "dnsmasq has no ipset support and no resolver writer — walled-garden disabled");
             let _ = tokio::fs::remove_file(&self.path).await;
-            return;
+            return false;
         }
         if !self.supported {
             tracing::info!("dnsmasq lacks ipset support — using engine-resolver garden (resolve FQDN -> ipset)");
         }
+        true
+    }
+
+    /// Periodic reconcile (first-boot + drift + CDN churn). Runs until aborted.
+    pub async fn run(self: Arc<Self>, interval: Duration) {
+        if !self.announce_mode().await {
+            return;
+        }
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            match self.reconcile_now().await {
-                Ok(true) => tracing::info!(path = %self.path.display(), "garden config reconciled (changed)"),
-                Ok(false) => {}
-                Err(e) => tracing::warn!(error = %e, "garden reconcile failed; keeping prior state"),
+            self.reconcile_and_log().await;
+        }
+    }
+
+    /// Periodic reconcile driven by the runtime-adjustable cadence
+    /// (`SetEngineParameters.garden_tick_secs`). Same behaviour as [`run`], but
+    /// rebuilds its ticker when the parameter snapshot changes. The reconcile
+    /// executes inside the select arm body, so a parameter push can never
+    /// cancel it mid-flight — a cancelled reconcile could write the dnsmasq
+    /// file but skip the reload, and the idempotence check would then suppress
+    /// the reload until the next real change.
+    pub async fn run_watch(
+        self: Arc<Self>,
+        mut rx: tokio::sync::watch::Receiver<portcullis_types::EngineParams>,
+    ) {
+        if !self.announce_mode().await {
+            return;
+        }
+        let mut ticker =
+            tokio::time::interval(rx.borrow_and_update().garden_tick.max(Duration::from_secs(1)));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => self.reconcile_and_log().await,
+                res = rx.changed() => match res {
+                    Ok(()) => {
+                        let tick = rx.borrow_and_update().garden_tick.max(Duration::from_secs(1));
+                        tracing::info!(garden_tick_secs = tick.as_secs(), "garden cadence updated");
+                        ticker = tokio::time::interval(tick);
+                    }
+                    // Sender gone (shutdown path): a closed watch resolves
+                    // immediately forever — fall back to the fixed cadence
+                    // instead of busy-spinning the select.
+                    Err(_) => break,
+                },
             }
+        }
+        loop {
+            ticker.tick().await;
+            self.reconcile_and_log().await;
         }
     }
 }

@@ -16,6 +16,8 @@ service Enforcement {
   rpc Health       (Empty)        returns (HealthReply);
   rpc SetEnforcement(SetEnforcementRequest) returns (Ack); // global on/off gate
   rpc SetGarden      (SetGardenRequest)      returns (Ack); // control-plane-managed walled garden
+  rpc SetTierPolicies(SetTierPoliciesRequest) returns (Ack); // fleet-wide per-tier grant defaults
+  rpc SetEngineParameters(SetEngineParametersRequest) returns (Ack); // runtime timers + session cap
 }
 
 // Toggle the engine's global enforcement gate. When disabled, the engine removes
@@ -33,15 +35,53 @@ message SetGardenRequest {
   repeated string fqdns = 1;
 }
 
+// Fleet-wide grant defaults for one SSID tier. The engine fills any 0-valued
+// per-grant field (see GrantRequest) from the tier's policy before applying the
+// grant, so the control plane can manage per-tier defaults centrally instead of
+// stamping every GrantRequest.
+message TierPolicy {
+  string tier        = 1; // "public" | "home" | "retail"
+  uint32 ttl_seconds = 2; // 0 = unset -> engine built-in default (1800s)
+  uint64 quota_bytes = 3; // 0 = unset -> unlimited
+  uint64 rate_bps    = 4; // 0 = unset -> unlimited
+}
+
+// Replace the per-tier grant defaults (full set, not a delta — idempotent, like
+// SetGarden). A tier absent from `policies` is reset to the engine built-in
+// default. RAM-only on the engine: the control plane re-pushes on reconnect, so
+// the engine never persists this to flash (§5.4 no-NAND).
+message SetTierPoliciesRequest {
+  repeated TierPolicy policies = 1;
+}
+
+// Full snapshot of the runtime-adjustable engine parameters. Every push
+// replaces the whole set; 0 = reset that field to the engine built-in default.
+// Out-of-bounds values are rejected (InvalidArgument). RAM-only on the engine:
+// the control plane re-pushes on reconnect (never persisted to flash, §5.4).
+// Lowering max_sessions below the live session count never evicts sessions —
+// it only blocks new grants.
+message SetEngineParametersRequest {
+  uint32 accounting_interval_secs = 1; // 0 = default 15;   bounds [1, 3600]
+  uint32 garden_tick_secs         = 2; // 0 = default 30;   bounds [5, 3600]
+  uint32 expiry_tick_secs         = 3; // 0 = default 1;    bounds [1, 60]
+  uint32 max_sessions             = 4; // 0 = default 4096; bounds [1, 16384]
+}
+
 message GrantRequest {
   string store_id    = 1;
   string client_mac  = 2; // primary identity (validated upstream via signed redirect)
   string client_ip   = 3; // optional / informational
-  uint32 ttl_seconds = 4; // session length -> nft set-element timeout
-  uint64 quota_bytes = 5; // 0 = unlimited
-  uint64 rate_bps    = 6; // 0 = unlimited
+  uint32 ttl_seconds = 4; // session length -> nft set-element timeout; 0 = use tier policy
+  uint64 quota_bytes = 5; // 0 = use tier policy (see NOTE); explicit unlimited on a quota'd tier = u64::MAX
+  uint64 rate_bps    = 6; // 0 = use tier policy (see NOTE); explicit unlimited on a rate-capped tier = u64::MAX
   string tier        = 7; // public | home | retail
   string session_id  = 8; // control-plane issued (== RADIUS Acct-Session-Id)
+  // NOTE (behaviour change, SetTierPolicies): ttl_seconds/quota_bytes/rate_bps
+  // == 0 no longer mean "built-in default"/"unlimited" directly — they mean
+  // "use this tier's policy" (which may itself resolve to a built-in default or
+  // to unlimited). A non-zero grant field always wins over the tier policy. To
+  // grant an explicit-unlimited exception under a tier that has a quota/rate,
+  // send u64::MAX (0 would inherit the tier's limit).
 }
 
 message GrantReply {
