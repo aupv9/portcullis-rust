@@ -714,6 +714,7 @@ dependencies = [
 name = "portcullis-garden"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "portcullis-types",
  "thiserror",
  "tokio",
