@@ -22,40 +22,54 @@ use std::sync::Arc;
 
 use futures::Stream;
 use portcullis_types::{Enforcer, EventSink, SessionEvent};
-use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 use crate::convert;
+use crate::event_log::EventLog;
 use crate::pb;
 
-/// Default bound on the in-RAM event fan-out buffer (number of events).
+/// Default bound on the in-RAM event replay buffer (number of events).
 ///
-/// Sized small on purpose: the box has 256 MB RAM (§14) and the control plane
-/// is the durable source of truth, so dropping the oldest events under a stuck
-/// consumer is preferable to unbounded growth. The engine never blocks
-/// enforcement to push an event.
-pub const DEFAULT_EVENT_BUFFER: usize = 512;
+/// This is the at-least-once replay window: a control-plane outage shorter
+/// than the buffer covers loses nothing (§7.6). 4096 events ≈ 10 minutes on a
+/// busy router (100 clients × one INTERIM per 15 s) at ~100 B/event ≈ 400 KB
+/// RAM — comfortably inside the <30 MB budget (§14). The engine never blocks
+/// enforcement to push an event; overflow evicts the oldest.
+pub const DEFAULT_EVENT_BUFFER: usize = 4096;
 
-/// The gRPC server state: the domain [`Enforcer`] plus the shared event
-/// broadcaster. Construct via [`EnforcementService::new`], which also hands
-/// back a [`GrpcEventSink`] wired to the same channel.
+/// Base capabilities every 0.4+ engine advertises via `GetEngineInfo`. The
+/// composition root appends conditional ones (e.g. `"shaper"`).
+pub const BASE_CAPABILITIES: &[&str] = &["tier_policies", "engine_params", "event_replay"];
+
+/// The gRPC server state: the domain [`Enforcer`] plus the shared replayable
+/// [`EventLog`]. Construct via [`EnforcementService::new`], which also hands
+/// back a [`GrpcEventSink`] wired to the same log.
 #[derive(Clone)]
 pub struct EnforcementService {
     enforcer: Arc<dyn Enforcer>,
-    events: broadcast::Sender<SessionEvent>,
+    events: Arc<EventLog>,
+    capabilities: Arc<Vec<String>>,
+}
+
+fn base_capabilities() -> Vec<String> {
+    BASE_CAPABILITIES.iter().map(|s| s.to_string()).collect()
 }
 
 impl EnforcementService {
     /// Build the service and its paired [`GrpcEventSink`] sharing one bounded
-    /// broadcast channel of `buffer` capacity.
+    /// [`EventLog`] of `buffer` capacity.
     ///
     /// The sink is what `portcullis-session` calls to `emit`; every event sent
-    /// through it reaches every live `StreamEvents` subscriber.
+    /// through it is sequenced, retained for replay, and reaches every live
+    /// `StreamEvents` subscriber.
     pub fn new(enforcer: Arc<dyn Enforcer>, buffer: usize) -> (Self, GrpcEventSink) {
-        let buffer = buffer.max(1);
-        let (tx, _rx) = broadcast::channel(buffer);
-        let svc = EnforcementService { enforcer, events: tx.clone() };
-        let sink = GrpcEventSink { events: tx };
+        let log = Arc::new(EventLog::new(buffer));
+        let svc = EnforcementService {
+            enforcer,
+            events: log.clone(),
+            capabilities: Arc::new(base_capabilities()),
+        };
+        let sink = GrpcEventSink { log };
         (svc, sink)
     }
 
@@ -64,72 +78,56 @@ impl EnforcementService {
         Self::new(enforcer, DEFAULT_EVENT_BUFFER)
     }
 
-    /// Build a service from an existing enforcer and a shared event sender
+    /// Build a service from an existing enforcer and a shared [`EventLog`]
     /// produced by [`event_channel`].
     ///
     /// The composition root uses this to break the `SessionManager` <-> sink
     /// construction cycle: the manager needs the [`GrpcEventSink`] at
     /// construction time, while the service needs the *already-built* manager as
-    /// its `Enforcer`. So we mint the channel + sink first ([`event_channel`]),
+    /// its `Enforcer`. So we mint the log + sink first ([`event_channel`]),
     /// hand the sink to the session layer, then assemble the service here from
-    /// the same `Sender`.
+    /// the same log. `capabilities` is what `GetEngineInfo` advertises — start
+    /// from [`BASE_CAPABILITIES`] and append conditional ones.
     pub fn from_parts(
         enforcer: Arc<dyn Enforcer>,
-        events: broadcast::Sender<SessionEvent>,
+        events: Arc<EventLog>,
+        capabilities: Vec<String>,
     ) -> Self {
-        EnforcementService { enforcer, events }
+        EnforcementService { enforcer, events, capabilities: Arc::new(capabilities) }
     }
 
-    /// Subscribe to the event fan-out (used internally by `stream_events`,
-    /// exposed for tests).
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
-        self.events.subscribe()
+    /// The shared event log (used by tests and `GetEngineInfo`).
+    pub fn event_log(&self) -> Arc<EventLog> {
+        self.events.clone()
     }
 }
 
-/// Mint a standalone bounded event channel and its paired [`GrpcEventSink`],
+/// Mint a standalone bounded [`EventLog`] and its paired [`GrpcEventSink`],
 /// decoupled from any [`EnforcementService`].
 ///
 /// Pair with [`EnforcementService::from_parts`] in the composition root: the
 /// sink is wired into `portcullis-session` (which emits lifecycle events into
 /// it) before the `SessionManager` — the service's `Enforcer` — exists. The
-/// returned `Sender` and the sink share one bounded channel, so events emitted
-/// by the session layer reach every live `StreamEvents` subscriber.
-pub fn event_channel(buffer: usize) -> (broadcast::Sender<SessionEvent>, GrpcEventSink) {
-    let buffer = buffer.max(1);
-    let (tx, _rx) = broadcast::channel(buffer);
-    (tx.clone(), GrpcEventSink { events: tx })
+/// returned log and the sink are the same store, so events emitted by the
+/// session layer are replayable to every `StreamEvents` subscriber.
+pub fn event_channel(buffer: usize) -> (Arc<EventLog>, GrpcEventSink) {
+    let log = Arc::new(EventLog::new(buffer));
+    (log.clone(), GrpcEventSink { log })
 }
 
-/// `EventSink` adapter: pushes domain events into the bounded broadcast so that
-/// gRPC `StreamEvents` subscribers receive them. Sending never blocks and never
-/// fails the caller — if there are no live subscribers, or the buffer is full
-/// for a lagging subscriber, the event is simply dropped from that consumer's
-/// view (§11: bounded RAM, no fail-open on enforcement).
+/// `EventSink` adapter: pushes domain events into the bounded [`EventLog`] so
+/// gRPC `StreamEvents` subscribers receive them (with replay). Pushing never
+/// blocks and never fails the caller — with no live subscriber the event just
+/// waits in the ring until evicted (§11: bounded RAM, no fail-open).
 #[derive(Clone)]
 pub struct GrpcEventSink {
-    events: broadcast::Sender<SessionEvent>,
-}
-
-impl GrpcEventSink {
-    /// Number of live `StreamEvents` subscribers.
-    pub fn subscriber_count(&self) -> usize {
-        self.events.receiver_count()
-    }
-
-    /// Subscribe directly (used by tests and by `stream_events`).
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
-        self.events.subscribe()
-    }
+    log: Arc<EventLog>,
 }
 
 #[tonic::async_trait]
 impl EventSink for GrpcEventSink {
     async fn emit(&self, event: SessionEvent) {
-        // `send` errors only when there are zero receivers; that is not a
-        // failure — events are best-effort fan-out and the CP is the durable
-        // store. Never panic, never block.
-        let _ = self.events.send(event);
+        self.log.push(event);
     }
 }
 
@@ -234,16 +232,36 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
 
     async fn stream_events(
         &self,
-        _request: Request<pb::StreamReq>,
+        request: Request<pb::StreamReq>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        // Back the stream with a fresh subscription to the BOUNDED broadcast.
-        // A slow/broken consumer can only lag; when it lags past the buffer the
-        // channel drops the oldest events for *that* consumer (RecvError::Lagged)
-        // and we skip forward — enforcement never blocks and RAM never grows
-        // unbounded (§11).
-        let rx = self.events.subscribe();
-        let stream = broadcast_event_stream(rx);
+        // Replay-then-tail against the bounded EventLog (at-least-once, §7.6).
+        // A valid cursor (matching boot_id) resumes after it; anything else —
+        // no cursor, a cursor from a previous boot — replays everything still
+        // retained (the CP detects gaps by the first seq jumping past
+        // cursor+1). A slow consumer only ever re-reads the ring; enforcement
+        // never blocks and RAM never grows unbounded (§11).
+        let req = request.into_inner();
+        let cursor = if req.boot_id == self.events.boot_id() { req.resume_after_seq } else { 0 };
+        let stream = event_log_stream(self.events.clone(), cursor);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn get_engine_info(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::EngineInfo>, Status> {
+        let cs = self.enforcer.config_state().await;
+        Ok(Response::new(pb::EngineInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            boot_id: self.events.boot_id().to_string(),
+            event_latest_seq: self.events.latest_seq(),
+            event_oldest_seq: self.events.oldest_seq(),
+            capabilities: self.capabilities.as_ref().clone(),
+            enforcement_enabled: cs.enforcement_enabled,
+            tier_policies_hash: cs.tier_policies_hash,
+            engine_params_hash: cs.engine_params_hash,
+            garden_hash: cs.garden_hash,
+        }))
     }
 
     async fn health(
@@ -309,27 +327,43 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
     }
 }
 
-/// Adapt a bounded `broadcast::Receiver<SessionEvent>` into a `Stream` of wire
+/// Adapt the [`EventLog`] into a replay-then-tail `Stream` of wire
 /// `SessionEvent`s using only `futures` (no `tokio-stream` dependency).
 ///
-/// - `Lagged` (slow consumer overran the buffer): skip the dropped events and
-///   keep going — the client missed some events but the stream stays alive and
-///   the engine never blocks.
-/// - `Closed` (sender gone): end the stream cleanly.
-fn broadcast_event_stream(
-    rx: broadcast::Receiver<SessionEvent>,
+/// Each poll drains everything retained past the cursor (batched into a local
+/// queue so the log lock is held only for the snapshot), then awaits the log's
+/// watch channel for new pushes. The watch never misses a wakeup: `changed()`
+/// compares against the last version this receiver has seen, so a push racing
+/// the empty-snapshot check still resolves it immediately.
+fn event_log_stream(
+    log: Arc<EventLog>,
+    cursor: u64,
 ) -> impl Stream<Item = Result<pb::SessionEvent, Status>> + Send + 'static {
-    futures::stream::unfold(rx, |mut rx| async move {
+    struct State {
+        log: Arc<EventLog>,
+        cursor: u64,
+        rx: tokio::sync::watch::Receiver<u64>,
+        pending: std::collections::VecDeque<(u64, SessionEvent)>,
+    }
+    let rx = log.subscribe();
+    let state = State { log, cursor, rx, pending: Default::default() };
+
+    futures::stream::unfold(state, |mut st| async move {
         loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    return Some((Ok(convert::session_event_to_pb(&ev)), rx));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Bounded-buffer overflow: drop oldest, keep streaming.
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
+            if let Some((seq, ev)) = st.pending.pop_front() {
+                st.cursor = seq;
+                let mut item = convert::session_event_to_pb(&ev);
+                item.seq = seq;
+                return Some((Ok(item), st));
+            }
+            let batch = st.log.snapshot_after(st.cursor);
+            if !batch.is_empty() {
+                st.pending = batch.into();
+                continue;
+            }
+            if st.rx.changed().await.is_err() {
+                // Log dropped (daemon shutdown): end the stream cleanly.
+                return None;
             }
         }
     })
@@ -458,6 +492,14 @@ mod tests {
                 return Err(portcullis_types::Error::Backend("boom".into()));
             }
             Ok(())
+        }
+        async fn config_state(&self) -> portcullis_types::ConfigState {
+            portcullis_types::ConfigState {
+                tier_policies_hash: "1111111111111111".into(),
+                engine_params_hash: "2222222222222222".into(),
+                garden_hash: "3333333333333333".into(),
+                enforcement_enabled: true,
+            }
         }
     }
 
@@ -682,74 +724,113 @@ mod tests {
         assert!(h.backend_ok);
     }
 
-    #[tokio::test]
-    async fn event_sink_event_reaches_subscriber() {
-        let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
-        let mut rx = svc.subscribe();
-
-        let ev = SessionEvent {
-            session_id: SessionId("s1".into()),
+    fn sample_event(n: u8, kind: EventKind) -> SessionEvent {
+        SessionEvent {
+            session_id: SessionId::from(format!("s{n}")),
             mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
-            kind: EventKind::Granted,
-            bytes_in: 0,
+            kind,
+            bytes_in: u64::from(n),
             bytes_out: 0,
-            ts_unix: 42,
-        };
-        sink.emit(ev.clone()).await;
+            ts_unix: i64::from(n),
+        }
+    }
 
-        let got = rx.recv().await.unwrap();
-        assert_eq!(got, ev);
+    fn stream_req(resume_after: u64, boot_id: &str) -> pb::StreamReq {
+        pb::StreamReq {
+            store_id: "s".into(),
+            resume_after_seq: resume_after,
+            boot_id: boot_id.into(),
+        }
     }
 
     #[tokio::test]
-    async fn stream_events_yields_emitted_event() {
+    async fn event_sink_event_lands_in_log_with_seq() {
         let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
-        // Subscribe BEFORE emitting so the bounded channel buffers it.
-        let resp = svc
-            .stream_events(Request::new(pb::StreamReq { store_id: "s".into() }))
-            .await
-            .unwrap();
+        sink.emit(sample_event(1, EventKind::Granted)).await;
+
+        let log = svc.event_log();
+        let snap = log.snapshot_after(0);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, 1);
+        assert_eq!(snap[0].1.kind, EventKind::Granted);
+    }
+
+    #[tokio::test]
+    async fn stream_events_replays_then_tails() {
+        let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
+        // Emitted BEFORE subscribing: the log replays it.
+        sink.emit(sample_event(1, EventKind::Granted)).await;
+
+        let resp = svc.stream_events(Request::new(stream_req(0, ""))).await.unwrap();
         let mut stream = resp.into_inner();
 
-        sink.emit(SessionEvent {
-            session_id: SessionId("s9".into()),
-            mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
-            kind: EventKind::Interim,
-            bytes_in: 7,
-            bytes_out: 8,
-            ts_unix: 99,
-        })
-        .await;
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.kind, pb::EventKind::Granted as i32);
 
-        let item = stream.next().await.unwrap().unwrap();
-        assert_eq!(item.session_id, "s9");
-        assert_eq!(item.kind, pb::EventKind::Interim as i32);
-        assert_eq!(item.bytes_in, 7);
+        // Emitted AFTER subscribing: the tail picks it up.
+        sink.emit(sample_event(2, EventKind::Interim)).await;
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.kind, pb::EventKind::Interim as i32);
+        assert_eq!(second.bytes_in, 2);
     }
 
     #[tokio::test]
-    async fn event_buffer_is_bounded() {
-        // A tiny buffer + a subscriber that never reads => the channel must NOT
-        // grow unbounded. The bound is enforced by tokio::broadcast: a lagging
-        // subscriber's recv yields Lagged, it does not OOM. We assert capacity
-        // is honoured by observing a Lagged once we overflow.
+    async fn stream_events_resumes_after_cursor_with_matching_boot_id() {
+        let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
+        for n in 1..=3u8 {
+            sink.emit(sample_event(n, EventKind::Interim)).await;
+        }
+        let boot_id = svc.event_log().boot_id().to_string();
+
+        // Matching boot_id + cursor 2 => only seq 3 is replayed.
+        let resp = svc.stream_events(Request::new(stream_req(2, &boot_id))).await.unwrap();
+        let mut stream = resp.into_inner();
+        assert_eq!(stream.next().await.unwrap().unwrap().seq, 3);
+
+        // Mismatching boot_id => the cursor is void; replay from the oldest.
+        let resp = svc.stream_events(Request::new(stream_req(2, "other-boot"))).await.unwrap();
+        let mut stream = resp.into_inner();
+        assert_eq!(stream.next().await.unwrap().unwrap().seq, 1);
+    }
+
+    #[tokio::test]
+    async fn event_buffer_is_bounded_and_gap_is_detectable() {
+        // Capacity 2, 10 events pushed: the ring holds only the newest two —
+        // RAM stays bounded — and a resuming client sees the seq jump (gap).
         let (svc, sink) = EnforcementService::new(MockEnforcer::ok(), 2);
-        let mut rx = svc.subscribe();
-        for i in 0..10u8 {
-            sink.emit(SessionEvent {
-                session_id: SessionId::from(format!("s{i}")),
-                mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
-                kind: EventKind::Interim,
-                bytes_in: u64::from(i),
-                bytes_out: 0,
-                ts_unix: i64::from(i),
-            })
-            .await;
+        for n in 0..10u8 {
+            sink.emit(sample_event(n, EventKind::Interim)).await;
         }
-        // First recv on an overflowed receiver reports how many were dropped.
-        match rx.recv().await {
-            Err(broadcast::error::RecvError::Lagged(n)) => assert!(n >= 1),
-            other => panic!("expected Lagged, got {other:?}"),
-        }
+        let log = svc.event_log();
+        assert_eq!(log.latest_seq(), 10);
+        assert_eq!(log.oldest_seq(), 9);
+
+        let resp = svc.stream_events(Request::new(stream_req(3, log.boot_id()))).await.unwrap();
+        let mut stream = resp.into_inner();
+        // Cursor 3 was evicted: the first item jumps to 9 — the client's gap signal.
+        assert_eq!(stream.next().await.unwrap().unwrap().seq, 9);
+    }
+
+    #[tokio::test]
+    async fn get_engine_info_reports_version_cursor_and_hashes() {
+        let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
+        sink.emit(sample_event(1, EventKind::Granted)).await;
+
+        let info = svc
+            .get_engine_info(Request::new(pb::Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.boot_id, svc.event_log().boot_id());
+        assert_eq!(info.event_latest_seq, 1);
+        assert_eq!(info.event_oldest_seq, 1);
+        assert!(info.capabilities.contains(&"event_replay".to_string()));
+        assert!(info.enforcement_enabled);
+        assert_eq!(info.tier_policies_hash, "1111111111111111");
+        assert_eq!(info.engine_params_hash, "2222222222222222");
+        assert_eq!(info.garden_hash, "3333333333333333");
     }
 }

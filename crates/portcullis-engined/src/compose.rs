@@ -63,9 +63,34 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tracing::info!(enforcement_enabled = cfg.enforcement_default, "boot enforcement state applied");
     }
 
+    // 1d. Optional tc/HTB download shaper (§7.7). Opt-in and probed at
+    //     runtime: ensure_root failing (no tc / no HTB kmod) degrades to
+    //     unshaped operation with a warning — QoS is never fail-closed and
+    //     the .ipk takes no hard tc dependency.
+    let mut capabilities: Vec<String> = portcullis_control::service::BASE_CAPABILITIES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if cfg.shaper_enabled {
+        let tc = portcullis_accounting::TcShaper::new(cfg.shape_interface.clone());
+        match tc.ensure_root().await {
+            Ok(()) => {
+                w.mgr.set_shaper(Arc::new(tc));
+                capabilities.push("shaper".to_string());
+                tracing::info!(iface = %cfg.shape_interface, "tc shaper enabled (HTB root installed)");
+            }
+            Err(e) => tracing::warn!(
+                iface = %cfg.shape_interface,
+                error = %e,
+                "tc shaper unavailable (missing tc/HTB?); running unshaped"
+            ),
+        }
+    }
+
     let svc = portcullis_control::EnforcementService::from_parts(
         w.mgr.clone() as Arc<dyn Enforcer>,
-        w.event_tx.clone(),
+        w.event_log.clone(),
+        capabilities,
     );
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

@@ -26,7 +26,12 @@ config portcullis 'main'
 	option redirect_rl_capacity       '5'
 	option redirect_rl_refill_per_sec '1'
 	option redirect_rl_max_keys       '10000'
-	option event_buffer_size          '512'
+	# Replayable event-log depth (at-least-once StreamEvents window, ~100B/event).
+	option event_buffer_size          '4096'
+	# Per-client tc/HTB download shaper (§7.7). Opt-in: needs `tc` + HTB kmod on
+	# the device; if the runtime probe fails the daemon logs and runs unshaped.
+	option shaper_enabled             '0'
+	option shape_interface            'br-lan'
 	list   garden_fqdn         'portal.wifihub.vn'
 	list   garden_fqdn         'cdn.wifihub.vn'
 	list   garden_fqdn         'otp.gateway'

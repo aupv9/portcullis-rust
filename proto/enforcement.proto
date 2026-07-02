@@ -18,6 +18,7 @@ service Enforcement {
   rpc SetGarden      (SetGardenRequest)      returns (Ack); // control-plane-managed walled garden
   rpc SetTierPolicies(SetTierPoliciesRequest) returns (Ack); // fleet-wide per-tier grant defaults
   rpc SetEngineParameters(SetEngineParametersRequest) returns (Ack); // runtime timers + session cap
+  rpc GetEngineInfo(Empty) returns (EngineInfo); // version, capabilities, event cursor, config hashes
 }
 
 // Toggle the engine's global enforcement gate. When disabled, the engine removes
@@ -139,13 +140,51 @@ message SessionEvent {
   string    session_id = 1;
   string    client_mac = 2;
   EventKind kind       = 3;
-  uint64    bytes_in   = 4;
+  uint64    bytes_in   = 4; // session totals at emit time (not deltas)
   uint64    bytes_out  = 5;
   int64     ts_unix    = 6;
+  // Monotonic per engine boot, starting at 1 (see EngineInfo.boot_id for the
+  // epoch). 0 = event from a pre-0.4 engine (no replay support). The control
+  // plane persists (boot_id, seq) as its consumption cursor and resumes with
+  // StreamReq.resume_after_seq for at-least-once delivery.
+  uint64    seq        = 7;
 }
 
 message StreamReq {
   string store_id = 1;
+  // Replay events with seq > resume_after_seq that are still in the engine's
+  // in-RAM replay buffer, then continue live. If the requested position has
+  // already been evicted, the stream starts at the oldest retained event —
+  // the client detects the gap by the first seq jumping past cursor+1.
+  uint64 resume_after_seq = 2;
+  // The boot_id the cursor belongs to. Empty or mismatching the engine's
+  // current boot_id => the cursor is from another life; the engine replays
+  // everything it has (the client resets its cursor from EngineInfo).
+  string boot_id = 3;
+}
+
+// Engine self-description: version/capabilities for rollout management, the
+// event-replay cursor bounds, and FNV-1a64 hashes of the control-plane-managed
+// state so the CP can detect config drift cheaply (GetEngineInfo + compare
+// beats re-pushing everything on a timer).
+//
+// Canonical forms hashed (MUST match the control plane's implementation;
+// covered by shared test vectors on both sides):
+//   tiers  : "home:{ttl_s}:{quota_bytes}:{rate_bps}|public:...|retail:..."
+//            (tiers sorted alphabetically)
+//   params : "{accounting_s}:{garden_s}:{expiry_s}:{max_sessions}"
+//   garden : fqdns lowercased, sorted ascending, joined with "|" ("" if empty)
+// Hash: FNV-1a 64-bit over UTF-8, rendered as 16 lowercase hex chars.
+message EngineInfo {
+  string version = 1;               // engine CARGO_PKG_VERSION, e.g. "0.4.0"
+  string boot_id = 2;               // random per daemon start; event-seq epoch
+  uint64 event_latest_seq = 3;      // 0 = no events emitted yet this boot
+  uint64 event_oldest_seq = 4;      // oldest seq still replayable (0 = none)
+  repeated string capabilities = 5; // e.g. "tier_policies","engine_params","event_replay","shaper"
+  bool   enforcement_enabled = 6;
+  string tier_policies_hash = 7;
+  string engine_params_hash = 8;
+  string garden_hash = 9;
 }
 
 message HealthReply {

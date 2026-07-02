@@ -220,6 +220,33 @@ impl EngineParams {
     }
 }
 
+/// FNV-1a 64-bit over UTF-8 bytes. Deterministic across platforms/languages —
+/// the control plane (Go) implements the same function over the same canonical
+/// strings so config-state hashes compare equal (see `ConfigState`). Kept in
+/// `types` so every crate hashes one way; covered by shared test vectors.
+pub fn fnv1a64(s: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Snapshot of the control-plane-managed engine state, reduced to canonical
+/// hashes (16 lowercase hex chars each, [`fnv1a64`]) so the control plane can
+/// detect drift with one `GetEngineInfo` call instead of re-pushing on a
+/// timer. Canonical forms are pinned in `proto/enforcement.proto` (EngineInfo).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigState {
+    pub tier_policies_hash: String,
+    pub engine_params_hash: String,
+    pub garden_hash: String,
+    pub enforcement_enabled: bool,
+}
+
 /// Control-plane-issued session id (== RADIUS `Acct-Session-Id`, TDD §7.4/§7.5).
 ///
 /// Backed by `Box<str>` rather than `String`: a session id is immutable once
@@ -536,6 +563,25 @@ pub trait Enforcer: Send + Sync {
     /// below the current count — the lowered cap only blocks new grants (G2).
     /// **RAM-only**, like the tier policies.
     async fn set_engine_parameters(&self, params: EngineParams) -> Result<()>;
+
+    /// Canonical hashes of the control-plane-managed state currently applied
+    /// (drift detection, see [`ConfigState`]). Read-only and cheap.
+    async fn config_state(&self) -> ConfigState;
+}
+
+/// Apply / clear a per-client bandwidth cap (TDD §7.7 — `tc`/HTB, download
+/// direction). `rate_bps == 0` means unlimited. Shaping is **best-effort QoS**,
+/// not enforcement: callers log-and-continue on error (quota/revoke remain the
+/// hard gates). Implemented by `portcullis-accounting` (`TcShaper`/`NoopShaper`)
+/// and wired into the `SessionManager` at composition time.
+#[async_trait]
+pub trait Shaper: Send + Sync {
+    /// Cap `mac` to `rate_bps` bits/sec (download). `rate_bps == 0` clears any
+    /// existing cap instead.
+    async fn apply(&self, mac: MacAddr, rate_bps: u64) -> Result<()>;
+
+    /// Remove any cap for `mac` (idempotent — clearing an unshaped MAC is Ok).
+    async fn clear(&self, mac: MacAddr) -> Result<()>;
 }
 
 /// Control-plane-managed walled garden, implemented by `portcullis-garden`'s
@@ -594,6 +640,22 @@ mod tests {
         assert_eq!(Tier::Home.to_string(), "home");
         assert_eq!("".parse::<Tier>().unwrap(), Tier::Public);
         assert!("gold".parse::<Tier>().is_err());
+    }
+
+    #[test]
+    fn fnv1a64_matches_shared_vectors() {
+        // Golden vectors shared with the Go control plane (hash.go tests) —
+        // any change here breaks cross-language drift detection.
+        for (s, want) in [
+            ("", "cbf29ce484222325"),
+            ("a", "af63dc4c8601ec8c"),
+            ("hello", "a430d84680aabd0b"),
+            ("15:30:1:4096", "3dadbdd27d764902"),
+            ("home:86400:0:0|public:7200:0:0|retail:28800:0:0", "f91fea58d22e1509"),
+            ("cdn.wifihub.vn|portal.wifihub.vn", "c34e4b6bbbbe11ee"),
+        ] {
+            assert_eq!(format!("{:016x}", fnv1a64(s)), want, "vector {s:?}");
+        }
     }
 
     #[test]

@@ -42,9 +42,10 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use portcullis_types::{
-    AuthElement, Counters, Enforcer, EngineParams, Error, EventKind, EventSink, GardenControl,
-    GrantParams, HealthStatus, MacAddr, MeteringSink, Result, RevokeReason, RulesetWriter,
-    SessionEvent, SessionId, SessionInfo, Tier, TierPolicy, DEFAULT_MAX_SESSIONS, DEFAULT_TTL,
+    AuthElement, ConfigState, Counters, Enforcer, EngineParams, Error, EventKind, EventSink,
+    GardenControl, GrantParams, HealthStatus, MacAddr, MeteringSink, Result, RevokeReason,
+    RulesetWriter, SessionEvent, SessionId, SessionInfo, Shaper, Tier, TierPolicy,
+    DEFAULT_MAX_SESSIONS, DEFAULT_TTL,
 };
 
 /// Upper bound on concurrently-tracked sessions held in RAM.
@@ -194,6 +195,14 @@ pub struct SessionManager {
     /// rebuild their tickers on change; the grant path reads `max_sessions`
     /// from it directly. RAM-only (§5.4 no-NAND).
     params: watch::Sender<EngineParams>,
+    /// Mirror of the last garden FQDN list applied (boot seed, then every
+    /// successful `set_garden`). Exists only so [`Enforcer::config_state`] can
+    /// hash it for drift detection — `GardenManager` stays the owner.
+    garden_fqdns: Mutex<Vec<String>>,
+    /// Optional per-client bandwidth shaper (composition root, `set_shaper`).
+    /// Best-effort QoS: apply/clear failures are logged, never fail a grant or
+    /// revoke — quota/revoke stay the hard enforcement (§7.7).
+    shaper: Mutex<Option<Arc<dyn Shaper>>>,
 }
 
 impl SessionManager {
@@ -214,7 +223,42 @@ impl SessionManager {
             garden: Mutex::new(None),
             tier_policies: Mutex::new(TierPolicyTable::default()),
             params: watch::Sender::new(EngineParams::default()),
+            garden_fqdns: Mutex::new(Vec::new()),
+            shaper: Mutex::new(None),
         }
+    }
+
+    /// Wire the per-client bandwidth shaper (composition root).
+    pub fn set_shaper(&self, s: Arc<dyn Shaper>) {
+        *self.shaper.lock().expect("shaper mutex poisoned") = Some(s);
+    }
+
+    fn shaper(&self) -> Option<Arc<dyn Shaper>> {
+        self.shaper.lock().expect("shaper mutex poisoned").clone()
+    }
+
+    /// Best-effort shaping hook: QoS only, never propagates errors (§7.7).
+    async fn shape_apply(&self, mac: MacAddr, rate_bps: u64) {
+        if let Some(s) = self.shaper() {
+            if let Err(e) = s.apply(mac, rate_bps).await {
+                tracing::warn!(%mac, rate_bps, error = %e, "shaper apply failed (QoS only; session unaffected)");
+            }
+        }
+    }
+
+    async fn shape_clear(&self, mac: MacAddr) {
+        if let Some(s) = self.shaper() {
+            if let Err(e) = s.clear(mac).await {
+                tracing::warn!(%mac, error = %e, "shaper clear failed (QoS only)");
+            }
+        }
+    }
+
+    /// Seed the garden-FQDN mirror (composition root, before `Arc`-ing) so
+    /// `config_state` reflects the boot list until the control plane pushes.
+    pub fn with_garden_fqdns(self, fqdns: Vec<String>) -> Self {
+        *self.garden_fqdns.lock().expect("garden fqdns mutex poisoned") = fqdns;
+        self
     }
 
     /// Override the seeded tier-policy table (composition root, before the
@@ -373,6 +417,10 @@ impl SessionManager {
             map.insert(params.mac, session);
         }
 
+        // QoS cap for the (effective) rate. rate 0 clears any leftover cap
+        // from a previous session of this MAC.
+        self.shape_apply(params.mac, params.rate_bps).await;
+
         self.sink
             .emit(Self::build_event(
                 session_id.clone(),
@@ -406,6 +454,7 @@ impl SessionManager {
         if let Err(e) = self.writer.del_auth(mac).await {
             tracing::warn!(mac = %mac, error = %e, "del_auth failed during revoke; in-RAM session already removed");
         }
+        self.shape_clear(mac).await;
 
         self.sink
             .emit(Self::build_event(
@@ -441,6 +490,7 @@ impl SessionManager {
             if let Err(e) = self.writer.del_auth(session.mac).await {
                 tracing::warn!(mac = %session.mac, error = %e, "del_auth failed during expiry tick");
             }
+            self.shape_clear(session.mac).await;
             self.sink
                 .emit(Self::build_event(
                     session.session_id.clone(),
@@ -612,7 +662,12 @@ impl Enforcer for SessionManager {
     async fn set_garden(&self, fqdns: Vec<String>) -> Result<()> {
         let garden = self.garden.lock().expect("garden mutex poisoned").clone();
         match garden {
-            Some(g) => g.set_fqdns(fqdns).await,
+            Some(g) => {
+                g.set_fqdns(fqdns.clone()).await?;
+                // Mirror only what the garden actually accepted (drift hash).
+                *self.garden_fqdns.lock().expect("garden fqdns mutex poisoned") = fqdns;
+                Ok(())
+            }
             None => Err(Error::BadRequest("garden control not configured".into())),
         }
     }
@@ -640,6 +695,62 @@ impl Enforcer for SessionManager {
         );
         Ok(())
     }
+
+    async fn config_state(&self) -> ConfigState {
+        let tiers = *self.tier_policies.lock().expect("tier policies mutex poisoned");
+        let params = *self.params.borrow();
+        let garden = self.garden_fqdns.lock().expect("garden fqdns mutex poisoned").clone();
+        ConfigState {
+            tier_policies_hash: hash_hex(&canonical_tiers(&tiers)),
+            engine_params_hash: hash_hex(&canonical_params(params)),
+            garden_hash: hash_hex(&canonical_garden(&garden)),
+            enforcement_enabled: *self
+                .enforcement_enabled
+                .lock()
+                .expect("enforcement mutex poisoned"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical forms for drift-detection hashes. Pinned in
+// proto/enforcement.proto (EngineInfo) and mirrored by the Go control plane —
+// any change here MUST change both sides and their shared test vectors.
+// ---------------------------------------------------------------------------
+
+fn hash_hex(s: &str) -> String {
+    format!("{:016x}", portcullis_types::fnv1a64(s))
+}
+
+/// `"home:{ttl_s}:{quota}:{rate}|public:...|retail:..."` (alphabetical).
+fn canonical_tiers(t: &TierPolicyTable) -> String {
+    let one = |name: &str, p: TierPolicy| {
+        format!("{name}:{}:{}:{}", p.ttl.as_secs(), p.quota_bytes, p.rate_bps)
+    };
+    format!(
+        "{}|{}|{}",
+        one("home", t.home),
+        one("public", t.public),
+        one("retail", t.retail)
+    )
+}
+
+/// `"{accounting_s}:{garden_s}:{expiry_s}:{max_sessions}"`.
+fn canonical_params(p: EngineParams) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        p.accounting_interval.as_secs(),
+        p.garden_tick.as_secs(),
+        p.expiry_tick.as_secs(),
+        p.max_sessions
+    )
+}
+
+/// FQDNs lowercased, sorted ascending, joined with `"|"` (`""` if empty).
+fn canonical_garden(fqdns: &[String]) -> String {
+    let mut v: Vec<String> = fqdns.iter().map(|s| s.to_lowercase()).collect();
+    v.sort();
+    v.join("|")
 }
 
 #[async_trait]
@@ -771,6 +882,37 @@ mod tests {
         (m, writer, sink)
     }
 
+    /// Records shaper calls; `fail` exercises the best-effort (log-only) path.
+    struct MockShaper {
+        ops: StdMutex<Vec<(String, MacAddr, u64)>>,
+        fail: bool,
+    }
+    impl MockShaper {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(MockShaper { ops: StdMutex::new(Vec::new()), fail })
+        }
+        fn ops(&self) -> Vec<(String, MacAddr, u64)> {
+            self.ops.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl Shaper for MockShaper {
+        async fn apply(&self, mac: MacAddr, rate_bps: u64) -> Result<()> {
+            self.ops.lock().unwrap().push(("apply".into(), mac, rate_bps));
+            if self.fail {
+                return Err(Error::Backend("tc boom".into()));
+            }
+            Ok(())
+        }
+        async fn clear(&self, mac: MacAddr) -> Result<()> {
+            self.ops.lock().unwrap().push(("clear".into(), mac, 0));
+            if self.fail {
+                return Err(Error::Backend("tc boom".into()));
+            }
+            Ok(())
+        }
+    }
+
     fn policy(tier: Tier, ttl_secs: u64, quota: u64, rate: u64) -> TierPolicy {
         TierPolicy {
             tier,
@@ -897,6 +1039,73 @@ mod tests {
         assert!(rx.has_changed().unwrap());
         assert_eq!(*rx.borrow_and_update(), good);
         assert_eq!(m.current_params(), good);
+    }
+
+    #[tokio::test]
+    async fn shaper_applied_with_effective_rate_and_cleared_on_teardown() {
+        let (m, _writer, _sink) = mgr();
+        let shaper = MockShaper::new(false);
+        m.set_shaper(shaper.clone());
+        // Tier policy supplies the rate for a 0-rate grant.
+        m.set_tier_policies(vec![policy(Tier::Public, 300, 0, 2_000_000)]).await.unwrap();
+
+        m.grant_at(grant_params(mac(1), 0, 0), Instant::now()).await.unwrap();
+        assert_eq!(shaper.ops(), vec![("apply".into(), mac(1), 2_000_000)]);
+
+        m.revoke(mac(1), RevokeReason::Admin).await.unwrap();
+        assert_eq!(shaper.ops()[1], ("clear".into(), mac(1), 0));
+
+        // Expiry sweep also clears.
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(2), 1, 0), now).await.unwrap();
+        m.tick_expiry(now + Duration::from_secs(2)).await;
+        let ops = shaper.ops();
+        assert_eq!(ops.last().unwrap(), &("clear".into(), mac(2), 0));
+    }
+
+    #[tokio::test]
+    async fn shaper_failure_never_fails_the_grant() {
+        let (m, writer, _sink) = mgr();
+        m.set_shaper(MockShaper::new(true));
+        let mut p = grant_params(mac(1), 60, 0);
+        p.rate_bps = 1_000_000;
+        // Shaper explodes; the grant still lands (QoS is best-effort).
+        m.grant_at(p, Instant::now()).await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(writer.ops(), vec![WriterOp::AddAuth(mac(1), Duration::from_secs(60))]);
+    }
+
+    #[tokio::test]
+    async fn config_state_matches_shared_vectors_and_tracks_changes() {
+        let (m, _writer, _sink) = mgr();
+
+        // Defaults: all-zero tier policies, default params, empty garden.
+        // These hex values are the shared cross-language vectors (Go hash_test).
+        let cs = m.config_state().await;
+        assert_eq!(canonical_tiers(&TierPolicyTable::default()), "home:0:0:0|public:0:0:0|retail:0:0:0");
+        assert_eq!(canonical_params(EngineParams::default()), "15:30:1:4096");
+        assert_eq!(cs.engine_params_hash, "3dadbdd27d764902"); // fnv1a64("15:30:1:4096")
+        assert_eq!(cs.garden_hash, "cbf29ce484222325"); // fnv1a64("")
+        assert!(cs.enforcement_enabled);
+
+        // Garden canonicalization: lowercase + sort + join.
+        let m2 = SessionManager::new(Arc::new(MockWriter::new()), Arc::new(CapturingSink::new()))
+            .with_garden_fqdns(vec!["Portal.WIFIHUB.vn".into(), "cdn.wifihub.vn".into()]);
+        let cs2 = m2.config_state().await;
+        assert_eq!(cs2.garden_hash, "c34e4b6bbbbe11ee"); // fnv1a64("cdn.wifihub.vn|portal.wifihub.vn")
+
+        // Hashes track pushed changes.
+        m.set_tier_policies(vec![policy(Tier::Home, 86400, 0, 0)]).await.unwrap();
+        let after_tiers = m.config_state().await;
+        assert_ne!(after_tiers.tier_policies_hash, cs.tier_policies_hash);
+
+        m.set_engine_parameters(EngineParams {
+            accounting_interval: Duration::from_secs(60),
+            ..EngineParams::default()
+        })
+        .await
+        .unwrap();
+        assert_ne!(m.config_state().await.engine_params_hash, cs.engine_params_hash);
     }
 
     #[tokio::test]
