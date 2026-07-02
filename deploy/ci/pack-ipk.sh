@@ -70,11 +70,19 @@ mkdir -p /etc/init.d /etc/config
 cp "$LIB/portcullis.init" /etc/init.d/portcullis && chmod 0755 /etc/init.d/portcullis
 [ -f /etc/config/portcullis ] || { cp "$LIB/config.default" /etc/config/portcullis && chmod 0644 /etc/config/portcullis; }
 mkdir -p /tmp/portcullis /etc/dnsmasq.d
-if [ ! -f /etc/dnsmasq.d/portcullis-garden.conf ]; then
-	echo 'ipset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/wifihub_g4,wifihub_g6' \
-		> /etc/dnsmasq.d/portcullis-garden.conf
-	/etc/init.d/dnsmasq reload 2>/dev/null || true
-fi
+# Walled garden needs dnsmasq-full: `ipset=` crashes a stock/slim dnsmasq and
+# takes DNS down for the whole LAN. Only wire it when dnsmasq supports ipset.
+DNSMASQ_VER="$(dnsmasq --version 2>/dev/null)"
+case "$DNSMASQ_VER" in
+	*no-ipset*) echo "portcullis: stock dnsmasq (no ipset) — skipping walled-garden; install dnsmasq-full to enable" >&2 ;;
+	*ipset*)
+		if [ ! -f /etc/dnsmasq.d/portcullis-garden.conf ]; then
+			echo 'ipset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/wifihub_g4,wifihub_g6' \
+				> /etc/dnsmasq.d/portcullis-garden.conf
+			/etc/init.d/dnsmasq reload 2>/dev/null || true
+		fi ;;
+	*) echo "portcullis: could not probe dnsmasq ipset support — skipping walled-garden" >&2 ;;
+esac
 /etc/init.d/portcullis enable 2>/dev/null || true
 exit 0
 EOF
