@@ -265,6 +265,18 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
             .map_err(status_from_domain)?;
         Ok(Response::new(pb::Ack { ok: true, message: String::new() }))
     }
+
+    async fn set_garden(
+        &self,
+        request: Request<pb::SetGardenRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        let fqdns = request.into_inner().fqdns;
+        self.enforcer
+            .set_garden(fqdns)
+            .await
+            .map_err(status_from_domain)?;
+        Ok(Response::new(pb::Ack { ok: true, message: String::new() }))
+    }
 }
 
 /// Adapt a bounded `broadcast::Receiver<SessionEvent>` into a `Stream` of wire
@@ -378,6 +390,12 @@ mod tests {
         }
         async fn enforcement_enabled(&self) -> bool {
             true
+        }
+        async fn set_garden(&self, _fqdns: Vec<String>) -> PResult<()> {
+            if self.fail {
+                return Err(portcullis_types::Error::Backend("boom".into()));
+            }
+            Ok(())
         }
     }
 

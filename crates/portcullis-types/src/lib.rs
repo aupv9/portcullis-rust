@@ -412,6 +412,18 @@ pub trait Enforcer: Send + Sync {
 
     /// Current global enforcement gate state.
     async fn enforcement_enabled(&self) -> bool;
+
+    /// Replace the pre-auth walled-garden FQDN list (control-plane managed).
+    /// Full set, not a delta. Returns Err if no garden controller is wired.
+    async fn set_garden(&self, fqdns: Vec<String>) -> Result<()>;
+}
+
+/// Control-plane-managed walled garden, implemented by `portcullis-garden`'s
+/// manager and injected into the SessionManager. Replacing the FQDN list
+/// reconciles the dnsmasq garden config (guarded by dnsmasq ipset support).
+#[async_trait]
+pub trait GardenControl: Send + Sync {
+    async fn set_fqdns(&self, fqdns: Vec<String>) -> Result<()>;
 }
 
 /// Accounting-facing sink, implemented by the SessionManager and called by the

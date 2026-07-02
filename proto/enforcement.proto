@@ -15,6 +15,7 @@ service Enforcement {
   rpc StreamEvents (StreamReq)    returns (stream SessionEvent); // engine -> control plane
   rpc Health       (Empty)        returns (HealthReply);
   rpc SetEnforcement(SetEnforcementRequest) returns (Ack); // global on/off gate
+  rpc SetGarden      (SetGardenRequest)      returns (Ack); // control-plane-managed walled garden
 }
 
 // Toggle the engine's global enforcement gate. When disabled, the engine removes
@@ -22,6 +23,14 @@ service Enforcement {
 // chains are left intact so re-enabling is instant and no session state is lost.
 message SetEnforcementRequest {
   bool enabled = 1;
+}
+
+// Replace the pre-auth walled-garden FQDN list (full set, not a delta). The
+// engine wires these to dnsmasq (ipset=) so their resolved IPs land in the
+// garden ipsets. Requires dnsmasq-full on the router; on stock dnsmasq the engine
+// stores the list but skips writing (ipset= would crash the resolver).
+message SetGardenRequest {
+  repeated string fqdns = 1;
 }
 
 message GrantRequest {

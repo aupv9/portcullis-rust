@@ -30,10 +30,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use portcullis_types::{Error, Result};
+use async_trait::async_trait;
+use portcullis_types::{Error, GardenControl, Result};
+use tokio::sync::Mutex;
 
 /// The set of garden FQDNs plus the ipset names that dnsmasq should populate.
 ///
@@ -233,6 +236,77 @@ pub async fn run_garden_loop(path: impl AsRef<Path>, cfg: GardenConfig, interval
             Ok(false) => tracing::debug!(path = %path.display(), "garden config already up to date"),
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "garden reconcile failed; keeping prior config"),
         }
+    }
+}
+
+/// Runtime-mutable, control-plane-managed walled garden.
+///
+/// Owns the FQDN list behind an async mutex so the gRPC `SetGarden` handler and
+/// the periodic reconcile loop share one source of truth. Probes dnsmasq ipset
+/// support once at construction; on a stock/slim dnsmasq (no ipset) it never
+/// writes the `ipset=` config (which would crash the resolver and kill LAN DNS) —
+/// it just holds the list in RAM, ready for a dnsmasq-full box.
+pub struct GardenManager {
+    path: PathBuf,
+    supported: bool,
+    cfg: Mutex<GardenConfig>,
+}
+
+impl GardenManager {
+    /// Build a manager seeded with `fqdns`, probing dnsmasq ipset support now.
+    pub fn new(path: impl Into<PathBuf>, fqdns: Vec<String>) -> Arc<Self> {
+        Arc::new(GardenManager {
+            path: path.into(),
+            supported: dnsmasq_supports_ipset("dnsmasq"),
+            cfg: Mutex::new(GardenConfig::with_fqdns(fqdns)),
+        })
+    }
+
+    /// Reconcile the dnsmasq garden config from the current FQDN list, reloading
+    /// dnsmasq on change. No-op that removes any stale conf when dnsmasq lacks
+    /// ipset support (protects LAN DNS).
+    pub async fn reconcile_now(&self) -> Result<bool> {
+        if !self.supported {
+            let _ = tokio::fs::remove_file(&self.path).await;
+            return Ok(false);
+        }
+        let cfg = self.cfg.lock().await.clone();
+        let changed = reconcile(&self.path, &cfg).await?;
+        if changed {
+            // best-effort reload so the new garden takes effect immediately.
+            let _ = tokio::process::Command::new("/etc/init.d/dnsmasq")
+                .arg("reload")
+                .status()
+                .await;
+        }
+        Ok(changed)
+    }
+
+    /// Periodic reconcile (first-boot + drift). Runs until aborted.
+    pub async fn run(self: Arc<Self>, interval: Duration) {
+        if !self.supported {
+            tracing::warn!(path = %self.path.display(),
+                "dnsmasq has no ipset support (stock/slim) — walled-garden disabled; install dnsmasq-full to enable");
+            let _ = tokio::fs::remove_file(&self.path).await;
+            return;
+        }
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match self.reconcile_now().await {
+                Ok(true) => tracing::info!(path = %self.path.display(), "garden config reconciled (changed)"),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(path = %self.path.display(), error = %e, "garden reconcile failed; keeping prior config"),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl GardenControl for GardenManager {
+    async fn set_fqdns(&self, fqdns: Vec<String>) -> Result<()> {
+        self.cfg.lock().await.fqdns = fqdns;
+        self.reconcile_now().await.map(|_| ())
     }
 }
 
