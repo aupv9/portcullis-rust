@@ -1,0 +1,15 @@
+Package: portcullis
+Version: 0.4.0-1
+Architecture: arm_cortex-a7_neon-vfpv4
+Maintainer: The portcullis authors
+Section: net
+Priority: optional
+Depends: ipset, iptables, ip6tables, kmod-ipt-ipset
+Description: Per-store captive-portal edge enforcement engine. Holds the internet
+ gate shut until the WiFi Hub control plane authorizes a client, then enforces,
+ meters, and expires that grant via ipset + iptables (TDD 17 option B).
+Filename: portcullis_0.4.0-1_arm_cortex-a7_neon-vfpv4.ipk
+Size: 1040456
+SHA256sum: 4058124e254531bcfb7d60bc30150ff1f956f195b41a5323a09f1c96ac08d1d3
+MD5Sum: 9bc437b15e0c80cc5f0afa52fc1fcff6
+

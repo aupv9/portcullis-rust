@@ -1,0 +1,15 @@
+Package: portcullis
+Version: 0.4.0-1
+Architecture: mips_24kc
+Maintainer: The portcullis authors
+Section: net
+Priority: optional
+Depends: ipset, iptables, ip6tables, kmod-ipt-ipset
+Description: Per-store captive-portal edge enforcement engine. Holds the internet
+ gate shut until the WiFi Hub control plane authorizes a client, then enforces,
+ meters, and expires that grant via ipset + iptables (TDD 17 option B).
+Filename: portcullis_0.4.0-1_mips_24kc.ipk
+Size: 1299995
+SHA256sum: fd0b195375e0cedc56c4d320a3d5f6e17b8a820c0e273d6a606844f4a282e2f6
+MD5Sum: ed356904ae516f74668fae388f41fa3b
+
