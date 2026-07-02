@@ -159,6 +159,7 @@ pub fn health_to_pb(h: HealthStatus) -> pb::HealthReply {
         kernel_table_present: h.kernel_table_present,
         cp_connected: h.cp_connected,
         last_reconcile_ok: h.last_reconcile_ok,
+        enforcement_enabled: h.enforcement_enabled,
     }
 }
 
@@ -332,11 +333,13 @@ mod tests {
             kernel_table_present: false,
             cp_connected: true,
             last_reconcile_ok: false,
+            enforcement_enabled: true,
         };
         let pb = health_to_pb(h);
         assert!(pb.backend_ok);
         assert!(!pb.kernel_table_present);
         assert!(pb.cp_connected);
         assert!(!pb.last_reconcile_ok);
+        assert!(pb.enforcement_enabled);
     }
 }

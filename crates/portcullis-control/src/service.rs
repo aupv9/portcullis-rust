@@ -253,6 +253,18 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
         let h = self.enforcer.health().await;
         Ok(Response::new(convert::health_to_pb(h)))
     }
+
+    async fn set_enforcement(
+        &self,
+        request: Request<pb::SetEnforcementRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        let enabled = request.into_inner().enabled;
+        self.enforcer
+            .set_enforcement(enabled)
+            .await
+            .map_err(status_from_domain)?;
+        Ok(Response::new(pb::Ack { ok: true, message: String::new() }))
+    }
 }
 
 /// Adapt a bounded `broadcast::Receiver<SessionEvent>` into a `Stream` of wire
@@ -358,6 +370,15 @@ mod tests {
         async fn health(&self) -> HealthStatus {
             HealthStatus { backend_ok: true, ..Default::default() }
         }
+        async fn set_enforcement(&self, _enabled: bool) -> PResult<()> {
+            if self.fail {
+                return Err(portcullis_types::Error::Backend("boom".into()));
+            }
+            Ok(())
+        }
+        async fn enforcement_enabled(&self) -> bool {
+            true
+        }
     }
 
     use pb::enforcement_server::Enforcement;
@@ -430,6 +451,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn set_enforcement_ok_and_error() {
+        let (ok, _s1) = EnforcementService::with_default_buffer(MockEnforcer::ok());
+        let ack = ok
+            .set_enforcement(Request::new(pb::SetEnforcementRequest { enabled: false }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok);
+
+        let (bad, _s2) = EnforcementService::with_default_buffer(MockEnforcer::failing());
+        let status = bad
+            .set_enforcement(Request::new(pb::SetEnforcementRequest { enabled: false }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Internal);
     }
 
     #[tokio::test]

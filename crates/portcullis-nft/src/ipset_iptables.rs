@@ -55,6 +55,9 @@ pub struct IpsetIptablesBackend {
     ipset_bin: String,
     /// (binary, garden set) for each address family we program.
     tables: Vec<(String, String)>,
+    /// Port the tcp:80 REDIRECT sends to — MUST equal the responder's listen
+    /// port so the hijacked request reaches the portcullis responder.
+    redirect_port: u16,
 }
 
 impl Default for IpsetIptablesBackend {
@@ -65,11 +68,19 @@ impl Default for IpsetIptablesBackend {
                 ("iptables".to_string(), IPSET_G4.to_string()),
                 ("ip6tables".to_string(), IPSET_G6.to_string()),
             ],
+            redirect_port: REDIRECT_PORT,
         }
     }
 }
 
 impl IpsetIptablesBackend {
+    /// Set the tcp:80 REDIRECT target port. Pass the daemon's configured
+    /// `responder_port` so the REDIRECT and the responder always agree.
+    pub fn with_redirect_port(mut self, port: u16) -> Self {
+        self.redirect_port = port;
+        self
+    }
+
     /// Override binary paths (tests / non-standard installs). `iptables` and
     /// `ip6tables` are paired with their family's garden set.
     pub fn with_bins(
@@ -83,6 +94,7 @@ impl IpsetIptablesBackend {
                 (iptables_bin.into(), IPSET_G4.to_string()),
                 (ip6tables_bin.into(), IPSET_G6.to_string()),
             ],
+            redirect_port: REDIRECT_PORT,
         }
     }
 
@@ -170,11 +182,32 @@ impl IpsetIptablesBackend {
         // Ensure exactly one jump hook -> chain, inserted ahead of fw3 (pos 1).
         // The chain is fully populated (drop-terminated) before the jump is
         // added, so first-boot never has a fail-open window.
-        let check = [
-            "-t", table, "-C", hook, "-j", chain,
-        ];
-        if !Self::run_ok(ipt, &check).await {
-            Self::run(ipt, &["-t", table, "-I", hook, "1", "-j", chain]).await?;
+        Self::set_hook(ipt, table, chain, hook, true).await
+    }
+
+    /// Add or remove the jump `hook -> chain` in `table` (`"nat"`/`"filter"`).
+    ///
+    /// This is the single global enforcement gate: the gating chains and the
+    /// `auth` set are never touched here — only whether traffic is routed
+    /// *through* them. Idempotent in both directions:
+    /// - `enabled = true`: ensure exactly one jump exists, inserted at position 1
+    ///   (ahead of fw3). Because the chain is already drop-terminated, enabling
+    ///   never opens a fail-open window.
+    /// - `enabled = false`: delete every copy of the jump so unauthorized traffic
+    ///   falls straight through to fw3 (i.e. flows). The chain remains populated
+    ///   but unreferenced, so re-enabling is a single `-I`.
+    async fn set_hook(ipt: &str, table: &str, chain: &str, hook: &str, enabled: bool) -> Result<()> {
+        let check = ["-t", table, "-C", hook, "-j", chain];
+        if enabled {
+            if !Self::run_ok(ipt, &check).await {
+                Self::run(ipt, &["-t", table, "-I", hook, "1", "-j", chain]).await?;
+            }
+        } else {
+            // Remove all copies (defensive: a re-inserted duplicate must not
+            // survive a disable). Bounded by the number of live jumps.
+            while Self::run_ok(ipt, &check).await {
+                Self::run(ipt, &["-t", table, "-D", hook, "-j", chain]).await?;
+            }
         }
         Ok(())
     }
@@ -203,7 +236,7 @@ impl FirewallBackend for IpsetIptablesBackend {
 
         // 2. Per-family iptables chains. Same shape for v4/v6, only the garden
         //    set differs.
-        let port = REDIRECT_PORT.to_string();
+        let port = self.redirect_port.to_string();
         for (ipt, gset) in &self.tables {
             // nat prerouting: exempt authed + garden, else redirect :80 -> :8080.
             let nat_rules: Vec<Vec<&str>> = vec![
@@ -251,6 +284,16 @@ impl FirewallBackend for IpsetIptablesBackend {
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         let out = Self::run_stdout(&self.ipset_bin, &["list", IPSET_AUTH]).await?;
         Ok(parse_ipset_list(&out))
+    }
+
+    async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+        // Toggle the jump into both gating chains for every family (v4 + v6).
+        // The chains + `auth` set are left intact; only the base-hook jump moves.
+        for (ipt, _gset) in &self.tables {
+            Self::set_hook(ipt, "nat", CHAIN_NAT, "PREROUTING", enabled).await?;
+            Self::set_hook(ipt, "filter", CHAIN_FWD, "FORWARD", enabled).await?;
+        }
+        Ok(())
     }
 }
 

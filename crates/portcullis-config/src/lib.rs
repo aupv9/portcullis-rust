@@ -61,6 +61,17 @@ pub struct Config {
     /// Walled-garden FQDNs always reachable pre-auth (portal, CDN, OTP, pay).
     #[serde(default)]
     pub garden_fqdn: Vec<String>,
+
+    /// Initial global enforcement gate state applied at boot, before the control
+    /// plane pushes the persisted admin choice. Defaults to `true` (fail-closed,
+    /// §11/G5): the engine always boots blocking unauthorized traffic.
+    #[serde(default = "default_enforcement")]
+    pub enforcement_default: bool,
+}
+
+/// Serde default for [`Config::enforcement_default`]: boot fail-closed.
+fn default_enforcement() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -77,6 +88,7 @@ impl Default for Config {
             default_quota_mb: 0,
             default_rate_kbps: 2048,
             garden_fqdn: Vec::new(),
+            enforcement_default: true,
         }
     }
 }
@@ -235,6 +247,15 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
             Error::Config(format!("UCI line {lineno}: '{key}' expects a u64, got '{v}'"))
         })
     };
+    let parse_bool = |v: &str| -> Result<bool> {
+        match v {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(Error::Config(format!(
+                "UCI line {lineno}: '{key}' expects a bool (0/1/true/false), got '{v}'"
+            ))),
+        }
+    };
 
     match key {
         "store_id" => cfg.store_id = val.to_string(),
@@ -246,6 +267,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "default_ttl" => cfg.default_ttl = parse_u64(val)?,
         "default_quota_mb" => cfg.default_quota_mb = parse_u64(val)?,
         "default_rate_kbps" => cfg.default_rate_kbps = parse_u64(val)?,
+        "enforcement_default" => cfg.enforcement_default = parse_bool(val)?,
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -456,6 +478,7 @@ config portcullis 'main'
                 "otp.gateway".to_string(),
                 "pay.example".to_string(),
             ],
+            enforcement_default: true,
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
@@ -474,6 +497,27 @@ config portcullis 'main'
         assert_eq!(d.default_quota_mb, 0);
         assert_eq!(d.default_rate_kbps, 2048);
         assert!(d.garden_fqdn.is_empty());
+        assert!(d.enforcement_default, "boots fail-closed by default");
+    }
+
+    #[test]
+    fn toml_without_enforcement_default_falls_back_to_enabled() {
+        // A config file predating the field must still parse, defaulting to true.
+        let cfg = Config::from_toml_str(
+            "store_id = \"S\"\ncontrol_endpoint = \"https://x:8443\"\n\
+             wg_interface = \"wg-hub\"\nhmac_key_file = \"/k\"\nresponder_port = 8080\n\
+             accounting_interval = 15\ndefault_ttl = 1800\ndefault_quota_mb = 0\n\
+             default_rate_kbps = 2048\n",
+        )
+        .unwrap();
+        assert!(cfg.enforcement_default);
+    }
+
+    #[test]
+    fn uci_parses_enforcement_default_off() {
+        let uci = "config portcullis 'main'\n\toption enforcement_default '0'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert!(!cfg.enforcement_default);
     }
 
     #[test]

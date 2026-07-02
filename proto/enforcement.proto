@@ -14,6 +14,14 @@ service Enforcement {
   rpc ListSessions (ListRequest)  returns (stream SessionInfo);
   rpc StreamEvents (StreamReq)    returns (stream SessionEvent); // engine -> control plane
   rpc Health       (Empty)        returns (HealthReply);
+  rpc SetEnforcement(SetEnforcementRequest) returns (Ack); // global on/off gate
+}
+
+// Toggle the engine's global enforcement gate. When disabled, the engine removes
+// its FORWARD/PREROUTING jump rules so ALL traffic flows freely; the auth set and
+// chains are left intact so re-enabling is instant and no session state is lost.
+message SetEnforcementRequest {
+  bool enabled = 1;
 }
 
 message GrantRequest {
@@ -96,6 +104,7 @@ message HealthReply {
   bool kernel_table_present  = 2;
   bool cp_connected          = 3;
   bool last_reconcile_ok     = 4;
+  bool enforcement_enabled   = 5; // global gate state (true = blocking unauth traffic)
 }
 
 message Empty {}

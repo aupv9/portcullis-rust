@@ -30,6 +30,12 @@ pub trait FirewallBackend: Send + Sync {
 
     /// List the current `auth` set elements (for restart adoption / reconcile).
     async fn list_auth(&self) -> Result<Vec<AuthElement>>;
+
+    /// Toggle the global enforcement gate. `true` (re)installs the jump into the
+    /// gating chains; `false` removes it so traffic flows. MUST NOT touch the
+    /// `auth` set or flush the gating chains — only the base-hook jump changes.
+    /// Idempotent (safe to call repeatedly with the same value).
+    async fn set_enforcement(&self, enabled: bool) -> Result<()>;
 }
 
 /// A mutation recorded by [`MockBackend`], for test assertions.
@@ -39,6 +45,7 @@ pub enum MockOp {
     AddAuth { mac: MacAddr, ttl: Duration },
     DelAuth { mac: MacAddr },
     ListAuth,
+    SetEnforcement { enabled: bool },
 }
 
 /// In-memory [`FirewallBackend`] for unit tests and host smoke use.
@@ -59,6 +66,8 @@ struct MockInner {
     ops: Vec<MockOp>,
     /// Remaining number of mutations to fail before they start succeeding.
     fail_remaining: usize,
+    /// Last enforcement gate state applied via `set_enforcement`.
+    enforcement_enabled: bool,
 }
 
 impl MockBackend {
@@ -86,6 +95,11 @@ impl MockBackend {
     /// Whether `ensure_base` has been applied.
     pub fn base_ready(&self) -> bool {
         self.inner.lock().unwrap().base_ready
+    }
+
+    /// Last enforcement gate state applied via `set_enforcement` (default false).
+    pub fn enforcement_enabled(&self) -> bool {
+        self.inner.lock().unwrap().enforcement_enabled
     }
 
     /// Current number of MACs in the in-memory `auth` set (non-expired).
@@ -155,5 +169,13 @@ impl FirewallBackend for MockBackend {
         out.sort_by_key(|e| e.mac.octets());
         inner.ops.push(MockOp::ListAuth);
         Ok(out)
+    }
+
+    async fn set_enforcement(&self, enabled: bool) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::maybe_fail(&mut inner, "set_enforcement")?;
+        inner.enforcement_enabled = enabled;
+        inner.ops.push(MockOp::SetEnforcement { enabled });
+        Ok(())
     }
 }
