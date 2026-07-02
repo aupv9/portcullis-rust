@@ -112,15 +112,19 @@ jobs:
   # Publish a per-arch opkg feed to GitHub Pages (repo is public → routers pull
   # over the internet). Router: add
   #   src/gz portcullis https://<owner>.github.io/portcullis-rust/<arch>
+  #
+  # We publish to the `gh-pages` branch via peaceiris (NOT actions/deploy-pages).
+  # deploy-pages deploys through the `github-pages` deployment environment, whose
+  # branch/tag allowlist rejects tag-triggered runs (this workflow fires on `v*`
+  # tags) unless the tag is explicitly allowed — a repo setting, not fixable in
+  # the workflow. Pushing to a branch has no such gate, so it works from tags.
+  # One-time repo setting: Settings → Pages → Source = "Deploy from a branch" →
+  # `gh-pages` / (root).
   pages:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      contents: write # push the generated feed to the gh-pages branch
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -130,6 +134,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p public
+          # .nojekyll: arch dirs like `mipsel_24kc` must be served verbatim (no
+          # Jekyll processing of underscore paths).
+          touch public/.nojekyll
           echo "<h1>portcullis opkg feed</h1><ul>" > public/index.html
           for d in dl/ipk-*; do
             arch="${d#dl/ipk-}"
@@ -153,12 +160,13 @@ jobs:
           done
           echo "</ul>" >> public/index.html
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - name: Publish feed to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: public
-      - id: deploy
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+          force_orphan: true # keep a single-commit branch; the feed is fully regenerated each release
 
   release:
     needs: [meta, build]
