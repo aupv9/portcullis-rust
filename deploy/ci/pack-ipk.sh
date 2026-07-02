@@ -65,8 +65,10 @@ cat > "$CTRL/postinst" <<'EOF'
 #!/bin/sh
 LIB=/usr/local/usr/lib/portcullis
 [ -d "$LIB" ] || LIB=/usr/lib/portcullis            # generic OpenWrt (dest=/)
-install -m0755 "$LIB/portcullis.init" /etc/init.d/portcullis
-[ -f /etc/config/portcullis ] || install -m0644 "$LIB/config.default" /etc/config/portcullis
+# busybox on RutOS has no `install`; use cp + chmod.
+mkdir -p /etc/init.d /etc/config
+cp "$LIB/portcullis.init" /etc/init.d/portcullis && chmod 0755 /etc/init.d/portcullis
+[ -f /etc/config/portcullis ] || { cp "$LIB/config.default" /etc/config/portcullis && chmod 0644 /etc/config/portcullis; }
 mkdir -p /tmp/portcullis /etc/dnsmasq.d
 if [ ! -f /etc/dnsmasq.d/portcullis-garden.conf ]; then
 	echo 'ipset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/wifihub_g4,wifihub_g6' \
