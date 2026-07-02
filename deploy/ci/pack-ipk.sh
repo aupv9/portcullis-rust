@@ -54,7 +54,7 @@ Architecture: ${ARCH}
 Maintainer: The portcullis authors
 Section: net
 Priority: optional
-Depends: ipset, iptables, ip6tables, iptables-mod-ipset, iptables-mod-nat-extra
+Depends: ipset, iptables, ip6tables, kmod-ipt-ipset
 Description: Per-store captive-portal edge enforcement engine. Holds the internet
  gate shut until the WiFi Hub control plane authorizes a client, then enforces,
  meters, and expires that grant via ipset + iptables (TDD 17 option B).
