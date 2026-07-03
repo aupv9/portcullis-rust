@@ -12,10 +12,9 @@
 //! epoch and the CP resets its cursor from `GetEngineInfo`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use portcullis_types::SessionEvent;
+use portcullis_types::{Counter, SessionEvent};
 use tokio::sync::watch;
 
 struct Inner {
@@ -35,7 +34,7 @@ pub struct EventLog {
     /// Events evicted from the ring before any replay (`events_evicted_total`
     /// in `GetMetrics`) — a rising value means the CP is falling behind the
     /// replay window.
-    evicted: AtomicU64,
+    evicted: Counter,
 }
 
 impl EventLog {
@@ -53,7 +52,7 @@ impl EventLog {
             latest: watch::Sender::new(0),
             boot_id,
             capacity: capacity.max(1),
-            evicted: AtomicU64::new(0),
+            evicted: Counter::default(),
         }
     }
 
@@ -71,7 +70,7 @@ impl EventLog {
             inner.buf.push_back((seq, event));
             while inner.buf.len() > self.capacity {
                 inner.buf.pop_front();
-                self.evicted.fetch_add(1, Ordering::Relaxed);
+                self.evicted.inc();
             }
             seq
         };
@@ -98,7 +97,7 @@ impl EventLog {
 
     /// Total events evicted from the ring this boot (`events_evicted_total`).
     pub fn evicted_total(&self) -> u64 {
-        self.evicted.load(Ordering::Relaxed)
+        self.evicted.get()
     }
 
     /// Watch the latest seq — tailing streams await changes on this.

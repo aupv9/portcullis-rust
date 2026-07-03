@@ -17,9 +17,10 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
+
+use portcullis_types::Counter;
 
 /// Configuration for the bucket. `capacity` tokens, refilled at
 /// `refill_per_sec`, one token spent per admitted request.
@@ -51,17 +52,17 @@ pub struct RateLimiter {
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
     /// Requests denied by this limiter since boot (any deny path), the
     /// `redirect_rejections_total` counter in `GetMetrics`.
-    rejections: AtomicU64,
+    rejections: Counter,
 }
 
 impl RateLimiter {
     pub fn new(cfg: RateLimitConfig) -> Self {
-        Self { cfg, buckets: Mutex::new(HashMap::new()), rejections: AtomicU64::new(0) }
+        Self { cfg, buckets: Mutex::new(HashMap::new()), rejections: Counter::default() }
     }
 
     /// Count (and report) one denied request.
     fn reject(&self) -> bool {
-        self.rejections.fetch_add(1, Ordering::Relaxed);
+        self.rejections.inc();
         false
     }
 
@@ -124,7 +125,7 @@ impl RateLimiter {
 
     /// Total requests this limiter has denied since boot.
     pub fn rejections_total(&self) -> u64 {
-        self.rejections.load(Ordering::Relaxed)
+        self.rejections.get()
     }
 }
 
