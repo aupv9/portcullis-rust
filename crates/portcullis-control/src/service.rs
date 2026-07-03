@@ -296,6 +296,7 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
             redirect_rejections_total: snap.redirect_rejections,
             rss_bytes: portcullis_types::rss_bytes(),
             uptime_secs: snap.uptime_secs,
+            idle_kills_total: snap.idle_kills,
         }))
     }
 
@@ -707,6 +708,7 @@ mod tests {
                 garden_tick_secs: 30,
                 expiry_tick_secs: 5,
                 max_sessions: 4096,
+                idle_timeout_secs: 0,
             })
         };
 
@@ -731,6 +733,7 @@ mod tests {
                 garden_tick_secs: 0,
                 expiry_tick_secs: 0,
                 max_sessions: 0,
+                idle_timeout_secs: 0,
             }))
             .await
             .unwrap_err();

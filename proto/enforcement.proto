@@ -67,6 +67,10 @@ message SetEngineParametersRequest {
   uint32 garden_tick_secs         = 2; // 0 = default 30;   bounds [5, 3600]
   uint32 expiry_tick_secs         = 3; // 0 = default 1;    bounds [1, 60]
   uint32 max_sessions             = 4; // 0 = default 4096; bounds [1, 16384]
+  // Disconnect a session after this many seconds with no metered traffic
+  // (RADIUS Idle-Timeout equivalent). UNLIKE the fields above, 0 = DISABLED
+  // (not a default); when set, bounds are [30, 86400].
+  uint32 idle_timeout_secs        = 5; // 0 = disabled;     bounds [30, 86400]
 }
 
 message GrantRequest {
@@ -132,9 +136,10 @@ message SessionInfo {
 enum EventKind {
   GRANTED        = 0;
   INTERIM        = 1;
-  EXPIRED        = 2;
-  REVOKED        = 3;
+  EXPIRED        = 2;   // session TTL (Session-Timeout) reached
+  REVOKED        = 3;   // control-plane / MAC-change teardown
   QUOTA_EXCEEDED = 4;
+  IDLE_TIMEOUT   = 5;   // no metered traffic within idle_timeout (Idle-Timeout)
 }
 
 message SessionEvent {
@@ -207,6 +212,7 @@ message MetricsReply {
   uint64 redirect_rejections_total = 10; // rate-limiter rejections on the :8080 responder
   uint64 rss_bytes                = 11; // /proc/self/status VmRSS (0 if unreadable)
   uint64 uptime_secs              = 12;
+  uint64 idle_kills_total         = 13; // sessions torn down for idle_timeout
 }
 
 message HealthReply {

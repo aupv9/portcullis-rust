@@ -239,6 +239,7 @@ Sourced from UCI (`/etc/config/portcullis`) or TOML; loaded & validated at start
 | `default_ttl` | `1800` (s) | ✅ hot |
 | `default_quota_mb` | `0` (0 = unlimited) | ✅ hot |
 | `default_rate_kbps` | `2048` | ✅ hot |
+| `idle_timeout` | `0` (0 = disabled; else 30–86400 s) | ✅ hot |
 | `garden_fqdn` | `portal.wifihub.vn` (list) | ✅ hot |
 
 mTLS material is provisioned separately at `/etc/portcullis/tls/` (`server.crt`, `server.key`, `client-ca.crt`) — never baked into the package.

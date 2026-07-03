@@ -215,6 +215,12 @@ pub struct EngineParams {
     pub garden_tick: Duration,
     pub expiry_tick: Duration,
     pub max_sessions: usize,
+    /// Disconnect a session after this long with no metered traffic (the
+    /// RADIUS Idle-Timeout equivalent, checked in the expiry sweep). Unlike the
+    /// other fields, [`Duration::ZERO`] means **disabled**, not "use a default"
+    /// — mirroring `quota_bytes == 0` == unlimited. Bounds when non-zero:
+    /// 30 s ..= 24 h (see [`validate`](EngineParams::validate)).
+    pub idle_timeout: Duration,
 }
 
 impl Default for EngineParams {
@@ -224,6 +230,8 @@ impl Default for EngineParams {
             garden_tick: DEFAULT_GARDEN_TICK,
             expiry_tick: DEFAULT_EXPIRY_TICK,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            // Idle disconnect is opt-in: off unless configured / pushed.
+            idle_timeout: Duration::ZERO,
         }
     }
 }
@@ -258,6 +266,14 @@ impl EngineParams {
             return Err(Error::BadRequest(format!(
                 "max_sessions {} out of bounds [1, 16384]",
                 self.max_sessions
+            )));
+        }
+        // 0 = disabled; any non-zero value must be a sane 30 s ..= 24 h window
+        // (short enough to matter, long enough not to churn live clients).
+        let idle = secs(self.idle_timeout);
+        if idle != 0 && !(30..=86400).contains(&idle) {
+            return Err(Error::BadRequest(format!(
+                "idle_timeout {idle}s out of bounds (0=disabled, else [30, 86400])"
             )));
         }
         Ok(())
@@ -310,6 +326,7 @@ pub struct MetricsRegistry {
     revokes: Counter,
     expires: Counter,
     quota_kills: Counter,
+    idle_kills: Counter,
     shaper_failures: Counter,
     redirect_rejections: Counter,
     started: Option<std::time::Instant>,
@@ -345,6 +362,11 @@ impl MetricsRegistry {
         self.quota_kills.inc();
     }
 
+    /// A session was torn down by the idle-timeout sweep.
+    pub fn inc_idle_kills(&self) {
+        self.idle_kills.inc();
+    }
+
     /// A best-effort shaper apply/clear failed (QoS only).
     pub fn inc_shaper_failures(&self) {
         self.shaper_failures.inc();
@@ -363,6 +385,7 @@ impl MetricsRegistry {
             revokes: self.revokes.get(),
             expires: self.expires.get(),
             quota_kills: self.quota_kills.get(),
+            idle_kills: self.idle_kills.get(),
             shaper_failures: self.shaper_failures.get(),
             redirect_rejections: self.redirect_rejections.get(),
             // `Default` (used by tests) has no start instant → 0 uptime.
@@ -379,6 +402,7 @@ pub struct MetricsSnapshot {
     pub revokes: u64,
     pub expires: u64,
     pub quota_kills: u64,
+    pub idle_kills: u64,
     pub shaper_failures: u64,
     pub redirect_rejections: u64,
     pub uptime_secs: u64,
@@ -502,6 +526,8 @@ pub enum RevokeReason {
     Quota,
     /// Client MAC changed / re-association.
     MacChange,
+    /// No metered traffic within `idle_timeout` (daemon expiry sweep).
+    Idle,
 }
 
 /// Session lifecycle event emitted engine -> control plane (TDD §7.5).
@@ -514,12 +540,15 @@ pub enum EventKind {
     Expired,
     Revoked,
     QuotaExceeded,
+    /// Idle-timeout teardown (RADIUS Acct-Terminate-Cause = Idle-Timeout).
+    IdleTimeout,
 }
 
 impl From<RevokeReason> for EventKind {
     fn from(r: RevokeReason) -> Self {
         match r {
             RevokeReason::Quota => EventKind::QuotaExceeded,
+            RevokeReason::Idle => EventKind::IdleTimeout,
             RevokeReason::Admin | RevokeReason::MacChange => EventKind::Revoked,
         }
     }

@@ -112,6 +112,11 @@ pub struct Session {
     pub tier: Tier,
     pub granted_at: Instant,
     pub expires_at: Instant,
+    /// Last instant this session was observed sending/receiving traffic (a
+    /// metering tick with a non-zero byte delta). Seeded to `granted_at` so the
+    /// idle clock runs from grant even before the first snapshot. Drives the
+    /// idle-timeout teardown in [`tick_expiry`](SessionManager::tick_expiry).
+    pub last_active: Instant,
     pub quota_bytes: u64,
     pub rate_bps: u64,
     pub bytes_in: u64,
@@ -422,6 +427,7 @@ impl SessionManager {
             tier: params.tier,
             granted_at: now,
             expires_at: now + params.ttl,
+            last_active: now,
             quota_bytes: params.quota_bytes,
             rate_bps: params.rate_bps,
             bytes_in: 0,
@@ -491,41 +497,65 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Daemon-side expiry path (TDD §7.4 dual-path). Removes every session whose
-    /// `expires_at <= now`, calls `del_auth` (idempotent belt-and-suspenders in
-    /// case the kernel timeout has not fired yet), and emits `EXPIRED` with final
-    /// bytes. Returns the number of sessions expired.
+    /// Daemon-side expiry path (TDD §7.4 dual-path) plus idle-timeout enforcement.
+    /// Removes every session that has either passed its TTL (`expires_at <= now`)
+    /// or, when `idle_timeout` is enabled, gone silent for at least that long
+    /// (`now - last_active >= idle_timeout`). For each it calls `del_auth`
+    /// (idempotent belt-and-suspenders in case the kernel timeout has not fired
+    /// yet), clears any shaper cap, and emits the matching terminal event with
+    /// final bytes: `EXPIRED` for TTL, `IDLE_TIMEOUT` for idle. TTL wins when a
+    /// session is both. Returns the number of sessions torn down.
     pub async fn tick_expiry(&self, now: Instant) -> usize {
-        let expired: Vec<Session> = {
+        let idle_timeout = self.params.borrow().idle_timeout;
+
+        let torn: Vec<(Session, Teardown)> = {
             let mut map = self.sessions.lock().expect("sessions mutex poisoned");
-            let macs: Vec<MacAddr> = map
+            let due: Vec<(MacAddr, Teardown)> = map
                 .iter()
-                .filter(|(_, s)| now >= s.expires_at)
-                .map(|(m, _)| *m)
+                .filter_map(|(m, s)| {
+                    if now >= s.expires_at {
+                        Some((*m, Teardown::Ttl))
+                    } else if !idle_timeout.is_zero()
+                        && now.saturating_duration_since(s.last_active) >= idle_timeout
+                    {
+                        Some((*m, Teardown::Idle))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
-            macs.into_iter()
-                .filter_map(|m| map.remove(&m))
+            due.into_iter()
+                .filter_map(|(m, t)| map.remove(&m).map(|s| (s, t)))
                 .collect()
         };
 
-        for session in &expired {
+        for (session, teardown) in &torn {
             if let Err(e) = self.writer.del_auth(session.mac).await {
                 tracing::warn!(mac = %session.mac, error = %e, "del_auth failed during expiry tick");
             }
             self.shape_clear(session.mac).await;
-            self.metrics.inc_expires();
+            let kind = match teardown {
+                Teardown::Ttl => {
+                    self.metrics.inc_expires();
+                    EventKind::Expired
+                }
+                Teardown::Idle => {
+                    self.metrics.inc_idle_kills();
+                    EventKind::IdleTimeout
+                }
+            };
             self.sink
                 .emit(Self::build_event(
                     session.session_id.clone(),
                     session.mac,
-                    EventKind::Expired,
+                    kind,
                     session.bytes_in,
                     session.bytes_out,
                 ))
                 .await;
         }
 
-        expired.len()
+        torn.len()
     }
 
     /// Time-injected counter application (TDD §7.6/§7.7). For each `(mac,
@@ -537,7 +567,7 @@ impl SessionManager {
     pub async fn apply_counters_at(
         &self,
         snapshot: Vec<(MacAddr, Counters)>,
-        _now: Instant,
+        now: Instant,
     ) -> Result<()> {
         let mut interim: Vec<SessionEvent> = Vec::new();
         let mut quota_breached: Vec<MacAddr> = Vec::new();
@@ -551,8 +581,18 @@ impl SessionManager {
                     continue;
                 };
 
+                // Cumulative session totals are monotonic (delta = absolute -
+                // baseline), so growth vs the previous tick == traffic *this*
+                // tick; that refreshes the idle clock. The baseline tick and a
+                // counter reset both yield no growth, so neither counts as
+                // activity — exactly right (establishing a baseline is not use).
+                let prev_in = session.bytes_in;
+                let prev_out = session.bytes_out;
                 session.bytes_in = delta(&mut session.baseline_in, counters.bytes_in);
                 session.bytes_out = delta(&mut session.baseline_out, counters.bytes_out);
+                if session.bytes_in > prev_in || session.bytes_out > prev_out {
+                    session.last_active = now;
+                }
 
                 interim.push(Self::build_event(
                     session.session_id.clone(),
@@ -616,6 +656,9 @@ impl SessionManager {
                 tier: Tier::default(),
                 granted_at: now,
                 expires_at: now + el.remaining,
+                // Restart-adopted sessions start the idle clock now; the next
+                // metering snapshot re-baselines bytes and refreshes this.
+                last_active: now,
                 quota_bytes: 0,
                 rate_bps: 0,
                 bytes_in: 0,
@@ -630,6 +673,15 @@ impl SessionManager {
         }
         adopted
     }
+}
+
+/// Why the expiry sweep is tearing a session down — selects the terminal event
+/// kind and metric. TTL takes precedence over idle when both apply.
+enum Teardown {
+    /// Session TTL reached (`expires_at <= now`) → `EXPIRED`.
+    Ttl,
+    /// No metered traffic within `idle_timeout` → `IDLE_TIMEOUT`.
+    Idle,
 }
 
 /// Convert an absolute monotonic counter into a per-session delta against a
@@ -1394,6 +1446,107 @@ mod tests {
             .unwrap();
         let info = m.get(mac(7)).await.unwrap().unwrap();
         assert_eq!(info.bytes_in, 250);
+    }
+
+    /// Build a manager whose engine params enable idle disconnect at `idle_secs`.
+    fn mgr_idle(idle_secs: u64) -> (SessionManager, Arc<MockWriter>, Arc<CapturingSink>) {
+        let writer = Arc::new(MockWriter::new());
+        let sink = Arc::new(CapturingSink::new());
+        let m = SessionManager::new(writer.clone(), sink.clone()).with_engine_params(EngineParams {
+            idle_timeout: Duration::from_secs(idle_secs),
+            ..EngineParams::default()
+        });
+        (m, writer, sink)
+    }
+
+    #[tokio::test]
+    async fn idle_disabled_by_default_keeps_silent_session() {
+        // Default params => idle_timeout 0 (disabled). A session silent well past
+        // any plausible idle window but still under its TTL must survive.
+        let (m, writer, sink) = mgr();
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(20), 3600, 0), now).await.unwrap();
+
+        let swept = m.tick_expiry(now + Duration::from_secs(3000)).await;
+        assert_eq!(swept, 0, "idle disabled: silent session must not be torn down");
+        assert_eq!(m.len(), 1);
+        assert!(!writer.ops().contains(&WriterOp::DelAuth(mac(20))));
+        assert!(!sink.kinds().contains(&EventKind::IdleTimeout));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_revokes_silent_session() {
+        // idle_timeout 60 s, long TTL. A session that never sends traffic is torn
+        // down once now - last_active (== grant time) reaches idle_timeout.
+        let (m, writer, sink) = mgr_idle(60);
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(21), 3600, 0), now).await.unwrap();
+
+        // Just before the window: still alive.
+        assert_eq!(m.tick_expiry(now + Duration::from_secs(59)).await, 0);
+        assert_eq!(m.len(), 1);
+
+        // At/after the window: idle teardown.
+        let swept = m.tick_expiry(now + Duration::from_secs(60)).await;
+        assert_eq!(swept, 1);
+        assert_eq!(m.len(), 0);
+        assert!(writer.ops().contains(&WriterOp::DelAuth(mac(21))));
+
+        let ev = sink
+            .events()
+            .into_iter()
+            .find(|e| e.kind == EventKind::IdleTimeout)
+            .expect("IDLE_TIMEOUT event emitted");
+        assert_eq!(ev.mac, mac(21));
+        // Idle teardown must not be double-counted as a TTL expiry.
+        let snap = m.metrics().snapshot();
+        assert_eq!(snap.idle_kills, 1);
+        assert_eq!(snap.expires, 0);
+    }
+
+    #[tokio::test]
+    async fn traffic_refreshes_idle_clock() {
+        // Metered traffic bumps last_active, deferring the idle deadline; a
+        // baseline tick (delta 0) does NOT count as activity.
+        let (m, _writer, _sink) = mgr_idle(60);
+        let now = Instant::now();
+        let t = |s: u64| now + Duration::from_secs(s);
+        m.grant_at(grant_params(mac(22), 3600, 0), now).await.unwrap();
+
+        // Baseline at t0: delta 0, so last_active stays at grant time.
+        m.apply_counters_at(vec![(mac(22), Counters { bytes_in: 100, bytes_out: 100 })], now)
+            .await
+            .unwrap();
+        // Real traffic at t40: delta > 0 => last_active advances to t40.
+        m.apply_counters_at(vec![(mac(22), Counters { bytes_in: 200, bytes_out: 200 })], t(40))
+            .await
+            .unwrap();
+
+        // t90: 90 - 40 = 50 < 60 => still alive (baseline tick did not reset it).
+        assert_eq!(m.tick_expiry(t(90)).await, 0);
+        assert_eq!(m.len(), 1);
+
+        // t110: 110 - 40 = 70 >= 60 => idle teardown.
+        assert_eq!(m.tick_expiry(t(110)).await, 1);
+        assert_eq!(m.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ttl_takes_precedence_over_idle() {
+        // When a session is both past its TTL and idle, TTL wins: the terminal
+        // event is EXPIRED (not IDLE_TIMEOUT) and the expiry metric is bumped.
+        let (m, _writer, sink) = mgr_idle(60);
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(23), 30, 0), now).await.unwrap();
+
+        let swept = m.tick_expiry(now + Duration::from_secs(61)).await;
+        assert_eq!(swept, 1);
+        let kinds = sink.kinds();
+        assert!(kinds.contains(&EventKind::Expired));
+        assert!(!kinds.contains(&EventKind::IdleTimeout));
+        let snap = m.metrics().snapshot();
+        assert_eq!(snap.expires, 1);
+        assert_eq!(snap.idle_kills, 0);
     }
 
     #[tokio::test]

@@ -126,6 +126,9 @@ pub fn engine_params_from_pb(req: pb::SetEngineParametersRequest) -> Result<Engi
         } else {
             req.max_sessions as usize
         },
+        // Unlike the timers above, 0 here means DISABLED (not a default), so it
+        // maps to Duration::ZERO rather than through `or_default`.
+        idle_timeout: Duration::from_secs(u64::from(req.idle_timeout_secs)),
     };
     params.validate()?;
     Ok(params)
@@ -173,6 +176,11 @@ pub fn revoke_reason_to_pb(r: RevokeReason) -> pb::RevokeReason {
         RevokeReason::Admin => pb::RevokeReason::RevokeAdmin,
         RevokeReason::Quota => pb::RevokeReason::RevokeQuota,
         RevokeReason::MacChange => pb::RevokeReason::RevokeMacChange,
+        // `Idle` is engine-initiated, never an inbound RevokeRequest reason: it
+        // is surfaced to the control plane via the IDLE_TIMEOUT SessionEvent,
+        // not this request enum. Fall back to the safest wire reason if ever
+        // serialized here.
+        RevokeReason::Idle => pb::RevokeReason::RevokeAdmin,
     }
 }
 
@@ -188,6 +196,7 @@ pub fn event_kind_to_pb(k: portcullis_types::EventKind) -> pb::EventKind {
         E::Expired => pb::EventKind::Expired,
         E::Revoked => pb::EventKind::Revoked,
         E::QuotaExceeded => pb::EventKind::QuotaExceeded,
+        E::IdleTimeout => pb::EventKind::IdleTimeout,
     }
 }
 
@@ -199,6 +208,7 @@ pub fn event_kind_from_pb(k: pb::EventKind) -> portcullis_types::EventKind {
         pb::EventKind::Expired => E::Expired,
         pb::EventKind::Revoked => E::Revoked,
         pb::EventKind::QuotaExceeded => E::QuotaExceeded,
+        pb::EventKind::IdleTimeout => E::IdleTimeout,
     }
 }
 
@@ -377,6 +387,7 @@ mod tests {
             garden_tick_secs: garden,
             expiry_tick_secs: expiry,
             max_sessions: max,
+            idle_timeout_secs: 0,
         }
     }
 
@@ -393,6 +404,34 @@ mod tests {
         assert_eq!(p.garden_tick, Duration::from_secs(120));
         assert_eq!(p.expiry_tick, Duration::from_secs(5));
         assert_eq!(p.max_sessions, 1000);
+    }
+
+    #[test]
+    fn engine_params_idle_timeout_zero_is_disabled_not_default() {
+        // Unlike the timer fields, idle 0 must stay 0 (disabled), not resolve
+        // to a built-in default.
+        let p = engine_params_from_pb(pb_params(0, 0, 0, 0)).unwrap();
+        assert_eq!(p.idle_timeout, Duration::ZERO);
+
+        let mut req = pb_params(0, 0, 0, 0);
+        req.idle_timeout_secs = 600;
+        assert_eq!(
+            engine_params_from_pb(req).unwrap().idle_timeout,
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn engine_params_idle_timeout_bounds() {
+        let with_idle = |secs: u32| {
+            let mut req = pb_params(0, 0, 0, 0);
+            req.idle_timeout_secs = secs;
+            engine_params_from_pb(req)
+        };
+        assert!(with_idle(30).is_ok()); // lower edge
+        assert!(with_idle(86400).is_ok()); // upper edge
+        assert!(with_idle(29).is_err()); // below range (and non-zero)
+        assert!(with_idle(86401).is_err()); // above range
     }
 
     #[test]

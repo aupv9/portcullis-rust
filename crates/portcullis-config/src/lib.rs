@@ -58,6 +58,13 @@ pub struct Config {
     /// Default per-session rate limit in kbps (`0` == unlimited).
     pub default_rate_kbps: u64,
 
+    /// Disconnect a session after this many seconds with no metered traffic
+    /// (the RADIUS Idle-Timeout equivalent). `0` == disabled (the default);
+    /// when set, bounds are [30, 86400]. Seeds the runtime engine parameters at
+    /// boot and is overridable at runtime via `SetEngineParameters`.
+    #[serde(default)]
+    pub idle_timeout: u64,
+
     /// Walled-garden FQDNs always reachable pre-auth (portal, CDN, OTP, pay).
     #[serde(default)]
     pub garden_fqdn: Vec<String>,
@@ -146,6 +153,7 @@ impl Default for Config {
             default_ttl: 1800,
             default_quota_mb: 0,
             default_rate_kbps: 2048,
+            idle_timeout: 0,
             garden_fqdn: Vec::new(),
             enforcement_default: true,
             redirect_rl_capacity: 5,
@@ -297,6 +305,12 @@ impl Config {
         if self.default_ttl < 1 {
             return Err(Error::Config("default_ttl must be >= 1 second".to_string()));
         }
+        if self.idle_timeout != 0 && !(30..=86400).contains(&self.idle_timeout) {
+            return Err(Error::Config(format!(
+                "idle_timeout {}s out of bounds (0=disabled, else [30, 86400])",
+                self.idle_timeout
+            )));
+        }
         if self.redirect_rl_capacity == 0 {
             return Err(Error::Config(
                 "redirect_rl_capacity must be >= 1".to_string(),
@@ -369,6 +383,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "default_ttl" => cfg.default_ttl = parse_u64(val)?,
         "default_quota_mb" => cfg.default_quota_mb = parse_u64(val)?,
         "default_rate_kbps" => cfg.default_rate_kbps = parse_u64(val)?,
+        "idle_timeout" => cfg.idle_timeout = parse_u64(val)?,
         "enforcement_default" => cfg.enforcement_default = parse_bool(val)?,
         "redirect_rl_capacity" => cfg.redirect_rl_capacity = parse_u32(val)?,
         "redirect_rl_refill_per_sec" => cfg.redirect_rl_refill_per_sec = parse_u32(val)?,
@@ -702,6 +717,7 @@ default_rate_kbps = 2048
             default_ttl: 1800,
             default_quota_mb: 0,
             default_rate_kbps: 2048,
+            idle_timeout: 600,
             garden_fqdn: vec![
                 "portal.wifihub.vn".to_string(),
                 "cdn.wifihub.vn".to_string(),
@@ -775,6 +791,30 @@ default_rate_kbps = 2048
     fn validate_rejects_empty_control_endpoint() {
         let mut cfg = Config::from_uci_str(UCI_EXAMPLE).unwrap();
         cfg.control_endpoint = String::new();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn idle_timeout_parses_and_defaults_to_disabled() {
+        // Absent from the §9 example => defaults to 0 (disabled).
+        assert_eq!(Config::from_uci_str(UCI_EXAMPLE).unwrap().idle_timeout, 0);
+
+        let uci = format!("{UCI_EXAMPLE}    option idle_timeout '600'\n");
+        assert_eq!(Config::from_uci_str(&uci).unwrap().idle_timeout, 600);
+    }
+
+    #[test]
+    fn validate_idle_timeout_bounds() {
+        let mut cfg = Config::from_uci_str(UCI_EXAMPLE).unwrap();
+        cfg.idle_timeout = 0; // disabled is always valid
+        assert!(cfg.validate().is_ok());
+        cfg.idle_timeout = 30; // lower edge
+        assert!(cfg.validate().is_ok());
+        cfg.idle_timeout = 86400; // upper edge
+        assert!(cfg.validate().is_ok());
+        cfg.idle_timeout = 29; // non-zero but below range
+        assert!(cfg.validate().is_err());
+        cfg.idle_timeout = 86401; // above range
         assert!(cfg.validate().is_err());
     }
 

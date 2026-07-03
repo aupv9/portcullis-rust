@@ -2,7 +2,7 @@
 # Per-store values (store_id, control_endpoint, keys) are filled by the fleet
 # provisioning pipeline / first-boot bootstrap (uci-defaults/99-portcullis).
 #
-# Hot-reloadable: garden_fqdn, tier defaults, accounting_interval.
+# Hot-reloadable: garden_fqdn, tier defaults, accounting_interval, idle_timeout.
 # Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port,
 #                   redirect_rl_*, event_buffer_size, firewall_backend.
 
@@ -16,6 +16,10 @@ config portcullis 'main'
 	option default_ttl         '1800'
 	option default_quota_mb    '0'
 	option default_rate_kbps   '2048'
+	# Disconnect a session after this many seconds with no metered traffic
+	# (RADIUS Idle-Timeout equivalent). '0' = disabled (default); else 30–86400.
+	# The control plane can override it live via SetEngineParameters.
+	option idle_timeout        '0'
 	# Global enforcement gate applied at boot (fail-closed default = '1').
 	# Set '0' to boot with the gate OFF (all clients reach the internet, no
 	# captive redirect) — useful for staging/maintenance. The control plane can
