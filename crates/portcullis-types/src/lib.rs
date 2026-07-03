@@ -269,6 +269,32 @@ impl EngineParams {
 // hot paths bump with Relaxed atomics; the gRPC handler reads a snapshot.
 // ---------------------------------------------------------------------------
 
+/// A monotonic `u64` counter that works on **every** target. 32-bit MIPS (the
+/// RUTM11, `mipsel-unknown-linux-musl`) has no native `AtomicU64`, so a tiny
+/// `Mutex` is used instead of pulling in `portable-atomic`. Every increment is
+/// on a cold / low-frequency path (grants, revokes, expiries, event eviction,
+/// rate-limit rejections — all human-paced or already the slow path), so lock
+/// contention is a non-issue.
+#[derive(Debug, Default)]
+pub struct Counter(std::sync::Mutex<u64>);
+
+impl Counter {
+    /// Increment by one.
+    pub fn inc(&self) {
+        self.inc_by(1);
+    }
+
+    /// Increment by `n`.
+    pub fn inc_by(&self, n: u64) {
+        *self.0.lock().expect("counter mutex poisoned") += n;
+    }
+
+    /// Current value.
+    pub fn get(&self) -> u64 {
+        *self.0.lock().expect("counter mutex poisoned")
+    }
+}
+
 /// Process-wide runtime counters, shared (via `Arc`) between the session
 /// layer, the redirect responder, and the gRPC `GetMetrics` handler. Counters
 /// count since boot (they reset with the engine's `boot_id`); RAM-only, like
@@ -277,90 +303,70 @@ impl EngineParams {
 /// Deliberately NOT here: `events_emitted/evicted` (owned by the control
 /// crate's `EventLog`), `sessions_active` (a gauge the [`Enforcer`] reports),
 /// and `rss_bytes` (read from the kernel at scrape time via [`rss_bytes`]).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MetricsRegistry {
-    grants: std::sync::atomic::AtomicU64,
-    grant_failures: std::sync::atomic::AtomicU64,
-    revokes: std::sync::atomic::AtomicU64,
-    expires: std::sync::atomic::AtomicU64,
-    quota_kills: std::sync::atomic::AtomicU64,
-    shaper_failures: std::sync::atomic::AtomicU64,
-    redirect_rejections: std::sync::atomic::AtomicU64,
-    started: std::time::Instant,
-}
-
-impl Default for MetricsRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    grants: Counter,
+    grant_failures: Counter,
+    revokes: Counter,
+    expires: Counter,
+    quota_kills: Counter,
+    shaper_failures: Counter,
+    redirect_rejections: Counter,
+    started: Option<std::time::Instant>,
 }
 
 impl MetricsRegistry {
     pub fn new() -> Self {
-        use std::sync::atomic::AtomicU64;
-        MetricsRegistry {
-            grants: AtomicU64::new(0),
-            grant_failures: AtomicU64::new(0),
-            revokes: AtomicU64::new(0),
-            expires: AtomicU64::new(0),
-            quota_kills: AtomicU64::new(0),
-            shaper_failures: AtomicU64::new(0),
-            redirect_rejections: AtomicU64::new(0),
-            started: std::time::Instant::now(),
-        }
-    }
-
-    fn inc(counter: &std::sync::atomic::AtomicU64) {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MetricsRegistry { started: Some(std::time::Instant::now()), ..Default::default() }
     }
 
     /// A grant was applied successfully.
     pub fn inc_grants(&self) {
-        Self::inc(&self.grants);
+        self.grants.inc();
     }
 
     /// A grant failed (session cap reached, writer/kernel error).
     pub fn inc_grant_failures(&self) {
-        Self::inc(&self.grant_failures);
+        self.grant_failures.inc();
     }
 
     /// A session was revoked (admin/quota/MAC-change teardown).
     pub fn inc_revokes(&self) {
-        Self::inc(&self.revokes);
+        self.revokes.inc();
     }
 
     /// A session hit its daemon-side expiry.
     pub fn inc_expires(&self) {
-        Self::inc(&self.expires);
+        self.expires.inc();
     }
 
     /// A session was revoked for exceeding its byte quota.
     pub fn inc_quota_kills(&self) {
-        Self::inc(&self.quota_kills);
+        self.quota_kills.inc();
     }
 
     /// A best-effort shaper apply/clear failed (QoS only).
     pub fn inc_shaper_failures(&self) {
-        Self::inc(&self.shaper_failures);
+        self.shaper_failures.inc();
     }
 
     /// The redirect responder rate-limited a request.
     pub fn inc_redirect_rejections(&self) {
-        Self::inc(&self.redirect_rejections);
+        self.redirect_rejections.inc();
     }
 
     /// A point-in-time copy of every counter plus the uptime.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        use std::sync::atomic::Ordering::Relaxed;
         MetricsSnapshot {
-            grants: self.grants.load(Relaxed),
-            grant_failures: self.grant_failures.load(Relaxed),
-            revokes: self.revokes.load(Relaxed),
-            expires: self.expires.load(Relaxed),
-            quota_kills: self.quota_kills.load(Relaxed),
-            shaper_failures: self.shaper_failures.load(Relaxed),
-            redirect_rejections: self.redirect_rejections.load(Relaxed),
-            uptime_secs: self.started.elapsed().as_secs(),
+            grants: self.grants.get(),
+            grant_failures: self.grant_failures.get(),
+            revokes: self.revokes.get(),
+            expires: self.expires.get(),
+            quota_kills: self.quota_kills.get(),
+            shaper_failures: self.shaper_failures.get(),
+            redirect_rejections: self.redirect_rejections.get(),
+            // `Default` (used by tests) has no start instant → 0 uptime.
+            uptime_secs: self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
         }
     }
 }
