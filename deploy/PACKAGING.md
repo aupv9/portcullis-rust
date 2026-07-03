@@ -1,8 +1,12 @@
-# 📦 Building & installing the portcullis `.ipk` on RutOS
+# 📦 Building & installing the portcullis `.ipk` on OpenWrt
 
-End-to-end guide to turn this Rust workspace into an OpenWrt package and install
-it on a **Teltonika RUTM11** (RutOS 7.x = OpenWrt 21.02, `ramips/mt7621`,
-`mipsel-unknown-linux-musl`).
+End-to-end guide to turn this Rust workspace into an **OpenWrt** package and
+install it on a router. portcullis targets OpenWrt generally (not a specific
+vendor); this guide uses the **Teltonika RUTM11** (RutOS 7.x = OpenWrt 21.02,
+`ramips/mt7621`, `mipsel-unknown-linux-musl`) as the worked example — for other
+devices substitute the matching arch/target (`mips_24kc`, `arm_cortex-a7`, …)
+and use your firmware's opkg/SSH. The firewall backend auto-detects at boot, so
+the same package works on stock (fw3/iptables) and fw4/nftables firmwares.
 
 > TL;DR
 > ```sh
