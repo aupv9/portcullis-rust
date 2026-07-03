@@ -112,6 +112,9 @@ pub(crate) fn wire(writer: Arc<dyn RulesetWriter>, cfg: &Config) -> Wired {
 fn initial_engine_params(cfg: &Config) -> portcullis_types::EngineParams {
     portcullis_types::EngineParams {
         accounting_interval: std::time::Duration::from_secs(cfg.accounting_interval.max(1)),
+        // 0 stays 0 (idle disconnect disabled); a set value enables it at boot,
+        // before the control plane has a chance to push SetEngineParameters.
+        idle_timeout: std::time::Duration::from_secs(cfg.idle_timeout),
         ..Default::default()
     }
 }
