@@ -124,9 +124,9 @@ fn flush_chain(name: &str) -> Value {
 }
 
 /// The ordered gating rules for the `prerouting` chain: exempt authed + garden,
-/// else redirect tcp:80 to the responder. Shared by [`build_base_ruleset`] and
-/// [`build_set_enforcement`] so the two never drift.
-fn prerouting_gate_rules() -> Vec<Value> {
+/// else redirect tcp:80 to the responder on `redirect_port`. Shared by
+/// [`build_base_ruleset`] and [`build_set_enforcement`] so the two never drift.
+fn prerouting_gate_rules(redirect_port: u16) -> Vec<Value> {
     vec![
         add(rule_obj(CHAIN_PREROUTING, match_set_accept("ether", "saddr", SET_AUTH))),
         add(rule_obj(CHAIN_PREROUTING, match_set_accept("ip", "daddr", SET_GARDEN4))),
@@ -141,7 +141,7 @@ fn prerouting_gate_rules() -> Vec<Value> {
                         "right": 80
                     }
                 },
-                { "redirect": { "port": REDIRECT_PORT } }
+                { "redirect": { "port": redirect_port } }
             ]),
         )),
     ]
@@ -159,12 +159,14 @@ fn forward_gate_rules() -> Vec<Value> {
     ]
 }
 
-/// Build the full base ruleset as the `nft -j` command array.
+/// Build the full base ruleset as the `nft -j` command array. `redirect_port`
+/// is the responder port the tcp:80 REDIRECT targets (the daemon passes its
+/// configured `responder_port`; [`REDIRECT_PORT`] is the default).
 ///
 /// The returned value is `{"nftables": [ ... ]}` — the exact shape `nft -j -f -`
 /// consumes on stdin. Order matters: table, then sets, then chains, then the
 /// rules within each chain in evaluation order.
-pub fn build_base_ruleset() -> Value {
+pub fn build_base_ruleset(redirect_port: u16) -> Value {
     let prio_dstnat = json!({ "base": "dstnat", "offset": PRIO_DSTNAT_OFFSET });
     let prio_filter = json!({ "base": "filter", "offset": PRIO_FILTER_OFFSET });
 
@@ -183,7 +185,7 @@ pub fn build_base_ruleset() -> Value {
     cmds.push(add(chain_obj(CHAIN_FORWARD, "forward", prio_filter, "filter")));
 
     // Rules, in evaluation order.
-    cmds.extend(prerouting_gate_rules());
+    cmds.extend(prerouting_gate_rules(redirect_port));
     cmds.extend(forward_gate_rules());
 
     json!({ "nftables": cmds })
@@ -203,10 +205,10 @@ pub fn build_base_ruleset() -> Value {
 /// The `auth`/`garden` sets are never touched, so session state survives a
 /// toggle. Assumes the base table/chains exist (created by [`build_base_ruleset`]
 /// at boot).
-pub fn build_set_enforcement(enabled: bool) -> Value {
+pub fn build_set_enforcement(enabled: bool, redirect_port: u16) -> Value {
     let mut cmds: Vec<Value> = vec![flush_chain(CHAIN_PREROUTING), flush_chain(CHAIN_FORWARD)];
     if enabled {
-        cmds.extend(prerouting_gate_rules());
+        cmds.extend(prerouting_gate_rules(redirect_port));
         cmds.extend(forward_gate_rules());
     }
     json!({ "nftables": cmds })
@@ -214,7 +216,7 @@ pub fn build_set_enforcement(enabled: bool) -> Value {
 
 /// Build the equivalent human-readable nft script (for DEBUG logging only;
 /// the JSON form is what is actually applied).
-pub fn build_base_script() -> String {
+pub fn build_base_script(redirect_port: u16) -> String {
     format!(
         "table {fam} {tbl} {{\n\
          \tset {g4} {{ type ipv4_addr; flags interval; }}\n\
@@ -243,7 +245,7 @@ pub fn build_base_script() -> String {
         auth = SET_AUTH,
         pre = CHAIN_PREROUTING,
         fwd = CHAIN_FORWARD,
-        port = REDIRECT_PORT,
+        port = redirect_port,
     )
 }
 
@@ -257,7 +259,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_single_inet_wifihub_table() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         let tables: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("table")))
@@ -269,7 +271,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_all_three_sets_with_correct_types_and_flags() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         let sets: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("set")))
@@ -290,7 +292,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_both_chains_with_right_hooks_and_priorities() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         let chains: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("chain")))
@@ -312,7 +314,7 @@ mod tests {
 
     #[test]
     fn prerouting_redirects_tcp_80_to_8080() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         let redirect = cmds(&rs).iter().any(|c| {
             let Some(rule) = c.get("add").and_then(|a| a.get("rule")) else {
                 return false;
@@ -339,8 +341,22 @@ mod tests {
     }
 
     #[test]
+    fn redirect_port_is_parameterized() {
+        // The responder port from config must land in every form of the
+        // ruleset — base, enforcement re-add, and the debug script.
+        let s = serde_json::to_string(&build_base_ruleset(9999)).unwrap();
+        assert!(s.contains("\"port\":9999"));
+        assert!(!s.contains(&format!("\"port\":{REDIRECT_PORT}")));
+
+        let toggle = serde_json::to_string(&build_set_enforcement(true, 9999)).unwrap();
+        assert!(toggle.contains("\"port\":9999"));
+
+        assert!(build_base_script(9999).contains("redirect to :9999"));
+    }
+
+    #[test]
     fn forward_chain_ends_with_terminal_drop() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         // The last rule in the forward chain must be a bare drop.
         let forward_rules: Vec<&Value> = cmds(&rs)
             .iter()
@@ -356,7 +372,7 @@ mod tests {
     #[test]
     fn no_postrouting_or_masquerade() {
         // We must not duplicate fw3's NAT.
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         let s = serde_json::to_string(&rs).unwrap();
         assert!(!s.contains("postrouting"), "must not define postrouting");
         assert!(!s.contains("masquerade"), "must not masquerade");
@@ -365,7 +381,7 @@ mod tests {
 
     #[test]
     fn forward_accepts_established_and_auth() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(REDIRECT_PORT);
         let s = serde_json::to_string(&rs).unwrap();
         assert!(s.contains("established"));
         assert!(s.contains("@auth"));
@@ -375,7 +391,7 @@ mod tests {
 
     #[test]
     fn set_enforcement_disabled_only_flushes_no_rules() {
-        let rs = build_set_enforcement(false);
+        let rs = build_set_enforcement(false, REDIRECT_PORT);
         let c = cmds(&rs);
         // Exactly two flushes (prerouting + forward), no rules.
         let flushes: Vec<&Value> = c.iter().filter_map(|v| v.get("flush")).collect();
@@ -388,7 +404,7 @@ mod tests {
 
     #[test]
     fn set_enforcement_enabled_flushes_then_readds_gate_with_terminal_drop() {
-        let rs = build_set_enforcement(true);
+        let rs = build_set_enforcement(true, REDIRECT_PORT);
         let c = cmds(&rs);
         assert_eq!(c.iter().filter_map(|v| v.get("flush")).count(), 2);
         // Re-adds the forward chain ending in a terminal drop.
@@ -410,7 +426,7 @@ mod tests {
 
     #[test]
     fn script_form_matches_invariants() {
-        let script = build_base_script();
+        let script = build_base_script(REDIRECT_PORT);
         assert!(script.contains("table inet wifihub"));
         assert!(script.contains("priority dstnat - 50"));
         assert!(script.contains("priority filter - 50"));

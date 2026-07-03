@@ -43,8 +43,8 @@ use tokio::sync::watch;
 
 use portcullis_types::{
     AuthElement, ConfigState, Counters, Enforcer, EngineParams, Error, EventKind, EventSink,
-    GardenControl, GrantParams, HealthStatus, MacAddr, MeteringSink, Result, RevokeReason,
-    RulesetWriter, SessionEvent, SessionId, SessionInfo, Shaper, Tier, TierPolicy,
+    GardenControl, GrantParams, HealthStatus, MacAddr, MeteringSink, MetricsRegistry, Result,
+    RevokeReason, RulesetWriter, SessionEvent, SessionId, SessionInfo, Shaper, Tier, TierPolicy,
     DEFAULT_MAX_SESSIONS, DEFAULT_TTL,
 };
 
@@ -65,39 +65,34 @@ pub const MAX_SESSIONS: usize = DEFAULT_MAX_SESSIONS;
 
 /// Fleet-wide per-tier grant defaults held in RAM (TDD §7.4/§7.5).
 ///
-/// One slot per [`Tier`]; a grant with a 0-valued field inherits the matching
-/// tier's policy (see [`SessionManager::effective_params`]). Seeded to
-/// [`TierPolicy::default`] (all-zero → built-in defaults) and replaced wholesale
-/// by the control plane via `SetTierPolicies`. RAM-only: never persisted, the
-/// control plane re-pushes on reconnect (§5.4 no-NAND).
-#[derive(Clone, Copy, Debug, Default)]
+/// Tiers are data-driven: the map holds whatever tiers the control plane (or
+/// the boot-config seed) pushed — nothing is pre-allocated per name. A grant
+/// with a 0-valued field inherits the matching tier's policy (see
+/// [`SessionManager::effective_params`]); a grant whose tier is absent from
+/// the map falls back to the all-zero policy, i.e. the built-in defaults —
+/// unknown tiers degrade gracefully instead of being special-cased. Replaced
+/// wholesale by the control plane via `SetTierPolicies`. RAM-only: never
+/// persisted, the control plane re-pushes on reconnect (§5.4 no-NAND).
+#[derive(Clone, Debug, Default)]
 struct TierPolicyTable {
-    public: TierPolicy,
-    home: TierPolicy,
-    retail: TierPolicy,
+    policies: HashMap<Tier, TierPolicy>,
 }
 
 impl TierPolicyTable {
-    /// The policy for `tier` (a copy — the table is tiny, TDD §14).
-    fn get(&self, tier: Tier) -> TierPolicy {
-        match tier {
-            Tier::Public => self.public,
-            Tier::Home => self.home,
-            Tier::Retail => self.retail,
-        }
+    /// The policy for `tier` (a clone — the table is tiny, TDD §14). A map
+    /// miss returns the all-zero [`TierPolicy::default`], which resolves to
+    /// the built-in fallbacks ([`DEFAULT_TTL`] / unlimited) downstream.
+    fn get(&self, tier: &Tier) -> TierPolicy {
+        self.policies.get(tier).cloned().unwrap_or_default()
     }
 
     /// Full replacement (`SetTierPolicies` semantics): any tier absent from
-    /// `policies` is reset to its built-in default; a tier repeated in the list
-    /// takes the last occurrence (last-wins).
+    /// `policies` falls back to the built-in defaults; a tier repeated in the
+    /// list takes the last occurrence (last-wins).
     fn replace_all(&mut self, policies: &[TierPolicy]) {
-        *self = TierPolicyTable::default();
+        self.policies.clear();
         for p in policies {
-            match p.tier {
-                Tier::Public => self.public = *p,
-                Tier::Home => self.home = *p,
-                Tier::Retail => self.retail = *p,
-            }
+            self.policies.insert(p.tier.clone(), p.clone());
         }
     }
 }
@@ -142,7 +137,7 @@ impl Session {
             session_id: self.session_id.clone(),
             mac: self.mac,
             ip: self.ip,
-            tier: self.tier,
+            tier: self.tier.clone(),
             granted_at_unix: self.granted_at_unix,
             expires_in,
             quota_bytes: self.quota_bytes,
@@ -203,6 +198,10 @@ pub struct SessionManager {
     /// Best-effort QoS: apply/clear failures are logged, never fail a grant or
     /// revoke — quota/revoke stay the hard enforcement (§7.7).
     shaper: Mutex<Option<Arc<dyn Shaper>>>,
+    /// Runtime counters (`GetMetrics` gRPC). `new()` mints a private registry
+    /// so tests need no wiring; the composition root shares one across the
+    /// daemon via [`with_metrics`](SessionManager::with_metrics).
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl SessionManager {
@@ -225,7 +224,21 @@ impl SessionManager {
             params: watch::Sender::new(EngineParams::default()),
             garden_fqdns: Mutex::new(Vec::new()),
             shaper: Mutex::new(None),
+            metrics: Arc::new(MetricsRegistry::new()),
         }
+    }
+
+    /// Share a daemon-wide metrics registry (composition root, before the
+    /// manager is `Arc`-ed) so the redirect responder and the gRPC service
+    /// report into the same counters. Defaults to a private registry.
+    pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The metrics registry this manager increments (`GetMetrics` source).
+    pub fn metrics(&self) -> Arc<MetricsRegistry> {
+        self.metrics.clone()
     }
 
     /// Wire the per-client bandwidth shaper (composition root).
@@ -241,6 +254,7 @@ impl SessionManager {
     async fn shape_apply(&self, mac: MacAddr, rate_bps: u64) {
         if let Some(s) = self.shaper() {
             if let Err(e) = s.apply(mac, rate_bps).await {
+                self.metrics.inc_shaper_failures();
                 tracing::warn!(%mac, rate_bps, error = %e, "shaper apply failed (QoS only; session unaffected)");
             }
         }
@@ -249,6 +263,7 @@ impl SessionManager {
     async fn shape_clear(&self, mac: MacAddr) {
         if let Some(s) = self.shaper() {
             if let Err(e) = s.clear(mac).await {
+                self.metrics.inc_shaper_failures();
                 tracing::warn!(%mac, error = %e, "shaper clear failed (QoS only)");
             }
         }
@@ -352,7 +367,7 @@ impl SessionManager {
             .tier_policies
             .lock()
             .expect("tier policies mutex poisoned")
-            .get(p.tier);
+            .get(&p.tier);
         if p.ttl.is_zero() {
             p.ttl = if policy.ttl.is_zero() { DEFAULT_TTL } else { policy.ttl };
         }
@@ -388,12 +403,16 @@ impl SessionManager {
                     cap,
                     "session cap reached; rejecting grant (fail-closed, no eviction)"
                 );
+                self.metrics.inc_grant_failures();
                 return Err(Error::Backend(format!("session cap {cap} reached")));
             }
         }
 
         // Kernel mutation first — fail closed on error.
-        self.writer.add_auth(params.mac, params.ttl).await?;
+        if let Err(e) = self.writer.add_auth(params.mac, params.ttl).await {
+            self.metrics.inc_grant_failures();
+            return Err(e);
+        }
 
         let session_id = params.session_id.clone();
         let session = Session {
@@ -416,6 +435,8 @@ impl SessionManager {
             let mut map = self.sessions.lock().expect("sessions mutex poisoned");
             map.insert(params.mac, session);
         }
+
+        self.metrics.inc_grants();
 
         // QoS cap for the (effective) rate. rate 0 clears any leftover cap
         // from a previous session of this MAC.
@@ -455,6 +476,7 @@ impl SessionManager {
             tracing::warn!(mac = %mac, error = %e, "del_auth failed during revoke; in-RAM session already removed");
         }
         self.shape_clear(mac).await;
+        self.metrics.inc_revokes();
 
         self.sink
             .emit(Self::build_event(
@@ -491,6 +513,7 @@ impl SessionManager {
                 tracing::warn!(mac = %session.mac, error = %e, "del_auth failed during expiry tick");
             }
             self.shape_clear(session.mac).await;
+            self.metrics.inc_expires();
             self.sink
                 .emit(Self::build_event(
                     session.session_id.clone(),
@@ -552,8 +575,11 @@ impl SessionManager {
         for mac in quota_breached {
             // Revoke emits the QUOTA_EXCEEDED final-byte event. If the session was
             // already gone (raced expiry), `SessionNotFound` is benign here.
-            if let Err(e) = self.revoke_internal(mac, RevokeReason::Quota).await {
-                tracing::debug!(mac = %mac, error = %e, "quota revoke skipped (session already gone)");
+            match self.revoke_internal(mac, RevokeReason::Quota).await {
+                Ok(()) => self.metrics.inc_quota_kills(),
+                Err(e) => {
+                    tracing::debug!(mac = %mac, error = %e, "quota revoke skipped (session already gone)");
+                }
             }
         }
 
@@ -651,6 +677,10 @@ impl Enforcer for SessionManager {
         *self.health.lock().expect("health mutex poisoned")
     }
 
+    async fn active_sessions(&self) -> usize {
+        self.len()
+    }
+
     async fn set_enforcement(&self, enabled: bool) -> Result<()> {
         self.set_enforcement_at(enabled).await
     }
@@ -697,7 +727,7 @@ impl Enforcer for SessionManager {
     }
 
     async fn config_state(&self) -> ConfigState {
-        let tiers = *self.tier_policies.lock().expect("tier policies mutex poisoned");
+        let tiers = self.tier_policies.lock().expect("tier policies mutex poisoned").clone();
         let params = *self.params.borrow();
         let garden = self.garden_fqdns.lock().expect("garden fqdns mutex poisoned").clone();
         ConfigState {
@@ -722,17 +752,18 @@ fn hash_hex(s: &str) -> String {
     format!("{:016x}", portcullis_types::fnv1a64(s))
 }
 
-/// `"home:{ttl_s}:{quota}:{rate}|public:...|retail:..."` (alphabetical).
+/// v2 (data-driven tiers, capability `tier_any`): only the tiers actually
+/// PRESENT in the policy map, sorted by name ascending, each rendered as
+/// `"name:{ttl_s}:{quota_bytes}:{rate_bps}"`, joined with `"|"`. An empty map
+/// canonicalizes to `""`. (v1 zero-filled the fixed public/home/retail names.)
 fn canonical_tiers(t: &TierPolicyTable) -> String {
-    let one = |name: &str, p: TierPolicy| {
-        format!("{name}:{}:{}:{}", p.ttl.as_secs(), p.quota_bytes, p.rate_bps)
-    };
-    format!(
-        "{}|{}|{}",
-        one("home", t.home),
-        one("public", t.public),
-        one("retail", t.retail)
-    )
+    let mut entries: Vec<&TierPolicy> = t.policies.values().collect();
+    entries.sort_by(|a, b| a.tier.as_str().cmp(b.tier.as_str()));
+    entries
+        .iter()
+        .map(|p| format!("{}:{}:{}:{}", p.tier, p.ttl.as_secs(), p.quota_bytes, p.rate_bps))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// `"{accounting_s}:{garden_s}:{expiry_s}:{max_sessions}"`.
@@ -870,7 +901,7 @@ mod tests {
             ttl: Duration::from_secs(ttl_secs),
             quota_bytes: quota,
             rate_bps: 0,
-            tier: Tier::Public,
+            tier: Tier::public(),
             session_id: SessionId::from(format!("sess-{}", m)),
         }
     }
@@ -937,7 +968,7 @@ mod tests {
     #[tokio::test]
     async fn grant_zero_fields_filled_from_tier_policy() {
         let (m, writer, _sink) = mgr();
-        m.set_tier_policies(vec![policy(Tier::Public, 300, 10_000_000, 2_000_000)])
+        m.set_tier_policies(vec![policy(Tier::public(), 300, 10_000_000, 2_000_000)])
             .await
             .unwrap();
 
@@ -955,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn grant_explicit_fields_win_over_policy() {
         let (m, writer, _sink) = mgr();
-        m.set_tier_policies(vec![policy(Tier::Public, 300, 10_000_000, 2_000_000)])
+        m.set_tier_policies(vec![policy(Tier::public(), 300, 10_000_000, 2_000_000)])
             .await
             .unwrap();
 
@@ -1047,7 +1078,7 @@ mod tests {
         let shaper = MockShaper::new(false);
         m.set_shaper(shaper.clone());
         // Tier policy supplies the rate for a 0-rate grant.
-        m.set_tier_policies(vec![policy(Tier::Public, 300, 0, 2_000_000)]).await.unwrap();
+        m.set_tier_policies(vec![policy(Tier::public(), 300, 0, 2_000_000)]).await.unwrap();
 
         m.grant_at(grant_params(mac(1), 0, 0), Instant::now()).await.unwrap();
         assert_eq!(shaper.ops(), vec![("apply".into(), mac(1), 2_000_000)]);
@@ -1079,10 +1110,11 @@ mod tests {
     async fn config_state_matches_shared_vectors_and_tracks_changes() {
         let (m, _writer, _sink) = mgr();
 
-        // Defaults: all-zero tier policies, default params, empty garden.
+        // Defaults: empty tier-policy map, default params, empty garden.
         // These hex values are the shared cross-language vectors (Go hash_test).
         let cs = m.config_state().await;
-        assert_eq!(canonical_tiers(&TierPolicyTable::default()), "home:0:0:0|public:0:0:0|retail:0:0:0");
+        assert_eq!(canonical_tiers(&TierPolicyTable::default()), "");
+        assert_eq!(cs.tier_policies_hash, "cbf29ce484222325"); // fnv1a64("")
         assert_eq!(canonical_params(EngineParams::default()), "15:30:1:4096");
         assert_eq!(cs.engine_params_hash, "3dadbdd27d764902"); // fnv1a64("15:30:1:4096")
         assert_eq!(cs.garden_hash, "cbf29ce484222325"); // fnv1a64("")
@@ -1094,10 +1126,11 @@ mod tests {
         let cs2 = m2.config_state().await;
         assert_eq!(cs2.garden_hash, "c34e4b6bbbbe11ee"); // fnv1a64("cdn.wifihub.vn|portal.wifihub.vn")
 
-        // Hashes track pushed changes.
-        m.set_tier_policies(vec![policy(Tier::Home, 86400, 0, 0)]).await.unwrap();
+        // Hashes track pushed changes; a single-tier map hashes only that tier.
+        m.set_tier_policies(vec![policy("home".parse().unwrap(), 86400, 0, 0)]).await.unwrap();
         let after_tiers = m.config_state().await;
         assert_ne!(after_tiers.tier_policies_hash, cs.tier_policies_hash);
+        assert_eq!(after_tiers.tier_policies_hash, "5d9f55cdb5d408ee"); // fnv1a64("home:86400:0:0")
 
         m.set_engine_parameters(EngineParams {
             accounting_interval: Duration::from_secs(60),
@@ -1108,24 +1141,74 @@ mod tests {
         assert_ne!(m.config_state().await.engine_params_hash, cs.engine_params_hash);
     }
 
+    /// v2 tiers canonical form (shared cross-language vectors — the Go control
+    /// plane's CanonicalTiers/hash_test must mirror these exactly): tiers
+    /// PRESENT in the policy map, sorted by name ascending,
+    /// `"name:{ttl_s}:{quota_bytes}:{rate_bps}"` joined with `"|"`; an empty
+    /// map canonicalizes to `""`.
+    #[test]
+    fn canonical_tiers_v2_sorts_present_tiers_and_matches_vectors() {
+        let mut t = TierPolicyTable::default();
+        assert_eq!(canonical_tiers(&t), "");
+        assert_eq!(hash_hex(&canonical_tiers(&t)), "cbf29ce484222325"); // fnv1a64("")
+
+        // Insertion order is irrelevant; names sort ascending. A novel tier
+        // ("gold") canonicalizes like any other.
+        t.replace_all(&[
+            policy(Tier::public(), 300, 0, 0),
+            policy("gold".parse().unwrap(), 600, 1_000_000, 2_000_000),
+        ]);
+        assert_eq!(canonical_tiers(&t), "gold:600:1000000:2000000|public:300:0:0");
+        // fnv1a64("gold:600:1000000:2000000|public:300:0:0")
+        assert_eq!(hash_hex(&canonical_tiers(&t)), "abce3e5bb1e3e89c");
+
+        // Last-wins on duplicates, and replace_all drops absent tiers.
+        t.replace_all(&[
+            policy("home".parse().unwrap(), 60, 0, 0),
+            policy("home".parse().unwrap(), 86400, 0, 0),
+        ]);
+        assert_eq!(canonical_tiers(&t), "home:86400:0:0");
+        assert_eq!(hash_hex(&canonical_tiers(&t)), "5d9f55cdb5d408ee"); // fnv1a64("home:86400:0:0")
+    }
+
+    #[tokio::test]
+    async fn grant_unknown_tier_falls_back_to_builtins() {
+        let (m, writer, _sink) = mgr();
+        // Policies exist for other tiers, but not for "gold".
+        m.set_tier_policies(vec![policy(Tier::public(), 300, 10_000_000, 2_000_000)])
+            .await
+            .unwrap();
+
+        let mut p = grant_params(mac(1), 0, 0);
+        p.tier = "gold".parse().unwrap();
+        m.grant_at(p, Instant::now()).await.unwrap();
+
+        // Map miss → all-zero policy → built-in TTL, unlimited quota/rate.
+        assert_eq!(writer.ops(), vec![WriterOp::AddAuth(mac(1), DEFAULT_TTL)]);
+        let s = session_of(&m, mac(1));
+        assert_eq!(s.quota_bytes, 0);
+        assert_eq!(s.rate_bps, 0);
+        assert_eq!(s.tier.as_str(), "gold");
+    }
+
     #[tokio::test]
     async fn set_tier_policies_is_full_replacement() {
         let (m, writer, _sink) = mgr();
         m.set_tier_policies(vec![
-            policy(Tier::Public, 300, 1, 1),
-            policy(Tier::Home, 600, 2, 2),
+            policy(Tier::public(), 300, 1, 1),
+            policy("home".parse().unwrap(), 600, 2, 2),
         ])
         .await
         .unwrap();
         // Second push omits Public → it resets to built-ins for later grants.
-        m.set_tier_policies(vec![policy(Tier::Home, 900, 3, 3)]).await.unwrap();
+        m.set_tier_policies(vec![policy("home".parse().unwrap(), 900, 3, 3)]).await.unwrap();
 
         m.grant_at(grant_params(mac(1), 0, 0), Instant::now()).await.unwrap();
         assert_eq!(writer.ops(), vec![WriterOp::AddAuth(mac(1), DEFAULT_TTL)]);
         assert_eq!(session_of(&m, mac(1)).quota_bytes, 0);
 
         let mut p = grant_params(mac(2), 0, 0);
-        p.tier = Tier::Home;
+        p.tier = "home".parse().unwrap();
         p.session_id = SessionId::from("sess-home");
         m.grant_at(p, Instant::now()).await.unwrap();
         assert_eq!(session_of(&m, mac(2)).quota_bytes, 3);
@@ -1361,7 +1444,7 @@ mod tests {
                 ttl: Duration::from_secs(60),
                 quota_bytes: 0,
                 rate_bps: 0,
-                tier: Tier::Public,
+                tier: Tier::public(),
                 session_id: SessionId::from(format!("sess-{i}")),
             };
             m.grant_at(params, now).await.unwrap();
@@ -1433,6 +1516,91 @@ mod tests {
         assert_eq!(m.len(), 1, "session survives a gate toggle");
         // No DelAuth was issued by the toggle.
         assert!(!writer.ops().iter().any(|o| matches!(o, WriterOp::DelAuth(_))));
+    }
+
+    #[tokio::test]
+    async fn metrics_count_grants_revokes_and_expiries() {
+        let (m, _writer, _sink) = mgr();
+        let now = Instant::now();
+
+        m.grant_at(grant_params(mac(1), 60, 0), now).await.unwrap();
+        m.grant_at(grant_params(mac(2), 10, 0), now).await.unwrap();
+        m.revoke(mac(1), RevokeReason::Admin).await.unwrap();
+        m.tick_expiry(now + Duration::from_secs(10)).await;
+
+        let s = m.metrics().snapshot();
+        assert_eq!(s.grants, 2);
+        assert_eq!(s.revokes, 1);
+        assert_eq!(s.expires, 1);
+        assert_eq!(s.grant_failures, 0);
+        assert_eq!(s.quota_kills, 0);
+        // A failed revoke (unknown MAC) is not counted.
+        assert!(m.revoke(mac(9), RevokeReason::Admin).await.is_err());
+        assert_eq!(m.metrics().snapshot().revokes, 1);
+        // active_sessions mirrors len() (the sessions_active gauge).
+        assert_eq!(m.active_sessions().await, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_grant_failures_on_writer_error_and_cap() {
+        // Writer error path.
+        let writer = Arc::new(MockWriter::failing());
+        let sink = Arc::new(CapturingSink::new());
+        let m = SessionManager::new(writer, sink);
+        assert!(m.grant_at(grant_params(mac(1), 60, 0), Instant::now()).await.is_err());
+        assert_eq!(m.metrics().snapshot().grant_failures, 1);
+        assert_eq!(m.metrics().snapshot().grants, 0);
+
+        // Session-cap path.
+        let (m, _writer, _sink) = mgr();
+        m.set_engine_parameters(params_with_cap(1)).await.unwrap();
+        m.grant_at(grant_params(mac(1), 60, 0), Instant::now()).await.unwrap();
+        assert!(m.grant_at(grant_params(mac(2), 60, 0), Instant::now()).await.is_err());
+        let s = m.metrics().snapshot();
+        assert_eq!(s.grants, 1);
+        assert_eq!(s.grant_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_quota_kills_alongside_revokes() {
+        let (m, _writer, _sink) = mgr();
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(4), 60, 1000), now).await.unwrap();
+        m.apply_counters_at(vec![(mac(4), Counters { bytes_in: 100, bytes_out: 100 })], now)
+            .await
+            .unwrap();
+        m.apply_counters_at(
+            vec![(mac(4), Counters { bytes_in: 1000, bytes_out: 1000 })],
+            now,
+        )
+        .await
+        .unwrap();
+
+        let s = m.metrics().snapshot();
+        assert_eq!(s.quota_kills, 1);
+        // The quota teardown goes through revoke_internal, so it counts there too.
+        assert_eq!(s.revokes, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_shaper_failures_and_shared_registry() {
+        let writer = Arc::new(MockWriter::new());
+        let sink = Arc::new(CapturingSink::new());
+        let shared = Arc::new(portcullis_types::MetricsRegistry::new());
+        let m = SessionManager::new(writer, sink).with_metrics(shared.clone());
+        m.set_shaper(MockShaper::new(true));
+
+        let mut p = grant_params(mac(1), 60, 0);
+        p.rate_bps = 1_000_000;
+        m.grant_at(p, Instant::now()).await.unwrap();
+        m.revoke(mac(1), RevokeReason::Admin).await.unwrap();
+
+        // apply (on grant) + clear (on revoke) both failed — best-effort QoS,
+        // counted, session lifecycle unaffected. Lands in the SHARED registry.
+        let s = shared.snapshot();
+        assert_eq!(s.shaper_failures, 2);
+        assert_eq!(s.grants, 1);
+        assert_eq!(s.revokes, 1);
     }
 
     #[tokio::test]

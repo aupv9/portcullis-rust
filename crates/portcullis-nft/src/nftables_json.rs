@@ -20,14 +20,17 @@ use tokio::process::Command;
 
 use crate::backend::FirewallBackend;
 use crate::ruleset::{
-    build_base_ruleset, build_set_enforcement, SET_AUTH, SET_GARDEN4, SET_GARDEN6, TABLE_FAMILY,
-    TABLE_NAME,
+    build_base_ruleset, build_set_enforcement, REDIRECT_PORT, SET_AUTH, SET_GARDEN4, SET_GARDEN6,
+    TABLE_FAMILY, TABLE_NAME,
 };
 
 /// Backend that builds `nft -j` JSON and invokes the `nft` binary.
 pub struct NftJsonBackend {
     /// Path to the `nft` binary (default `"nft"`, resolved via `PATH`).
     nft_bin: String,
+    /// Port the tcp:80 REDIRECT sends to — MUST equal the responder's listen
+    /// port so the hijacked request reaches the portcullis responder.
+    redirect_port: u16,
 }
 
 impl Default for NftJsonBackend {
@@ -40,6 +43,7 @@ impl NftJsonBackend {
     pub fn new() -> Self {
         Self {
             nft_bin: "nft".to_string(),
+            redirect_port: REDIRECT_PORT,
         }
     }
 
@@ -47,7 +51,16 @@ impl NftJsonBackend {
     pub fn with_binary(nft_bin: impl Into<String>) -> Self {
         Self {
             nft_bin: nft_bin.into(),
+            redirect_port: REDIRECT_PORT,
         }
+    }
+
+    /// Set the tcp:80 REDIRECT target port. Pass the daemon's configured
+    /// `responder_port` so the REDIRECT and the responder always agree (same
+    /// seam as `IpsetIptablesBackend::with_redirect_port`).
+    pub fn with_redirect_port(mut self, port: u16) -> Self {
+        self.redirect_port = port;
+        self
     }
 
     /// Feed a `nft -j` JSON command document to `nft -j -f -` on stdin and
@@ -178,7 +191,7 @@ impl NftJsonBackend {
 #[async_trait]
 impl FirewallBackend for NftJsonBackend {
     async fn ensure_base(&self) -> Result<()> {
-        self.apply_json(&build_base_ruleset()).await
+        self.apply_json(&build_base_ruleset(self.redirect_port)).await
     }
 
     async fn add_auth(&self, mac: MacAddr, ttl: Duration) -> Result<()> {
@@ -195,7 +208,7 @@ impl FirewallBackend for NftJsonBackend {
     }
 
     async fn set_enforcement(&self, enabled: bool) -> Result<()> {
-        self.apply_json(&build_set_enforcement(enabled)).await
+        self.apply_json(&build_set_enforcement(enabled, self.redirect_port)).await
     }
 
     async fn replace_garden(

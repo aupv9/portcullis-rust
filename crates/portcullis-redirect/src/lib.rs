@@ -151,6 +151,9 @@ struct AppState<R: NeighResolver + 'static> {
     cfg: RedirectConfig,
     resolver: R,
     limiter: RateLimiter,
+    /// Daemon-wide metrics registry (`GetMetrics`): rate-limited requests also
+    /// bump `redirect_rejections` there. `None` = standalone (tests, `serve`).
+    metrics: Option<Arc<portcullis_types::MetricsRegistry>>,
 }
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
@@ -193,6 +196,9 @@ async fn handle<R: NeighResolver + 'static>(
 
     // Rate-limit per source IP before doing any work (esp. the neigh fork).
     if !state.limiter.check(src_ip) {
+        if let Some(m) = &state.metrics {
+            m.inc_redirect_rejections();
+        }
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
@@ -211,23 +217,26 @@ fn build_router<R: NeighResolver + 'static>(state: Arc<AppState<R>>) -> Router {
 }
 
 /// Bind `0.0.0.0:<listen_port>` and serve until the process exits, with the
-/// built-in [`RateLimitConfig::default`] limits.
+/// built-in [`RateLimitConfig::default`] limits and no shared metrics.
 pub async fn serve<R: NeighResolver + 'static>(
     cfg: RedirectConfig,
     resolver: R,
 ) -> portcullis_types::Result<()> {
-    serve_with_limits(cfg, resolver, RateLimitConfig::default()).await
+    serve_with_limits(cfg, resolver, RateLimitConfig::default(), None).await
 }
 
 /// Bind `0.0.0.0:<listen_port>` and serve until the process exits.
 ///
 /// `rl` is the per-source-IP token-bucket configuration (config-file backed:
-/// `redirect_rl_*`, RequiresRestart §9). The `ConnectInfo` extractor requires
+/// `redirect_rl_*`, RequiresRestart §9). `metrics`, when `Some`, receives a
+/// `redirect_rejections` bump for every rate-limited request (the composition
+/// root passes the daemon-wide registry). The `ConnectInfo` extractor requires
 /// `into_make_service_with_connect_info::<SocketAddr>()`.
 pub async fn serve_with_limits<R: NeighResolver + 'static>(
     cfg: RedirectConfig,
     resolver: R,
     rl: RateLimitConfig,
+    metrics: Option<Arc<portcullis_types::MetricsRegistry>>,
 ) -> portcullis_types::Result<()> {
     use portcullis_types::Error;
 
@@ -236,6 +245,7 @@ pub async fn serve_with_limits<R: NeighResolver + 'static>(
         cfg,
         resolver,
         limiter: RateLimiter::new(rl),
+        metrics,
     });
     let app = build_router(state);
 
@@ -387,7 +397,35 @@ mod tests {
             cfg: cfg(),
             resolver: MockNeighResolver::new(),
             limiter: RateLimiter::new(RateLimitConfig::default()),
+            metrics: None,
         });
         let _router = build_router(state);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_request_bumps_shared_registry() {
+        let metrics = Arc::new(portcullis_types::MetricsRegistry::new());
+        let state = Arc::new(AppState {
+            cfg: cfg(),
+            resolver: MockNeighResolver::new(),
+            // One-token bucket with no refill: the second request is denied.
+            limiter: RateLimiter::new(RateLimitConfig {
+                capacity: 1.0,
+                refill_per_sec: 0.0,
+                max_keys: 10,
+            }),
+            metrics: Some(metrics.clone()),
+        });
+        let peer: SocketAddr = "10.0.0.9:40000".parse().unwrap();
+
+        let first = handle(State(state.clone()), ConnectInfo(peer)).await;
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(metrics.snapshot().redirect_rejections, 0);
+
+        let second = handle(State(state.clone()), ConnectInfo(peer)).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Both the limiter's own counter and the shared registry advanced.
+        assert_eq!(state.limiter.rejections_total(), 1);
+        assert_eq!(metrics.snapshot().redirect_rejections, 1);
     }
 }

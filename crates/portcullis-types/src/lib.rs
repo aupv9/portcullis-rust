@@ -92,35 +92,79 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
-/// SSID / policy tier (TDD §7.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Tier {
-    #[default]
-    Public,
-    Home,
-    Retail,
+/// Conventional tier names (seed/config defaults). Tiers are **data-driven**:
+/// these are conventions the control plane seeds, not an exhaustive set.
+pub const TIER_PUBLIC: &str = "public";
+pub const TIER_HOME: &str = "home";
+pub const TIER_RETAIL: &str = "retail";
+
+/// SSID / policy tier (TDD §7.4). Data-driven: any name matching
+/// `^[a-z0-9_-]{1,32}$` (after trim + ASCII-lowercase normalization) is a
+/// valid tier — the control plane defines the actual set. `"public"`,
+/// `"home"` and `"retail"` are conventional names, not an enum.
+///
+/// Backed by `Box<str>` (same rationale as [`SessionId`]): immutable once
+/// parsed, so a `String`'s capacity word is dead weight on the RUTM11.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Tier(Box<str>);
+
+impl Tier {
+    /// The conventional default tier (`"public"`) — what an empty wire string
+    /// resolves to, and what adopted sessions are tagged with.
+    pub fn public() -> Self {
+        Tier(Box::from(TIER_PUBLIC))
+    }
+
+    /// Borrow as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for Tier {
+    fn default() -> Self {
+        Tier::public()
+    }
 }
 
 impl fmt::Display for Tier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Tier::Public => "public",
-            Tier::Home => "home",
-            Tier::Retail => "retail",
-        })
+        f.write_str(&self.0)
     }
 }
 
 impl FromStr for Tier {
     type Err = Error;
+
+    /// Normalize (trim + ASCII-lowercase), then validate. Empty string =>
+    /// `"public"` (the wire's "no tier given" default, §7.5); anything not
+    /// matching `^[a-z0-9_-]{1,32}$` post-normalization is rejected.
     fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "public" | "" => Ok(Tier::Public),
-            "home" => Ok(Tier::Home),
-            "retail" => Ok(Tier::Retail),
-            other => Err(Error::InvalidTier(other.to_string())),
+        let norm = s.trim().to_ascii_lowercase();
+        if norm.is_empty() {
+            return Ok(Tier::public());
         }
+        let well_formed = norm.len() <= 32
+            && norm
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        if !well_formed {
+            return Err(Error::InvalidTier(norm));
+        }
+        Ok(Tier(norm.into_boxed_str()))
+    }
+}
+
+impl Serialize for Tier {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tier {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -152,7 +196,7 @@ pub const DEFAULT_EXPIRY_TICK: Duration = Duration::from_secs(1);
 /// from the matching tier's policy before applying the grant. A field of `0`
 /// here means *unset*: it resolves to the built-in default ([`DEFAULT_TTL`] for
 /// `ttl`) or to *unlimited* (`quota_bytes` / `rate_bps`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TierPolicy {
     pub tier: Tier,
     pub ttl: Duration,
@@ -218,6 +262,151 @@ impl EngineParams {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime metrics (GetMetrics gRPC — fleet monitoring). Lock-free counters the
+// hot paths bump with Relaxed atomics; the gRPC handler reads a snapshot.
+// ---------------------------------------------------------------------------
+
+/// Process-wide runtime counters, shared (via `Arc`) between the session
+/// layer, the redirect responder, and the gRPC `GetMetrics` handler. Counters
+/// count since boot (they reset with the engine's `boot_id`); RAM-only, like
+/// everything else (§5.4).
+///
+/// Deliberately NOT here: `events_emitted/evicted` (owned by the control
+/// crate's `EventLog`), `sessions_active` (a gauge the [`Enforcer`] reports),
+/// and `rss_bytes` (read from the kernel at scrape time via [`rss_bytes`]).
+#[derive(Debug)]
+pub struct MetricsRegistry {
+    grants: std::sync::atomic::AtomicU64,
+    grant_failures: std::sync::atomic::AtomicU64,
+    revokes: std::sync::atomic::AtomicU64,
+    expires: std::sync::atomic::AtomicU64,
+    quota_kills: std::sync::atomic::AtomicU64,
+    shaper_failures: std::sync::atomic::AtomicU64,
+    redirect_rejections: std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
+}
+
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetricsRegistry {
+    pub fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        MetricsRegistry {
+            grants: AtomicU64::new(0),
+            grant_failures: AtomicU64::new(0),
+            revokes: AtomicU64::new(0),
+            expires: AtomicU64::new(0),
+            quota_kills: AtomicU64::new(0),
+            shaper_failures: AtomicU64::new(0),
+            redirect_rejections: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn inc(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A grant was applied successfully.
+    pub fn inc_grants(&self) {
+        Self::inc(&self.grants);
+    }
+
+    /// A grant failed (session cap reached, writer/kernel error).
+    pub fn inc_grant_failures(&self) {
+        Self::inc(&self.grant_failures);
+    }
+
+    /// A session was revoked (admin/quota/MAC-change teardown).
+    pub fn inc_revokes(&self) {
+        Self::inc(&self.revokes);
+    }
+
+    /// A session hit its daemon-side expiry.
+    pub fn inc_expires(&self) {
+        Self::inc(&self.expires);
+    }
+
+    /// A session was revoked for exceeding its byte quota.
+    pub fn inc_quota_kills(&self) {
+        Self::inc(&self.quota_kills);
+    }
+
+    /// A best-effort shaper apply/clear failed (QoS only).
+    pub fn inc_shaper_failures(&self) {
+        Self::inc(&self.shaper_failures);
+    }
+
+    /// The redirect responder rate-limited a request.
+    pub fn inc_redirect_rejections(&self) {
+        Self::inc(&self.redirect_rejections);
+    }
+
+    /// A point-in-time copy of every counter plus the uptime.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        MetricsSnapshot {
+            grants: self.grants.load(Relaxed),
+            grant_failures: self.grant_failures.load(Relaxed),
+            revokes: self.revokes.load(Relaxed),
+            expires: self.expires.load(Relaxed),
+            quota_kills: self.quota_kills.load(Relaxed),
+            shaper_failures: self.shaper_failures.load(Relaxed),
+            redirect_rejections: self.redirect_rejections.load(Relaxed),
+            uptime_secs: self.started.elapsed().as_secs(),
+        }
+    }
+}
+
+/// Plain-data view of a [`MetricsRegistry`] (see [`MetricsRegistry::snapshot`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub grants: u64,
+    pub grant_failures: u64,
+    pub revokes: u64,
+    pub expires: u64,
+    pub quota_kills: u64,
+    pub shaper_failures: u64,
+    pub redirect_rejections: u64,
+    pub uptime_secs: u64,
+}
+
+/// Resident-set size of this process in bytes, from `/proc/self/status`
+/// (`VmRSS:`). Returns `0` when it cannot be read — notably on non-Linux dev
+/// hosts (macOS), where `/proc` does not exist. The one deliberate exception
+/// to this crate's "no I/O" rule: it reads only our own procfs entry, so it
+/// stays kernel-agnostic and mock-free for every consumer.
+pub fn rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| parse_vmrss_kb(&s))
+            .map_or(0, |kb| kb.saturating_mul(1024))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Extract the `VmRSS` value (kB) from a `/proc/self/status` document.
+/// Kept separate (and compiled on every platform) so the parsing is
+/// unit-testable on non-Linux dev hosts — where only the tests call it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_vmrss_kb(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
 }
 
 /// FNV-1a 64-bit over UTF-8 bytes. Deterministic across platforms/languages —
@@ -537,6 +726,10 @@ pub trait Enforcer: Send + Sync {
     async fn list(&self) -> Result<Vec<SessionInfo>>;
     async fn health(&self) -> HealthStatus;
 
+    /// Number of sessions currently tracked (the `sessions_active` gauge in
+    /// `GetMetrics`). Read-only and cheap — no kernel round-trip.
+    async fn active_sessions(&self) -> usize;
+
     /// Set the global enforcement gate (admin toggle via control plane). On
     /// success the reported [`HealthStatus::enforcement_enabled`] reflects the
     /// new state. Fails closed: on backend error the prior state is kept.
@@ -636,10 +829,45 @@ mod tests {
 
     #[test]
     fn tier_parse_and_display() {
-        assert_eq!("retail".parse::<Tier>().unwrap(), Tier::Retail);
-        assert_eq!(Tier::Home.to_string(), "home");
-        assert_eq!("".parse::<Tier>().unwrap(), Tier::Public);
-        assert!("gold".parse::<Tier>().is_err());
+        // Conventional names parse and print verbatim.
+        assert_eq!("retail".parse::<Tier>().unwrap().as_str(), "retail");
+        assert_eq!("home".parse::<Tier>().unwrap().to_string(), "home");
+        // Empty => the conventional default.
+        assert_eq!("".parse::<Tier>().unwrap(), Tier::public());
+        assert_eq!(Tier::default(), Tier::public());
+        // Data-driven: any well-formed name is accepted.
+        assert_eq!("gold".parse::<Tier>().unwrap().as_str(), "gold");
+        assert_eq!("vip_2-a".parse::<Tier>().unwrap().as_str(), "vip_2-a");
+    }
+
+    #[test]
+    fn tier_normalizes_trim_and_case() {
+        assert_eq!("  Retail  ".parse::<Tier>().unwrap().as_str(), "retail");
+        assert_eq!("GOLD".parse::<Tier>().unwrap(), "gold".parse::<Tier>().unwrap());
+        assert_eq!("   ".parse::<Tier>().unwrap(), Tier::public());
+    }
+
+    #[test]
+    fn tier_rejects_bad_charset_and_length() {
+        assert!(matches!("plat!num".parse::<Tier>(), Err(Error::InvalidTier(_))));
+        assert!(matches!("tier with spaces".parse::<Tier>(), Err(Error::InvalidTier(_))));
+        assert!(matches!("tiếng".parse::<Tier>(), Err(Error::InvalidTier(_))));
+        // 32 chars is the edge; 33 is out.
+        assert!("a".repeat(32).parse::<Tier>().is_ok());
+        assert!(matches!("a".repeat(33).parse::<Tier>(), Err(Error::InvalidTier(_))));
+    }
+
+    #[test]
+    fn tier_serde_is_string() {
+        let t: Tier = "gold".parse().unwrap();
+        let j = serde_json::to_string(&t).unwrap();
+        assert_eq!(j, "\"gold\"");
+        let back: Tier = serde_json::from_str(&j).unwrap();
+        assert_eq!(t, back);
+        // Deserialization normalizes/validates via FromStr.
+        let up: Tier = serde_json::from_str("\"GOLD\"").unwrap();
+        assert_eq!(up, t);
+        assert!(serde_json::from_str::<Tier>("\"bad tier!\"").is_err());
     }
 
     #[test]
@@ -651,6 +879,9 @@ mod tests {
             ("a", "af63dc4c8601ec8c"),
             ("hello", "a430d84680aabd0b"),
             ("15:30:1:4096", "3dadbdd27d764902"),
+            // Legacy v1 tiers canonical form — kept as a pure string→hash
+            // vector (the live v2 tiers vectors are pinned in
+            // portcullis-session's config_state tests).
             ("home:86400:0:0|public:7200:0:0|retail:28800:0:0", "f91fea58d22e1509"),
             ("cdn.wifihub.vn|portal.wifihub.vn", "c34e4b6bbbbe11ee"),
         ] {
@@ -661,7 +892,7 @@ mod tests {
     #[test]
     fn tier_policy_default_is_public_and_zeroed() {
         let p = TierPolicy::default();
-        assert_eq!(p.tier, Tier::Public);
+        assert_eq!(p.tier, Tier::public());
         assert_eq!(p.ttl, Duration::ZERO);
         assert_eq!(p.quota_bytes, 0);
         assert_eq!(p.rate_bps, 0);
@@ -681,5 +912,46 @@ mod tests {
     fn counters_total_saturates() {
         let c = Counters { bytes_in: u64::MAX, bytes_out: 10 };
         assert_eq!(c.total(), u64::MAX);
+    }
+
+    #[test]
+    fn metrics_registry_counts_and_snapshots() {
+        let m = MetricsRegistry::new();
+        assert_eq!(m.snapshot(), MetricsSnapshot { ..Default::default() });
+
+        m.inc_grants();
+        m.inc_grants();
+        m.inc_grant_failures();
+        m.inc_revokes();
+        m.inc_expires();
+        m.inc_quota_kills();
+        m.inc_shaper_failures();
+        m.inc_redirect_rejections();
+
+        let s = m.snapshot();
+        assert_eq!(s.grants, 2);
+        assert_eq!(s.grant_failures, 1);
+        assert_eq!(s.revokes, 1);
+        assert_eq!(s.expires, 1);
+        assert_eq!(s.quota_kills, 1);
+        assert_eq!(s.shaper_failures, 1);
+        assert_eq!(s.redirect_rejections, 1);
+    }
+
+    #[test]
+    fn parse_vmrss_extracts_kb() {
+        let status = "Name:\tportcullis\nVmPeak:\t  20000 kB\nVmRSS:\t   12345 kB\nThreads:\t1\n";
+        assert_eq!(parse_vmrss_kb(status), Some(12345));
+        assert_eq!(parse_vmrss_kb("Name:\tx\n"), None);
+        assert_eq!(parse_vmrss_kb("VmRSS:\tnot-a-number kB\n"), None);
+    }
+
+    #[test]
+    fn rss_bytes_is_platform_gated() {
+        // Linux: our own procfs entry always has a VmRSS; elsewhere: 0.
+        #[cfg(target_os = "linux")]
+        assert!(rss_bytes() > 0);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(rss_bytes(), 0);
     }
 }

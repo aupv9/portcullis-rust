@@ -26,8 +26,11 @@ use crate::pb;
 /// Validation rules (§7.5):
 /// - `client_mac` is parsed via [`MacAddr::from_str`]; an invalid MAC is
 ///   **rejected** (no fail-open default).
-/// - `tier` is parsed via [`Tier::from_str`] (empty string => `public`); an
-///   unknown tier is rejected.
+/// - `tier` is parsed via [`Tier::from_str`] (empty string => `public`).
+///   Tiers are data-driven: any well-formed `[a-z0-9_-]{1,32}` name is
+///   accepted (the control plane owns the tier set); a malformed name is
+///   rejected. A tier with no policy on the engine degrades to the built-in
+///   defaults at grant time.
 /// - `client_ip` is optional/informational: empty => `None`; a non-empty but
 ///   unparseable IP is rejected (it would otherwise be silently dropped).
 /// - `ttl_seconds` -> [`Duration`] (the nft set-element timeout).
@@ -76,7 +79,8 @@ fn parse_optional_ip(s: &str) -> Result<Option<IpAddr>> {
 /// [`TierPolicy`] entries (full-replacement semantics, §7.4).
 ///
 /// - `tier` is parsed via [`Tier::from_str`] (empty string => `public`, matching
-///   the grant path); an unknown tier is **rejected**.
+///   the grant path). Tiers are data-driven: any well-formed
+///   `[a-z0-9_-]{1,32}` name is accepted; a malformed name is **rejected**.
 /// - A tier repeated within one request is rejected as a bad request — the
 ///   control plane's intent would be ambiguous.
 /// - An empty `policies` list is valid: it resets every tier to built-ins.
@@ -251,7 +255,7 @@ mod tests {
         assert_eq!(p.ttl, Duration::from_secs(3600));
         assert_eq!(p.quota_bytes, 0); // unlimited
         assert_eq!(p.rate_bps, 0); // unlimited
-        assert_eq!(p.tier, Tier::Retail);
+        assert_eq!(p.tier.as_str(), "retail");
         assert_eq!(p.session_id, SessionId("sess-123".into()));
     }
 
@@ -265,17 +269,28 @@ mod tests {
 
     #[test]
     fn grant_request_invalid_tier_rejected() {
+        // Only malformed names are rejected now (charset/length), not
+        // "unknown" ones — tiers are data-driven.
+        for bad in ["plat!num", "Tier With Spaces"] {
+            let mut g = sample_grant();
+            g.tier = bad.into();
+            let err = grant_request_to_params(g).unwrap_err();
+            assert!(matches!(err, Error::InvalidTier(_)), "tier {bad:?}");
+        }
+    }
+
+    #[test]
+    fn grant_request_novel_tier_accepted() {
         let mut g = sample_grant();
-        g.tier = "platinum".into();
-        let err = grant_request_to_params(g).unwrap_err();
-        assert!(matches!(err, Error::InvalidTier(_)));
+        g.tier = "gold".into();
+        assert_eq!(grant_request_to_params(g).unwrap().tier.as_str(), "gold");
     }
 
     #[test]
     fn grant_request_empty_tier_is_public() {
         let mut g = sample_grant();
         g.tier = "".into();
-        assert_eq!(grant_request_to_params(g).unwrap().tier, Tier::Public);
+        assert_eq!(grant_request_to_params(g).unwrap().tier, Tier::public());
     }
 
     #[test]
@@ -308,16 +323,32 @@ mod tests {
         };
         let ps = tier_policies_from_pb(req).unwrap();
         assert_eq!(ps.len(), 3);
-        assert_eq!(ps[0].tier, Tier::Public);
+        assert_eq!(ps[0].tier, Tier::public());
         assert_eq!(ps[0].ttl, Duration::from_secs(300));
         assert_eq!(ps[1].quota_bytes, 3);
         assert_eq!(ps[2].rate_bps, 6);
     }
 
     #[test]
-    fn tier_policies_unknown_tier_rejected() {
-        let req = pb::SetTierPoliciesRequest { policies: vec![pb_policy("platinum", 1, 0, 0)] };
-        assert!(matches!(tier_policies_from_pb(req).unwrap_err(), Error::InvalidTier(_)));
+    fn tier_policies_malformed_tier_rejected() {
+        // Bad charset and over-length names are rejected; "unknown" is no
+        // longer a concept (data-driven tiers).
+        let long = "a".repeat(33);
+        for bad in ["plat!num", long.as_str()] {
+            let req = pb::SetTierPoliciesRequest { policies: vec![pb_policy(bad, 1, 0, 0)] };
+            assert!(
+                matches!(tier_policies_from_pb(req).unwrap_err(), Error::InvalidTier(_)),
+                "tier {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_policies_novel_tier_accepted() {
+        let req = pb::SetTierPoliciesRequest { policies: vec![pb_policy("gold", 600, 5, 6)] };
+        let ps = tier_policies_from_pb(req).unwrap();
+        assert_eq!(ps[0].tier.as_str(), "gold");
+        assert_eq!(ps[0].ttl, Duration::from_secs(600));
     }
 
     #[test]
@@ -331,7 +362,7 @@ mod tests {
     #[test]
     fn tier_policies_empty_tier_is_public() {
         let req = pb::SetTierPoliciesRequest { policies: vec![pb_policy("", 1, 0, 0)] };
-        assert_eq!(tier_policies_from_pb(req).unwrap()[0].tier, Tier::Public);
+        assert_eq!(tier_policies_from_pb(req).unwrap()[0].tier, Tier::public());
     }
 
     #[test]
@@ -391,7 +422,7 @@ mod tests {
             session_id: SessionId("s1".into()),
             mac: "01:02:03:04:05:06".parse().unwrap(),
             ip: Some("192.168.0.9".parse().unwrap()),
-            tier: Tier::Home,
+            tier: "home".parse().unwrap(),
             granted_at_unix: 1_700_000_000,
             expires_in: Duration::from_secs(120),
             quota_bytes: 1_000_000,
@@ -418,7 +449,7 @@ mod tests {
             session_id: SessionId("s1".into()),
             mac: "01:02:03:04:05:06".parse().unwrap(),
             ip: None,
-            tier: Tier::Public,
+            tier: Tier::public(),
             granted_at_unix: 0,
             expires_in: Duration::ZERO,
             quota_bytes: 0,
@@ -435,7 +466,7 @@ mod tests {
             session_id: SessionId("s1".into()),
             mac: "01:02:03:04:05:06".parse().unwrap(),
             ip: None,
-            tier: Tier::Public,
+            tier: Tier::public(),
             granted_at_unix: 0,
             expires_in: Duration::from_secs(u64::from(u32::MAX) + 100),
             quota_bytes: 0,

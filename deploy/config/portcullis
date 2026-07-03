@@ -4,7 +4,7 @@
 #
 # Hot-reloadable: garden_fqdn, tier defaults, accounting_interval.
 # Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port,
-#                   redirect_rl_*, event_buffer_size.
+#                   redirect_rl_*, event_buffer_size, firewall_backend.
 
 config portcullis 'main'
 	option store_id            'SITE-0000'
@@ -32,6 +32,10 @@ config portcullis 'main'
 	# the device; if the runtime probe fails the daemon logs and runs unshaped.
 	option shaper_enabled             '0'
 	option shape_interface            'br-lan'
+	# Firewall backend: 'auto' (default) probes the kernel for nft NAT support
+	# and falls back to ipset+iptables (the stock-RutOS path, no CONFIG_NFT_NAT);
+	# 'nft' / 'ipset' force a backend. RequiresRestart.
+	# option firewall_backend           'auto'
 	list   garden_fqdn         'portal.wifihub.vn'
 	list   garden_fqdn         'cdn.wifihub.vn'
 	list   garden_fqdn         'otp.gateway'

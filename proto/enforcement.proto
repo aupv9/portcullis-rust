@@ -19,6 +19,7 @@ service Enforcement {
   rpc SetTierPolicies(SetTierPoliciesRequest) returns (Ack); // fleet-wide per-tier grant defaults
   rpc SetEngineParameters(SetEngineParametersRequest) returns (Ack); // runtime timers + session cap
   rpc GetEngineInfo(Empty) returns (EngineInfo); // version, capabilities, event cursor, config hashes
+  rpc GetMetrics(Empty) returns (MetricsReply); // runtime counters for fleet monitoring
 }
 
 // Toggle the engine's global enforcement gate. When disabled, the engine removes
@@ -41,7 +42,7 @@ message SetGardenRequest {
 // grant, so the control plane can manage per-tier defaults centrally instead of
 // stamping every GrantRequest.
 message TierPolicy {
-  string tier        = 1; // "public" | "home" | "retail"
+  string tier        = 1; // any [a-z0-9_-]{1,32} name (conventional: public | home | retail); data-driven, control plane owns the set
   uint32 ttl_seconds = 2; // 0 = unset -> engine built-in default (1800s)
   uint64 quota_bytes = 3; // 0 = unset -> unlimited
   uint64 rate_bps    = 4; // 0 = unset -> unlimited
@@ -75,7 +76,7 @@ message GrantRequest {
   uint32 ttl_seconds = 4; // session length -> nft set-element timeout; 0 = use tier policy
   uint64 quota_bytes = 5; // 0 = use tier policy (see NOTE); explicit unlimited on a quota'd tier = u64::MAX
   uint64 rate_bps    = 6; // 0 = use tier policy (see NOTE); explicit unlimited on a rate-capped tier = u64::MAX
-  string tier        = 7; // public | home | retail
+  string tier        = 7; // any [a-z0-9_-]{1,32} name (conventional: public | home | retail); data-driven, control plane owns the set
   string session_id  = 8; // control-plane issued (== RADIUS Acct-Session-Id)
   // NOTE (behaviour change, SetTierPolicies): ttl_seconds/quota_bytes/rate_bps
   // == 0 no longer mean "built-in default"/"unlimited" directly — they mean
@@ -170,8 +171,11 @@ message StreamReq {
 //
 // Canonical forms hashed (MUST match the control plane's implementation;
 // covered by shared test vectors on both sides):
-//   tiers  : "home:{ttl_s}:{quota_bytes}:{rate_bps}|public:...|retail:..."
-//            (tiers sorted alphabetically)
+//   tiers  : (v2, capability "tier_any") only the tiers PRESENT in the policy
+//            map, sorted by name ascending,
+//            "name:{ttl_s}:{quota_bytes}:{rate_bps}" joined with "|"
+//            (empty map => ""). Tiers are data-driven; the fixed
+//            public/home/retail zero-fill of v1 is gone.
 //   params : "{accounting_s}:{garden_s}:{expiry_s}:{max_sessions}"
 //   garden : fqdns lowercased, sorted ascending, joined with "|" ("" if empty)
 // Hash: FNV-1a 64-bit over UTF-8, rendered as 16 lowercase hex chars.
@@ -185,6 +189,24 @@ message EngineInfo {
   string tier_policies_hash = 7;
   string engine_params_hash = 8;
   string garden_hash = 9;
+}
+
+// Runtime counters/gauges for fleet monitoring (the control plane aggregates
+// these into its Prometheus /metrics). Counters count since engine boot (they
+// reset together with EngineInfo.boot_id); gauges are current values.
+message MetricsReply {
+  uint64 sessions_active          = 1;  // gauge
+  uint64 grants_total             = 2;
+  uint64 grant_failures_total     = 3;  // incl. writer/kernel errors during grant
+  uint64 revokes_total            = 4;
+  uint64 expires_total            = 5;
+  uint64 quota_kills_total        = 6;
+  uint64 events_emitted_total     = 7;  // == EventLog latest_seq
+  uint64 events_evicted_total     = 8;  // events pushed out of the replay buffer
+  uint64 shaper_failures_total    = 9;
+  uint64 redirect_rejections_total = 10; // rate-limiter rejections on the :8080 responder
+  uint64 rss_bytes                = 11; // /proc/self/status VmRSS (0 if unreadable)
+  uint64 uptime_secs              = 12;
 }
 
 message HealthReply {

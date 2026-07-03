@@ -116,17 +116,24 @@ fn initial_engine_params(cfg: &Config) -> portcullis_types::EngineParams {
     }
 }
 
-/// Seed tier policies from the boot config (§9): every tier starts from the
-/// same config-derived defaults until the control plane pushes real per-tier
-/// policies via `SetTierPolicies`. `0` stays `0` (built-in TTL / unlimited).
+/// Seed tier policies from the boot config (§9): the three conventional tier
+/// names start from the same config-derived defaults until the control plane
+/// pushes the real (data-driven) tier set via `SetTierPolicies`. `0` stays `0`
+/// (built-in TTL / unlimited); a granted tier absent from the map falls back
+/// to the built-ins the same way.
 fn initial_tier_policies(cfg: &Config) -> Vec<portcullis_types::TierPolicy> {
-    use portcullis_types::{Tier, TierPolicy};
+    use portcullis_types::{Tier, TierPolicy, TIER_HOME, TIER_PUBLIC, TIER_RETAIL};
     let ttl = std::time::Duration::from_secs(cfg.default_ttl);
     let quota_bytes = cfg.default_quota_mb.saturating_mul(1024 * 1024);
     let rate_bps = cfg.default_rate_kbps.saturating_mul(1000);
-    [Tier::Public, Tier::Home, Tier::Retail]
+    [TIER_PUBLIC, TIER_HOME, TIER_RETAIL]
         .into_iter()
-        .map(|tier| TierPolicy { tier, ttl, quota_bytes, rate_bps })
+        .map(|name| TierPolicy {
+            tier: name.parse::<Tier>().expect("conventional tier names are well-formed"),
+            ttl,
+            quota_bytes,
+            rate_bps,
+        })
         .collect()
 }
 
@@ -154,7 +161,7 @@ mod tests {
             ttl: Duration::from_secs(1800),
             quota_bytes: 0,
             rate_bps: 0,
-            tier: portcullis_types::Tier::Public,
+            tier: portcullis_types::Tier::public(),
             session_id: portcullis_types::SessionId("s-1".into()),
         };
         let id = w.mgr.grant(params).await.expect("grant");
@@ -186,7 +193,7 @@ mod tests {
             ttl: Duration::ZERO,
             quota_bytes: 0,
             rate_bps: 0,
-            tier: portcullis_types::Tier::Home,
+            tier: "home".parse().unwrap(),
             session_id: portcullis_types::SessionId("s-2".into()),
         };
         w.mgr.grant(params).await.expect("grant");

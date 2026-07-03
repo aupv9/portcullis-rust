@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -48,11 +49,20 @@ struct Bucket {
 pub struct RateLimiter {
     cfg: RateLimitConfig,
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    /// Requests denied by this limiter since boot (any deny path), the
+    /// `redirect_rejections_total` counter in `GetMetrics`.
+    rejections: AtomicU64,
 }
 
 impl RateLimiter {
     pub fn new(cfg: RateLimitConfig) -> Self {
-        Self { cfg, buckets: Mutex::new(HashMap::new()) }
+        Self { cfg, buckets: Mutex::new(HashMap::new()), rejections: AtomicU64::new(0) }
+    }
+
+    /// Count (and report) one denied request.
+    fn reject(&self) -> bool {
+        self.rejections.fetch_add(1, Ordering::Relaxed);
+        false
     }
 
     /// Admit (and charge) one request from `ip` at time `now`. Returns `true`
@@ -65,7 +75,7 @@ impl RateLimiter {
         // deny rather than propagate a panic up the request path.
         let mut map = match self.buckets.lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(_) => return self.reject(),
         };
 
         // Opportunistic prune of fully-refilled, idle buckets to bound memory.
@@ -83,7 +93,7 @@ impl RateLimiter {
         // If still at the cap and this is a brand-new key, deny without
         // inserting — an attacker spraying random IPs can't grow the map.
         if !map.contains_key(&ip) && map.len() >= self.cfg.max_keys {
-            return false;
+            return self.reject();
         }
 
         let bucket = map.entry(ip).or_insert(Bucket { tokens: self.cfg.capacity, last: now });
@@ -98,7 +108,7 @@ impl RateLimiter {
             bucket.tokens -= 1.0;
             true
         } else {
-            false
+            self.reject()
         }
     }
 
@@ -110,6 +120,11 @@ impl RateLimiter {
     /// Current number of tracked keys (for tests / metrics).
     pub fn tracked_keys(&self) -> usize {
         self.buckets.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Total requests this limiter has denied since boot.
+    pub fn rejections_total(&self) -> u64 {
+        self.rejections.load(Ordering::Relaxed)
     }
 }
 
@@ -132,6 +147,25 @@ mod tests {
         assert!(rl.check_at(a, t0));
         // Fourth in the same instant is over capacity.
         assert!(!rl.check_at(a, t0));
+    }
+
+    #[test]
+    fn rejections_are_counted_across_deny_paths() {
+        let rl = RateLimiter::new(RateLimitConfig { capacity: 1.0, refill_per_sec: 0.0, max_keys: 1 });
+        let t0 = Instant::now();
+        assert_eq!(rl.rejections_total(), 0);
+
+        // Admitted request: not counted.
+        assert!(rl.check_at(ip("10.0.0.1"), t0));
+        assert_eq!(rl.rejections_total(), 0);
+
+        // Out of tokens: counted.
+        assert!(!rl.check_at(ip("10.0.0.1"), t0));
+        assert_eq!(rl.rejections_total(), 1);
+
+        // New key past max_keys (anti-spray deny): counted too.
+        assert!(!rl.check_at(ip("10.0.0.2"), t0));
+        assert_eq!(rl.rejections_total(), 2);
     }
 
     #[test]
