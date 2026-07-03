@@ -14,7 +14,7 @@
 ![clippy](https://img.shields.io/badge/clippy-D%20warnings%20clean-brightgreen)
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
 ![binary](https://img.shields.io/badge/binary-~2.4MB-informational)
-![target](https://img.shields.io/badge/target-mipsel--musl%20(RUTM11)-lightgrey)
+![target](https://img.shields.io/badge/target-OpenWrt%20(mipsel%2Fmips%2Farmv7--musl)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
 </div>
@@ -23,7 +23,9 @@
 
 ## 📖 What is this?
 
-`portcullis` is the **data-plane enforcement arm** of an ad-gated public-WiFi captive portal. It runs locally on each site's OpenWrt router (built for the **Teltonika RUTM11** / RutOS) — one router per site, scaling to thousands of independent sites — and does exactly one job well: hold the internet gate shut until the control plane says open, then enforce / meter / expire that grant.
+`portcullis` is the **data-plane enforcement arm** of an ad-gated public-WiFi captive portal. It runs locally on each site's **OpenWrt** router — one router per site, scaling to thousands of independent sites — and does exactly one job well: hold the internet gate shut until the control plane says open, then enforce / meter / expire that grant.
+
+It is **not vendor-locked to any specific router**. The only hard requirement is **OpenWrt** (or an OpenWrt-derived firmware — vanilla OpenWrt, Teltonika RutOS, GL.iNet, etc.). The netfilter-touching code sits behind a `FirewallBackend` seam with two implementations — nftables (`nft -j`) and ipset + iptables/ip6tables — auto-selected at boot to fit whatever the device's kernel actually supports, so no single vendor's firmware is assumed. The **Teltonika RUTM11 / RutOS 21.02** is the **reference/primary validation device** (a deliberately constrained MIPS target — if it runs there, it runs on roomier OpenWrt hardware), not a lock-in.
 
 It is the mechanism behind a **video-gate ad slot**: the moment the gate completes, the control plane calls `GrantSession`, and `portcullis` opens the path.
 
@@ -39,7 +41,7 @@ Design notes and the load-bearing invariants are summarized below and in [`CLAUD
 flowchart LR
   subgraph Store["🏬 Site / venue  (1 router : 1 site, ×N)"]
     C["📱 Clients<br/>Public-Hub SSID"]
-    subgraph R["📡 RUTM11 — RutOS 7.x / OpenWrt 21.02"]
+    subgraph R["📡 OpenWrt router (ref: RUTM11 / RutOS 21.02)"]
       ENG["🏰 portcullis daemon"]
       RESP["↪️ 302 responder :8080"]
       DM["🧩 dnsmasq-full<br/>nftset → garden"]
@@ -193,17 +195,20 @@ cargo test -p portcullis-session expiry
 RUST_LOG=debug PORTCULLIS_CONFIG=/etc/config/portcullis cargo run -p portcullis-engined
 ```
 
-### 📦 Cross-compile for the router (RUTM11)
+### 📦 Cross-compile for OpenWrt
+
+CI cross-builds a static-musl `.ipk` for the common OpenWrt CPU families (no vendor SDK required — see `.github/workflows/release-ipk.yml`):
 
 ```bash
-# Target: MIPS 1004Kc, little-endian, static musl
-cargo build --release --target mipsel-unknown-linux-musl
-# Package as an .ipk via the RutOS / OpenWrt SDK (ramips/mt7621).
+# e.g. MIPS little-endian (RUTM11-class ramips/mt7621); pick the target for your device
+cargo build --release --target mipsel-unknown-linux-musl   # mipsel_24kc
+#                              mips-unknown-linux-musl       # mips_24kc  (RUT9xx)
+#                              armv7-unknown-linux-musleabihf# arm_cortex-a7 (RUTX / many OpenWrt APs)
 ```
 
-**Full build → install → provision → verify guide: [`deploy/PACKAGING.md`](./deploy/PACKAGING.md)** (or `SDK_DIR=/path/to/sdk ./deploy/build-ipk.sh`).
+Release tags publish signed `.ipk`s for all three arches plus an opkg feed. **Full build → install → provision → verify guide: [`deploy/PACKAGING.md`](./deploy/PACKAGING.md)** (or `SDK_DIR=/path/to/sdk ./deploy/build-ipk.sh` to build via an OpenWrt/vendor SDK).
 
-Runtime dependencies on-device: `kmod-nft-*` + `nftables` userspace and `dnsmasq-full` (declared as package deps).
+Runtime dependencies on-device (declared as package deps): `ipset` + `iptables`/`ip6tables` for the ipset backend, or `kmod-nft-*` + `nftables` userspace for the nft backend, plus `dnsmasq-full` for the walled garden. The engine auto-detects which firewall backend the kernel supports at boot.
 
 ---
 
@@ -271,7 +276,7 @@ mTLS material is provisioned separately at `/etc/portcullis/tls/` (`server.crt`,
 
 ## 🪶 Performance & footprint
 
-Tuned for the RUTM11 (MIPS 880 MHz, **256 MB RAM**; budgets: <15 MB binary, <30 MB RSS — TDD §14).
+Tuned for constrained OpenWrt hardware — reference device the RUTM11 (MIPS 880 MHz, **256 MB RAM**; budgets: <15 MB binary, <30 MB RSS — TDD §14). Meeting the budget on this low end means ample headroom on roomier OpenWrt routers.
 
 | | Before tuning | After |
 |---|---|---|
@@ -298,14 +303,15 @@ cargo test --workspace          # 130 unit tests across 9 crates
 
 - **Unit:** pure domain (`session`, `redirect` HMAC/parse) + `nft` against a `MockBackend`.
 - **Integration (planned):** Linux netns harness asserts verdicts (unauth→redirect, garden→allow, authed→forward, expired→re-gate, revoked→drop) + fault injection (kill -9 → adoption, CP loss → fail-closed). See [`.claude/skills/netns-harness`](./.claude/skills/netns-harness).
-- **On-device:** RUTM11 acceptance (nft-vs-fw3 priorities, conntrack-under-NAT, flash-write audit).
+- **On-device:** OpenWrt acceptance on the reference RUTM11 (backend auto-detect, nft-vs-fw3 hook priorities, conntrack-under-NAT, flash-write audit) — the same suite applies to any OpenWrt target.
 
 ---
 
 ## 🗺️ Roadmap
 
 - [x] `deploy/` — procd init, OpenWrt SDK `.ipk` Makefile, UCI config, first-boot `uci-defaults` ([`deploy/`](./deploy))
-- [ ] MIPS cross-compile validated on-device + size/RSS validation (`-Z build-std`, RutOS SDK)
+- [x] Multi-arch cross-compile → `.ipk` in CI (mipsel/mips/armv7 musl, no vendor SDK)
+- [ ] On-device size/RSS validation on the reference RUTM11
 - [ ] `tc`/HTB bandwidth shaping (Phase-2)
 - [ ] Linux netns integration + fault-injection suite in CI
 - [ ] RFC 8910/8908 Captive Portal API (DHCP option 114) alongside CPD redirect
@@ -340,6 +346,6 @@ at your option. Unless you explicitly state otherwise, any contribution intentio
 
 ## 🙏 References
 
-- Teltonika RUTM11 / RutOS (OpenWrt 21.02, kernel 5.4) — `wiki.teltonika-networks.com`
+- OpenWrt (the only hard platform requirement) — `openwrt.org`; reference device: Teltonika RUTM11 / RutOS 21.02, kernel 5.4 — `wiki.teltonika-networks.com`
 - openNDS (prior art: redirect, walled garden, tmpfs, CPD) — `opennds.readthedocs.io`
 - CVE-2023-38314 (openNDS NULL-deref DoS) — the redirect-hardening precedent

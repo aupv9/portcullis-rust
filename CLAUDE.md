@@ -8,7 +8,9 @@ The full Cargo workspace is implemented and tested (9 crates; host build/tests +
 
 ## What `portcullis` is
 
-The **data-plane enforcement arm** of an ad-gated public-WiFi captive portal — a single Tokio daemon running on each site's OpenWrt router (built for the Teltonika RUTM11; one router per site, scaling to thousands of sites). Its one job: **no client reaches the internet until the central control plane explicitly grants a session**, then enforce/meter/expire that grant.
+The **data-plane enforcement arm** of an ad-gated public-WiFi captive portal — a single Tokio daemon running on each site's **OpenWrt** router (one router per site, scaling to thousands of sites). Its one job: **no client reaches the internet until the central control plane explicitly grants a session**, then enforce/meter/expire that grant.
+
+**Not vendor-locked.** The only hard platform requirement is OpenWrt (vanilla OpenWrt, Teltonika RutOS, GL.iNet, or any OpenWrt-derived firmware). The firewall layer is behind the `FirewallBackend` seam (nftables `nft -j` *or* ipset+iptables/ip6tables, auto-selected at boot to match the kernel), so no single vendor's firmware is assumed. The **Teltonika RUTM11 / RutOS** is the **reference/primary validation device** — a deliberately constrained MIPS target chosen so that meeting its budget guarantees headroom elsewhere — not a supported-hardware whitelist.
 
 It is **not** a NAS, not an ad renderer, not a business-logic owner. Hard boundaries (do not blur these):
 - **RADIUS** is spoken only by the Go control plane. `portcullis` never speaks RADIUS — it emits `SessionEvent`s; the control plane translates them to RADIUS Accounting.
@@ -46,13 +48,14 @@ These come from §5/§7 and are load-bearing — violating them causes flash fai
 7. **MAC is the session key, signed by the router.** The redirect responder computes `sig = HMAC-SHA256(key, "<mac>|<store_id>|<ts>")`; the portal/control plane trust `mac`/`store` only because the signature validates. A client cannot forge another's MAC into a grant.
 8. **The redirect responder (:8080) is the primary inbound attack surface.** It's reachable by any unauthenticated client. Strict/bounded request parsing, no client-controlled data in privileged paths, fuzz the parser (cf. CVE-2023-38314, an openNDS NULL-deref DoS via a missing query param).
 
-## Platform constraints (RUTM11 / RutOS — §5)
+## Platform constraints (OpenWrt; validated on the RUTM11 reference — §5)
 
-- **Target triple: `mipsel-unknown-linux-musl`** (MediaTek MT7621, MIPS 1004Kc, little-endian). Statically linked against musl. Expect `build-std` friction; this is harder than the ARM/RUTX path.
-- RutOS 7.x = **OpenWrt 21.02, kernel 5.4.147**. The native firewall is **fw3 (iptables/xtables), not fw4/nftables**. `portcullis` runs its own `nf_tables` table *alongside* fw3 — non-standard coexistence, ordered by hook priority (`dstnat - 50`, `filter - 50`). This is the single biggest design risk (§18) and must be validated on-device.
-- `kmod-nft-*` + `nftables` userspace may not ship in stock RutOS — may need SDK-building. `dnsmasq-full` (not stock slim dnsmasq) is required for `nftset=`.
-- Firewall backend: **`nftables-rs` (drives `nft -j` JSON)** is chosen — pure-Rust, easiest MIPS cross-compile; fork/exec per batch is fine because per-store churn is tiny. Abstracted behind the `FirewallBackend` trait so it can be revisited (fallback: `rustables` netlink, or iptables/ipset).
-- Resource budget: < 30 MB RSS steady-state, binary < 15 MB, on 256 MB RAM.
+These are **OpenWrt-class realities**, not one vendor's quirks — RutOS is just where they were first hit. Portability across OpenWrt firmwares is a first-class goal.
+
+- **Targets: any OpenWrt CPU family** — CI cross-builds static-musl `.ipk`s for `mipsel-unknown-linux-musl` (MT7621, RUTM11-class), `mips-unknown-linux-musl` (RUT9xx), and `armv7-unknown-linux-musleabihf` (RUTX and many OpenWrt APs). MIPS is the hardest (`build-std` friction, no 64-bit atomics); if it builds there it builds on the ARM path.
+- **Native firewall varies by firmware.** OpenWrt 21.02 / RutOS 7.x use **fw3 (iptables/xtables)**; OpenWrt 22.03+ uses **fw4 (nftables)**. `portcullis` runs its **own** table/sets *alongside* the native firewall (non-invasive coexistence, ordered by hook priority `dstnat -50` / `filter -50`) — never editing the vendor's rules. This coexistence is the single biggest design risk (§18) and must be validated per firmware.
+- **Backend auto-detect handles the variance.** At boot the engine probes for nftables-NAT support: present → `NftJsonBackend` (`nft -j`); absent (e.g. stock RutOS lacks `CONFIG_NFT_NAT`) → `IpsetIptablesBackend` (ipset + iptables/ip6tables, runs on stock firmware). Both sit behind the `FirewallBackend` trait; the choice is config-overridable (`firewall_backend = auto|ipset|nft`) and advertised as a capability. `dnsmasq-full` (not slim dnsmasq) is required for the `ipset=`/`nftset=` walled garden.
+- Resource budget: < 30 MB RSS steady-state, binary < 15 MB — sized for the 256 MB RUTM11 low end, so roomier OpenWrt hardware has headroom.
 
 ## Commands (planned — workspace does not exist yet)
 
@@ -69,10 +72,10 @@ cargo test -p portcullis-session expiry          # single test by name filter
 # (veth pairs + fake clients), asserting: unauth->redirect, garden->allow,
 # authed->forward, expired->re-gate, revoked->drop.
 
-# Cross-compile for the router
-cargo build --release --target mipsel-unknown-linux-musl
+# Cross-compile for an OpenWrt target (pick the arch for your device)
+cargo build --release --target mipsel-unknown-linux-musl        # or mips- / armv7-...
 
-# Package as .ipk via the RutOS / OpenWrt SDK (ramips/mt7621 target)
+# CI cross-builds .ipk for all three arches (zig, no vendor SDK); or via an SDK:
 ./scripts/dockerbuild make pm                    # produces bin/packages/<arch>/*.ipk
 ```
 
