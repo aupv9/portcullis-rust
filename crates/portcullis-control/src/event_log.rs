@@ -12,6 +12,7 @@
 //! epoch and the CP resets its cursor from `GetEngineInfo`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use portcullis_types::SessionEvent;
@@ -31,6 +32,10 @@ pub struct EventLog {
     latest: watch::Sender<u64>,
     boot_id: String,
     capacity: usize,
+    /// Events evicted from the ring before any replay (`events_evicted_total`
+    /// in `GetMetrics`) — a rising value means the CP is falling behind the
+    /// replay window.
+    evicted: AtomicU64,
 }
 
 impl EventLog {
@@ -48,6 +53,7 @@ impl EventLog {
             latest: watch::Sender::new(0),
             boot_id,
             capacity: capacity.max(1),
+            evicted: AtomicU64::new(0),
         }
     }
 
@@ -65,6 +71,7 @@ impl EventLog {
             inner.buf.push_back((seq, event));
             while inner.buf.len() > self.capacity {
                 inner.buf.pop_front();
+                self.evicted.fetch_add(1, Ordering::Relaxed);
             }
             seq
         };
@@ -87,6 +94,11 @@ impl EventLog {
     /// Latest assigned seq (0 = nothing emitted this boot).
     pub fn latest_seq(&self) -> u64 {
         *self.latest.borrow()
+    }
+
+    /// Total events evicted from the ring this boot (`events_evicted_total`).
+    pub fn evicted_total(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
     }
 
     /// Watch the latest seq — tailing streams await changes on this.
@@ -132,6 +144,21 @@ mod tests {
         assert_eq!(log.oldest_seq(), 4); // 1..3 evicted
         let snap = log.snapshot_after(0);
         assert_eq!(snap.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![4, 5]);
+    }
+
+    #[test]
+    fn eviction_counter_tracks_ring_overflow() {
+        let log = EventLog::new(2);
+        assert_eq!(log.evicted_total(), 0);
+        for n in 1..=5u8 {
+            log.push(ev(n));
+        }
+        // Capacity 2, 5 pushed: seqs 1..3 fell off the ring.
+        assert_eq!(log.evicted_total(), 3);
+        // Pushes within capacity never count.
+        let roomy = EventLog::new(8);
+        roomy.push(ev(1));
+        assert_eq!(roomy.evicted_total(), 0);
     }
 
     #[test]

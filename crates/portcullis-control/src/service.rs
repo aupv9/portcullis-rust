@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use portcullis_types::{Enforcer, EventSink, SessionEvent};
+use portcullis_types::{Enforcer, EventSink, MetricsRegistry, SessionEvent};
 use tonic::{Request, Response, Status};
 
 use crate::convert;
@@ -49,6 +49,7 @@ pub struct EnforcementService {
     enforcer: Arc<dyn Enforcer>,
     events: Arc<EventLog>,
     capabilities: Arc<Vec<String>>,
+    metrics: Arc<MetricsRegistry>,
 }
 
 fn base_capabilities() -> Vec<String> {
@@ -68,6 +69,7 @@ impl EnforcementService {
             enforcer,
             events: log.clone(),
             capabilities: Arc::new(base_capabilities()),
+            metrics: Arc::new(MetricsRegistry::new()),
         };
         let sink = GrpcEventSink { log };
         (svc, sink)
@@ -87,18 +89,26 @@ impl EnforcementService {
     /// its `Enforcer`. So we mint the log + sink first ([`event_channel`]),
     /// hand the sink to the session layer, then assemble the service here from
     /// the same log. `capabilities` is what `GetEngineInfo` advertises — start
-    /// from [`BASE_CAPABILITIES`] and append conditional ones.
+    /// from [`BASE_CAPABILITIES`] and append conditional ones. `metrics` is the
+    /// daemon-wide counter registry `GetMetrics` reports (the same one the
+    /// session layer and redirect responder increment).
     pub fn from_parts(
         enforcer: Arc<dyn Enforcer>,
         events: Arc<EventLog>,
         capabilities: Vec<String>,
+        metrics: Arc<MetricsRegistry>,
     ) -> Self {
-        EnforcementService { enforcer, events, capabilities: Arc::new(capabilities) }
+        EnforcementService { enforcer, events, capabilities: Arc::new(capabilities), metrics }
     }
 
     /// The shared event log (used by tests and `GetEngineInfo`).
     pub fn event_log(&self) -> Arc<EventLog> {
         self.events.clone()
+    }
+
+    /// The metrics registry `GetMetrics` reads (used by tests).
+    pub fn metrics(&self) -> Arc<MetricsRegistry> {
+        self.metrics.clone()
     }
 }
 
@@ -261,6 +271,31 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
             tier_policies_hash: cs.tier_policies_hash,
             engine_params_hash: cs.engine_params_hash,
             garden_hash: cs.garden_hash,
+        }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::MetricsReply>, Status> {
+        // Assemble the reply from its owners: the shared registry (session +
+        // redirect counters), the enforcer (active-session gauge), the event
+        // log (emitted == latest seq, evicted), and the kernel (RSS).
+        let snap = self.metrics.snapshot();
+        let sessions_active = self.enforcer.active_sessions().await as u64;
+        Ok(Response::new(pb::MetricsReply {
+            sessions_active,
+            grants_total: snap.grants,
+            grant_failures_total: snap.grant_failures,
+            revokes_total: snap.revokes,
+            expires_total: snap.expires,
+            quota_kills_total: snap.quota_kills,
+            events_emitted_total: self.events.latest_seq(),
+            events_evicted_total: self.events.evicted_total(),
+            shaper_failures_total: snap.shaper_failures,
+            redirect_rejections_total: snap.redirect_rejections,
+            rss_bytes: portcullis_types::rss_bytes(),
+            uptime_secs: snap.uptime_secs,
         }))
     }
 
@@ -432,7 +467,7 @@ mod tests {
                 session_id: SessionId("s1".into()),
                 mac,
                 ip: None,
-                tier: portcullis_types::Tier::Public,
+                tier: portcullis_types::Tier::public(),
                 granted_at_unix: 1,
                 expires_in: Duration::from_secs(60),
                 quota_bytes: 0,
@@ -446,7 +481,7 @@ mod tests {
                 session_id: SessionId("s1".into()),
                 mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
                 ip: None,
-                tier: portcullis_types::Tier::Public,
+                tier: portcullis_types::Tier::public(),
                 granted_at_unix: 1,
                 expires_in: Duration::from_secs(60),
                 quota_bytes: 0,
@@ -457,6 +492,10 @@ mod tests {
         }
         async fn health(&self) -> HealthStatus {
             HealthStatus { backend_ok: true, ..Default::default() }
+        }
+        async fn active_sessions(&self) -> usize {
+            // Fixed gauge value so get_metrics assertions are unambiguous.
+            3
         }
         async fn set_enforcement(&self, _enabled: bool) -> PResult<()> {
             if self.fail {
@@ -618,13 +657,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_tier_policies_invalid_tier_rejected_before_enforcer() {
+    async fn set_tier_policies_novel_tier_accepted() {
+        // Tiers are data-driven now: a well-formed but previously-unknown name
+        // like "platinum" is accepted (the control plane owns the tier set).
+        let enf = MockEnforcer::ok();
+        let (svc, _sink) = EnforcementService::with_default_buffer(enf.clone());
+        let ack = svc
+            .set_tier_policies(Request::new(pb::SetTierPoliciesRequest {
+                policies: vec![pb::TierPolicy {
+                    tier: "platinum".into(),
+                    ttl_seconds: 0,
+                    quota_bytes: 0,
+                    rate_bps: 0,
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok);
+        assert_eq!(enf.tier_pushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn set_tier_policies_malformed_tier_rejected_before_enforcer() {
+        // A malformed name (bad charset) is still rejected at the wire boundary.
         let enf = MockEnforcer::ok();
         let (svc, _sink) = EnforcementService::with_default_buffer(enf.clone());
         let status = svc
             .set_tier_policies(Request::new(pb::SetTierPoliciesRequest {
                 policies: vec![pb::TierPolicy {
-                    tier: "platinum".into(),
+                    tier: "plat!num".into(),
                     ttl_seconds: 0,
                     quota_bytes: 0,
                     rate_bps: 0,
@@ -811,6 +873,47 @@ mod tests {
         let mut stream = resp.into_inner();
         // Cursor 3 was evicted: the first item jumps to 9 — the client's gap signal.
         assert_eq!(stream.next().await.unwrap().unwrap().seq, 9);
+    }
+
+    #[tokio::test]
+    async fn get_metrics_assembles_registry_gauge_and_event_log() {
+        // Capacity 2 so pushing 3 events evicts one (events_evicted_total).
+        let (svc, sink) = EnforcementService::new(MockEnforcer::ok(), 2);
+        for n in 1..=3u8 {
+            sink.emit(sample_event(n, EventKind::Interim)).await;
+        }
+        svc.metrics().inc_grants();
+        svc.metrics().inc_grants();
+        svc.metrics().inc_grant_failures();
+        svc.metrics().inc_revokes();
+        svc.metrics().inc_expires();
+        svc.metrics().inc_quota_kills();
+        svc.metrics().inc_shaper_failures();
+        svc.metrics().inc_redirect_rejections();
+
+        let m = svc
+            .get_metrics(Request::new(pb::Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(m.sessions_active, 3, "MockEnforcer gauge");
+        assert_eq!(m.grants_total, 2);
+        assert_eq!(m.grant_failures_total, 1);
+        assert_eq!(m.revokes_total, 1);
+        assert_eq!(m.expires_total, 1);
+        assert_eq!(m.quota_kills_total, 1);
+        assert_eq!(m.events_emitted_total, 3);
+        assert_eq!(m.events_evicted_total, 1);
+        assert_eq!(m.shaper_failures_total, 1);
+        assert_eq!(m.redirect_rejections_total, 1);
+        // rss_bytes: >0 on Linux, 0 on other dev hosts (see types::rss_bytes).
+        if cfg!(target_os = "linux") {
+            assert!(m.rss_bytes > 0);
+        } else {
+            assert_eq!(m.rss_bytes, 0);
+        }
+        // uptime is measured from registry creation — just sanity-bound it.
+        assert!(m.uptime_secs < 60);
     }
 
     #[tokio::test]

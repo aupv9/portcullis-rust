@@ -99,6 +99,12 @@ pub struct Config {
     /// towards clients).
     #[serde(default = "default_shape_interface")]
     pub shape_interface: String,
+
+    /// Firewall backend selection: `"auto"` (default — probe for kernel nft
+    /// NAT support, fall back to ipset), `"nft"` (force `NftJsonBackend`), or
+    /// `"ipset"` (force `IpsetIptablesBackend`, the stock-RutOS path).
+    #[serde(default = "default_firewall_backend")]
+    pub firewall_backend: String,
 }
 
 /// Serde default for [`Config::enforcement_default`]: boot fail-closed.
@@ -123,6 +129,9 @@ fn default_event_buffer() -> u32 {
 fn default_shape_interface() -> String {
     "br-lan".to_string()
 }
+fn default_firewall_backend() -> String {
+    "auto".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -145,6 +154,7 @@ impl Default for Config {
             event_buffer_size: 4096,
             shaper_enabled: false,
             shape_interface: "br-lan".to_string(),
+            firewall_backend: "auto".to_string(),
         }
     }
 }
@@ -312,6 +322,12 @@ impl Config {
                 "shape_interface must not be empty when shaper_enabled".to_string(),
             ));
         }
+        if !matches!(self.firewall_backend.as_str(), "auto" | "ipset" | "nft") {
+            return Err(Error::Config(format!(
+                "firewall_backend must be one of auto|ipset|nft, got '{}'",
+                self.firewall_backend
+            )));
+        }
         Ok(())
     }
 }
@@ -360,6 +376,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "event_buffer_size" => cfg.event_buffer_size = parse_u32(val)?,
         "shaper_enabled" => cfg.shaper_enabled = parse_bool(val)?,
         "shape_interface" => cfg.shape_interface = val.to_string(),
+        "firewall_backend" => cfg.firewall_backend = val.to_string(),
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -469,7 +486,10 @@ pub fn diff(old: &Config, new: &Config) -> ReloadImpact {
         || old.redirect_rl_max_keys != new.redirect_rl_max_keys
         || old.event_buffer_size != new.event_buffer_size
         || old.shaper_enabled != new.shaper_enabled
-        || old.shape_interface != new.shape_interface;
+        || old.shape_interface != new.shape_interface
+        // The backend is selected once at composition (before the writer actor
+        // spawns); switching it means rebuilding the kernel ruleset.
+        || old.firewall_backend != new.firewall_backend;
 
     if requires_restart {
         ReloadImpact::RequiresRestart
@@ -633,6 +653,44 @@ default_rate_kbps = 2048
     }
 
     #[test]
+    fn firewall_backend_parses_defaults_and_validates() {
+        // Absent (pre-0.5 config files, UCI and TOML): defaults to "auto".
+        let old = Config::from_uci_str("config portcullis 'main'\n    option store_id 'S'\n").unwrap();
+        assert_eq!(old.firewall_backend, "auto");
+        assert_eq!(Config::default().firewall_backend, "auto");
+
+        // Explicit UCI option parses.
+        let uci = "config portcullis 'main'\n    option store_id 'S'\n    option firewall_backend 'nft'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert_eq!(cfg.firewall_backend, "nft");
+        cfg.validate().unwrap();
+
+        // Every allowed value validates; anything else is rejected.
+        for ok in ["auto", "ipset", "nft"] {
+            let cfg = Config {
+                store_id: "S".into(),
+                firewall_backend: ok.into(),
+                ..Config::default()
+            };
+            cfg.validate().unwrap();
+        }
+        let bad = Config {
+            store_id: "S".into(),
+            firewall_backend: "iptables".into(),
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn diff_firewall_backend_requires_restart() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.firewall_backend = "nft".to_string();
+        assert_eq!(diff(&old, &new), ReloadImpact::RequiresRestart);
+    }
+
+    #[test]
     fn toml_roundtrip_equals_original() {
         let original = Config {
             store_id: "SITE-0042".to_string(),
@@ -657,6 +715,7 @@ default_rate_kbps = 2048
             event_buffer_size: 4096,
             shaper_enabled: true,
             shape_interface: "br-lan".to_string(),
+            firewall_backend: "auto".to_string(),
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
