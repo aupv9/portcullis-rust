@@ -9,6 +9,10 @@ plane over the `Attach` bidi stream (Phases 0–5 landed: proto, config, control
 transport + `channel.rs` driver, engined rewiring, deploy/docs). Phase 6 (netns
 E2E against a mock CP server) and the Go control-plane rewrite remain.
 
+The **system-level** CP+edge redesign this transport implies (CP as server,
+connection registry, cross-replica command routing, reconcile, events→RADIUS) is
+specified in [`control-plane-edge-architecture.md`](./control-plane-edge-architecture.md).
+
 ---
 
 ## 1. Problem
