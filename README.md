@@ -10,7 +10,7 @@
 ![status](https://img.shields.io/badge/status-alpha-orange)
 ![rust](https://img.shields.io/badge/rust-1.96%2B-blue?logo=rust)
 ![edition](https://img.shields.io/badge/edition-2021-blue)
-![tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-165%20passing-brightgreen)
 ![clippy](https://img.shields.io/badge/clippy-D%20warnings%20clean-brightgreen)
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
 ![binary](https://img.shields.io/badge/binary-~2.4MB-informational)
@@ -100,7 +100,7 @@ crates/
   ↪️ portcullis-redirect     :8080 HMAC-signed 302 responder + neigh MAC lookup
   🌳 portcullis-garden       dnsmasq nftset render + reconcile
   📊 portcullis-accounting   conntrack metering loop + quota trigger + tc shaper
-  🔌 portcullis-control      tonic gRPC Enforcement server + mTLS + event fan-out
+  🔌 portcullis-control      tonic gRPC client: dials CP over mTLS bidi stream (CGNAT-safe) + event fan-out
   ⚙️ portcullis-config       UCI/TOML config: load, validate, hot-reload diff
   🚀 portcullis-engined      composition root: runtime, signals, adoption, shutdown
 proto/enforcement.proto      contract shared with the Go control plane
@@ -183,7 +183,7 @@ On start: `ensure_base` (idempotent) → `list_auth` from the kernel → `adopt`
 ```bash
 # Build & test the whole workspace
 cargo build --workspace
-cargo test  --workspace          # 130 tests
+cargo test  --workspace          # 165 tests
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Run a single crate's tests
@@ -209,18 +209,22 @@ Runtime dependencies on-device: `kmod-nft-*` + `nftables` userspace and `dnsmasq
 
 ## 📡 gRPC API — `wifihub.enforcement.v1`
 
-The engine is the **server**; the Go control plane is the client. See [`proto/enforcement.proto`](./proto/enforcement.proto).
+Sites sit behind **CGNAT**, so the router has no inbound reachability. The **engine is the gRPC client**: it dials the control plane over mutual TLS and holds one long-lived bidirectional stream, `Attach`. Commands travel CP → engine; events, acks and health travel engine → CP. See [`proto/enforcement.proto`](./proto/enforcement.proto) and [`docs/design/cgnat-bidi-control-channel.md`](./docs/design/cgnat-bidi-control-channel.md).
 
-| RPC | Direction | Purpose |
+```
+rpc Attach (stream EngineFrame) returns (stream ControlFrame)   // production path
+```
+
+| Frame | Direction | Carries |
 |---|---|---|
-| `GrantSession(GrantRequest) → GrantReply` | CP → engine | Authorize a client (mac, ttl, quota, rate, tier) |
-| `RevokeSession(RevokeRequest) → Ack` | CP → engine | Admin/fraud/quota revoke |
-| `GetSession(Key) → SessionInfo` | CP → engine | Look up one session |
-| `ListSessions(ListRequest) → stream SessionInfo` | CP → engine | Snapshot all sessions |
-| `StreamEvents(StreamReq) → stream SessionEvent` | **engine → CP** | GRANTED / INTERIM / EXPIRED / REVOKED / QUOTA_EXCEEDED |
-| `Health(Empty) → HealthReply` | CP → engine | backend / kernel-table / cp-connected / reconcile flags |
+| `ControlFrame` | CP → engine | `Grant` / `Revoke` / `Get` / `List` / `Ping` (each with a `correlation_id`) |
+| `EngineFrame` | engine → CP | `Hello` (reconnect snapshot) · `SessionEvent` · `CommandAck` · `SessionInfo` · `ListEnd` · `HealthReply` |
 
-> 🔒 The engine **never speaks RADIUS** — it emits `SessionEvent`s; the control plane (NAS-of-record) translates them to RADIUS Accounting.
+On (re)connect the engine sends `Hello` with a snapshot of its currently-authorized sessions so the control plane can reconcile against kernel truth. Each command's reply echoes its `correlation_id`; a validation/enforcer failure returns `CommandAck { ok: false }` — never a silent accept. `SessionEvent` kinds: `GRANTED` / `INTERIM` / `EXPIRED` / `REVOKED` / `QUOTA_EXCEEDED`.
+
+The same messages are also exposed as **unary RPCs** (`GrantSession`, `RevokeSession`, `GetSession`, `ListSessions`, `StreamEvents`, `Health`) — retained for **on-net / dev / integration** use where the control plane can reach the engine directly. They are not used behind CGNAT.
+
+> 🔒 The engine **never speaks RADIUS** — it emits `SessionEvent`s; the control plane (NAS-of-record) translates them to RADIUS Accounting. The router exposes **no inbound port**; its only listener is the LAN-only `:8080` redirect responder.
 
 ---
 
@@ -287,16 +291,16 @@ Techniques: size-first release profile (`opt-level="z"`, LTO, `codegen-units=1`,
 ## 🧪 Testing
 
 ```bash
-cargo test --workspace          # 130 unit tests across 9 crates
+cargo test --workspace          # 165 unit tests across 9 crates
 ```
 
 | Crate | Tests | | Crate | Tests |
 |---|---|---|---|---|
-| types | 7 | | garden | 9 |
-| config | 16 | | accounting | 9 |
-| nft | 21 | | control | 26 |
-| session | 11 | | engined | 1 |
-| redirect | 30 | | **total** | **130** |
+| types | 10 | | garden | 9 |
+| config | 19 | | accounting | 9 |
+| nft | 21 | | control | 43 |
+| session | 18 | | engined | 3 |
+| redirect | 33 | | **total** | **165** |
 
 - **Unit:** pure domain (`session`, `redirect` HMAC/parse) + `nft` against a `MockBackend`.
 - **Integration (planned):** Linux netns harness asserts verdicts (unauth→redirect, garden→allow, authed→forward, expired→re-gate, revoked→drop) + fault injection (kill -9 → adoption, CP loss → fail-closed). See [`.claude/skills/netns-harness`](./.claude/skills/netns-harness).
