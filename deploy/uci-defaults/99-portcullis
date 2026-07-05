@@ -4,8 +4,9 @@
 #
 # What it sets up that the package install can't: the dedicated daemon user, the
 # tmpfs state dir, the dnsmasq-full garden nftset wiring, and a placeholder
-# secrets dir. Per-store identity (store_id, endpoint, HMAC/WG keys) is injected
-# by the fleet provisioning pipeline, NOT baked into the image (§13).
+# secrets dir. Per-store identity (store_id, endpoint, HMAC key, mTLS client
+# cert/key + pinned CP server CA) is injected by the fleet provisioning
+# pipeline, NOT baked into the image (§13).
 
 set -e
 

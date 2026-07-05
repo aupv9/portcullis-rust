@@ -35,7 +35,7 @@ Assert the **HMAC** on the 302 (`HMAC-SHA256(key, "<mac>|<store_id>|<ts>")`) and
 ## Fault injection (§15) — the no-fail-open guarantees
 
 - **`kill -9` the daemon mid-session** → restart → assert it *adopts* kernel `@auth` (no client dropped), rebuilds in-RAM sessions, and **re-baselines accounting from current conntrack counters** (totals not corrupted, not reset to zero).
-- **Sever the control-plane link** (drop the gRPC/WG path) → assert existing sessions keep being enforced, `SessionEvent`s queue in bounded RAM, new grants are blocked (fail-closed for *new* access), reconnect with backoff.
+- **Sever the control-plane link** (kill the mock CP server the engine dials) → assert existing sessions keep being enforced, `SessionEvent`s queue in bounded RAM, new grants are blocked (fail-closed for *new* access), engine reconnects with backoff and re-sends its `Hello` snapshot.
 - **Corrupt an nft transaction** → assert retry-once then degraded-mode; assert the ruleset is **not** flushed and nothing fails open.
 - **Router-reboot analogue** (flush the ns ruleset + conntrack) → all sessions end, clients re-auth — acceptable, no persistence expected.
 

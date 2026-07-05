@@ -3,12 +3,18 @@
 # provisioning pipeline / first-boot bootstrap (uci-defaults/99-portcullis).
 #
 # Hot-reloadable: garden_fqdn, tier defaults, accounting_interval.
-# Requires restart: control_endpoint, wg_interface, hmac_key_file, responder_port.
+# Requires restart: control_endpoint, cp_server_ca_file, cp_server_name,
+#                   hmac_key_file, responder_port.
+#
+# The engine DIALS control_endpoint outbound (the router is behind CGNAT), so
+# no inbound port is exposed. It presents /etc/portcullis/tls/client.{crt,key}
+# and verifies the control plane against cp_server_ca_file.
 
 config portcullis 'main'
 	option store_id            'SITE-0000'
 	option control_endpoint    'https://cp.wifihub.internal:8443'
-	option wg_interface        'wg-hub'
+	option cp_server_ca_file   '/etc/portcullis/tls/cp-ca.crt'
+	option cp_server_name      'cp.wifihub.internal'
 	option hmac_key_file       '/etc/portcullis/hmac.key'
 	option responder_port      '8080'
 	option accounting_interval '15'

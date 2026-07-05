@@ -52,7 +52,7 @@ flowchart LR
   end
   R -->|"WAN / cellular (authed traffic breaks out locally)"| NET["🌍 Internet"]
   C -. "unauth :80 → REDIRECT" .-> RESP
-  ENG <-->|"WG overlay: control + accounting only<br/>gRPC / mTLS"| CP
+  ENG <-->|"engine dials out (CGNAT)<br/>gRPC / mTLS bidi stream<br/>control + accounting only"| CP
 
   subgraph CPlane["☁️ Control plane (central)"]
     CP["Go control plane<br/>NAS-of-record"]
@@ -64,7 +64,7 @@ flowchart LR
   PORTAL["🖥️ Next.js portal<br/>ad slots A/B/C/D"] --> CP
 ```
 
-Client **data** breaks out locally at the store's WAN. The WireGuard overlay carries **control + accounting only** — never client traffic. Identity is the client **MAC** (visible at L2 locally), not IP.
+Client **data** breaks out locally at the store's WAN. The engine dials the control plane outbound over an mTLS gRPC stream (the router is behind CGNAT, so it cannot be reached inbound) carrying **control + accounting only** — never client traffic. Identity is the client **MAC** (visible at L2 locally), not IP.
 
 ---
 
@@ -78,7 +78,7 @@ Client **data** breaks out locally at the store's WAN. The WireGuard overlay car
 | ⏱️ | **Dual-path expiry** — kernel set-element `timeout` + daemon sweep | ✅ |
 | 📊 | **Accounting** — per-session bytes from conntrack (correct under NAT), 15 s interims | ✅ |
 | 🎯 | **Quota enforcement** — revoke + `QUOTA_EXCEEDED` when bytes exceed quota | ✅ |
-| 🔌 | **gRPC control** — `Enforcement` service over **mutual TLS** on WireGuard | ✅ |
+| 🔌 | **gRPC control** — engine dials the control plane over an **mTLS** bidirectional stream (CGNAT-safe, no inbound port) | ✅ |
 | 📡 | **Event stream** — engine → control plane lifecycle events (bounded fan-out) | ✅ |
 | ♻️ | **Restart adoption** — rebuild session view from the kernel; no client dropped | ✅ |
 | 🛡️ | **Fail-closed everywhere** — no error path ever fails open | ✅ |
@@ -231,23 +231,26 @@ Sourced from UCI (`/etc/config/portcullis`) or TOML; loaded & validated at start
 | Option | Example | Hot-reload? |
 |---|---|---|
 | `store_id` | `SITE-0042` | restart |
-| `control_endpoint` | `https://cp.wifihub.internal:8443` | restart |
-| `wg_interface` | `wg-hub` | restart |
+| `control_endpoint` | `https://cp.wifihub.internal:8443` (dialed outbound) | restart |
+| `cp_server_ca_file` | `/etc/portcullis/tls/cp-ca.crt` | restart |
+| `cp_server_name` | `cp.wifihub.internal` | restart |
 | `hmac_key_file` | `/etc/portcullis/hmac.key` | restart |
 | `responder_port` | `8080` | restart |
+| `control_keepalive_secs` | `20` | restart |
+| `control_reconnect_max_secs` | `60` | restart |
 | `accounting_interval` | `15` (s) | ✅ hot |
 | `default_ttl` | `1800` (s) | ✅ hot |
 | `default_quota_mb` | `0` (0 = unlimited) | ✅ hot |
 | `default_rate_kbps` | `2048` | ✅ hot |
 | `garden_fqdn` | `portal.wifihub.vn` (list) | ✅ hot |
 
-mTLS material is provisioned separately at `/etc/portcullis/tls/` (`server.crt`, `server.key`, `client-ca.crt`) — never baked into the package.
+mTLS material is provisioned separately at `/etc/portcullis/tls/` — the engine's client identity (`client.crt`, `client.key`) plus the pinned control-plane server CA (`cp-ca.crt`) — never baked into the package.
 
 ---
 
 ## 🔐 Security model
 
-- **mTLS is the gate.** The gRPC server requires a client cert chaining to the control-plane CA (`client_ca_root`); WireGuard is defence-in-depth, not the only gate. No client CA → the server refuses to start (no anonymous fallback).
+- **mTLS is the gate.** The engine dials the control plane presenting its per-store **client** cert and verifies the control plane's **server** cert against a pinned CA (`cp_server_ca_file`); with no CA it refuses to dial (no anonymous fallback). The control plane must bind the client cert identity to the `store_id` so one store cannot impersonate another. The router exposes **no inbound port** — its only listener is the LAN-only `:8080` redirect responder.
 - **Router-signed identity.** The `:8080` responder signs `HMAC-SHA256(key, "mac|store|ts")`; the portal trusts `mac`/`store` only because the signature validates. The key never reaches the client; verification is constant-time.
 - **Hardened attack surface.** The redirect responder reads only the kernel source IP (never client query/body), parses totally and panic-free (cf. openNDS CVE-2023-38314), with per-source rate limiting and a bounded request body.
 - **Least privilege.** Runs as a dedicated non-root user with `CAP_NET_ADMIN` only; subprocess args are engine-constructed, never client-interpolated.

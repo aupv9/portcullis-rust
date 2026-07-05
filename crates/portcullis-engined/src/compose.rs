@@ -22,9 +22,6 @@ use crate::{wire, DEFAULT_PORTAL_URL, GARDEN_CONF_PATH, TLS_DIR};
 const EXPIRY_TICK: Duration = Duration::from_secs(1);
 /// Walled-garden reconcile cadence.
 const GARDEN_TICK: Duration = Duration::from_secs(30);
-/// Control-plane liveness poll cadence (drives the `cp_connected` flag + the
-/// `cp_disconnects_total` metric).
-const CP_POLL_TICK: Duration = Duration::from_secs(10);
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // 0. Metrics recorder (§12). Created first so it can be injected into the nft
@@ -54,7 +51,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Vec::new()
     });
 
-    // 2-4. Domain core: event channel + sink, SessionManager, gRPC service.
+    // 2-4. Domain core: event channel + sink, SessionManager. The engine is the
+    //    control-plane CLIENT (CGNAT: it cannot accept inbound), so no gRPC
+    //    server is assembled here — the outbound channel task (step 5) dispatches
+    //    inbound commands straight to `w.mgr` as the `Enforcer`.
     let w = wire(writer.clone());
     let adopted_n = w.mgr.adopt(adopted, Instant::now());
     tracing::info!(adopted = adopted_n, "restart adoption complete");
@@ -63,35 +63,46 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // initial view is consistent; the periodic reconcile loop refreshes these.
     w.mgr.mark_reconcile(true, true);
 
-    let svc = portcullis_control::EnforcementService::from_parts(
-        w.mgr.clone() as Arc<dyn Enforcer>,
-        w.event_tx.clone(),
-    );
-
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // 5. gRPC control server over mutual TLS (§13). Bind only on the WG overlay
-    //    address in production; here we bind the configured endpoint's port.
-    match load_tls() {
+    // 5. Outbound control channel over mutual TLS (§13, CGNAT design doc). The
+    //    engine dials the control plane and holds a long-lived bidirectional
+    //    stream: commands arrive on it, events/acks are pushed back. It
+    //    reconnects with backoff and sets the `cp_connected` health flag.
+    match load_client_tls(&cfg) {
         Ok(Some(tls)) => {
-            let addr = grpc_listen_addr(&cfg);
+            let chan_cfg = portcullis_control::ControlChannelConfig {
+                endpoint: cfg.control_endpoint.clone(),
+                tls,
+                store_id: cfg.store_id.clone(),
+                keepalive: Duration::from_secs(cfg.control_keepalive_secs.max(1)),
+                reconnect_max: Duration::from_secs(cfg.control_reconnect_max_secs.max(1)),
+            };
+            let enforcer = w.mgr.clone() as Arc<dyn Enforcer>;
+            let events = w.event_tx.clone();
+            let mgr = w.mgr.clone();
+            let m = metrics.clone();
             tasks.push(tokio::spawn(async move {
-                tracing::info!(%addr, "gRPC Enforcement server (mTLS) listening");
-                if let Err(e) = portcullis_control::serve(addr, svc, tls).await {
-                    tracing::error!(error = %e, "gRPC server exited");
-                }
+                tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, move |up| {
+                    mgr.set_cp_connected(up);
+                    if !up {
+                        m.incr(Metric::CpDisconnect);
+                    }
+                })
+                .await;
             }));
         }
         Ok(None) => {
-            // No cert material yet (pre-provisioning). Do NOT serve an
-            // unauthenticated control plane — fail closed: existing sessions
-            // keep being enforced, but no new grants are accepted (§11, §13).
+            // No cert material yet (pre-provisioning). Do NOT dial without a
+            // client identity / pinned CP CA — fail closed: existing sessions
+            // keep being enforced, but no new grants can arrive (§11, §13).
             tracing::warn!(
                 dir = TLS_DIR,
-                "mTLS material absent; control plane disabled (no new grants)"
+                "mTLS material absent; control channel disabled (no new grants)"
             );
         }
-        Err(e) => return Err(e).context("load mTLS material"),
+        Err(e) => return Err(e).context("load mTLS client material"),
     }
 
     // 6. :8080 redirect responder (§7.2). Reads the per-store HMAC key.
@@ -163,62 +174,45 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }));
     }
 
-    // 9b. Drift reconciliation (§7.8) + control-plane liveness poll (§12), folded
-    //     into one task to keep the task/stack count low (embedded-perf).
+    // 9b. Drift reconciliation against the kernel `auth` set (§7.8). The
+    //     `cp_connected` flag + disconnect metric are driven by the control
+    //     channel task (step 5), not polled here.
     {
         let mgr = w.mgr.clone();
         let writer = writer.clone();
-        let sink = w.grpc_sink.clone();
-        let m = metrics.clone();
         let reconcile_interval = Duration::from_secs(cfg.reconcile_interval.max(5));
         tasks.push(tokio::spawn(async move {
             let mut recon = tokio::time::interval(reconcile_interval);
             recon.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut poll = tokio::time::interval(CP_POLL_TICK);
-            let mut cp_up = false;
             loop {
-                tokio::select! {
-                    _ = recon.tick() => {
-                        match writer.list_auth().await {
-                            Ok(kernel) => {
-                                let report = mgr
-                                    .reconcile_at(kernel, UnknownKernelPolicy::default(), Instant::now())
-                                    .await;
-                                mgr.mark_reconcile(report.ok(), true);
-                                if report.repaired() || !report.ok() {
-                                    tracing::info!(
-                                        readded = report.readded,
-                                        adopted = report.adopted,
-                                        deleted = report.deleted,
-                                        errors = report.errors,
-                                        "reconcile pass repaired drift"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "reconcile: list_auth failed");
-                                mgr.mark_reconcile(false, false);
-                            }
+                recon.tick().await;
+                match writer.list_auth().await {
+                    Ok(kernel) => {
+                        let report = mgr
+                            .reconcile_at(kernel, UnknownKernelPolicy::default(), Instant::now())
+                            .await;
+                        mgr.mark_reconcile(report.ok(), true);
+                        if report.repaired() || !report.ok() {
+                            tracing::info!(
+                                readded = report.readded,
+                                adopted = report.adopted,
+                                deleted = report.deleted,
+                                errors = report.errors,
+                                "reconcile pass repaired drift"
+                            );
                         }
                     }
-                    _ = poll.tick() => {
-                        // A live StreamEvents subscriber == the control plane is connected.
-                        let up = sink.subscriber_count() > 0;
-                        if up != cp_up {
-                            if !up {
-                                m.incr(Metric::CpDisconnect);
-                            }
-                            cp_up = up;
-                            mgr.set_cp_connected(up);
-                        }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "reconcile: list_auth failed");
+                        mgr.mark_reconcile(false, false);
                     }
                 }
             }
         }));
     }
 
-    // 9c. Prometheus /metrics endpoint (§12), bound on the WG address. Disabled
-    //     when metrics_port == 0.
+    // 9c. Prometheus /metrics endpoint (§12), bound on loopback (no overlay to
+    //     scrape over now). Disabled when metrics_port == 0.
     if cfg.metrics_port != 0 {
         let addr = metrics_listen_addr(&cfg);
         let m = metrics.clone();
@@ -243,42 +237,31 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the gRPC listen address from the control endpoint's port (the host
-/// part is the WG interface address in production; we bind all interfaces and
-/// rely on mTLS + the WG network, §13).
-fn grpc_listen_addr(cfg: &Config) -> std::net::SocketAddr {
-    let port = cfg
-        .control_endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8443);
-    std::net::SocketAddr::from(([0, 0, 0, 0], port))
-}
-
-/// Metrics endpoint listen address. Bound on all interfaces; in production the
-/// WG address is used so it is only reachable over the overlay (same trust
-/// boundary as gRPC, §12/§13).
+/// Metrics endpoint listen address, bound on **loopback**: without the WireGuard
+/// overlay there is no private network to expose it on, and the endpoint is
+/// unauthenticated (§12). Local scrape only.
 fn metrics_listen_addr(cfg: &Config) -> std::net::SocketAddr {
-    std::net::SocketAddr::from(([0, 0, 0, 0], cfg.metrics_port))
+    std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port))
 }
 
-/// Load the engine's server identity + the control-plane client CA from
-/// [`TLS_DIR`]. Returns `Ok(None)` if the material isn't present yet (the
-/// daemon then runs without the control plane rather than failing open).
-fn load_tls() -> anyhow::Result<Option<tonic::transport::ServerTlsConfig>> {
+/// Load the engine's **client** identity + the pinned control-plane **server**
+/// CA from [`TLS_DIR`] and build the mutual-TLS client config used to dial the
+/// control plane. Returns `Ok(None)` if the material isn't present yet (the
+/// daemon then runs without the control channel rather than failing open).
+fn load_client_tls(cfg: &Config) -> anyhow::Result<Option<tonic::transport::ClientTlsConfig>> {
     let dir = std::path::Path::new(TLS_DIR);
-    let cert_p = dir.join("server.crt");
-    let key_p = dir.join("server.key");
-    let ca_p = dir.join("client-ca.crt");
+    let cert_p = dir.join("client.crt");
+    let key_p = dir.join("client.key");
+    let ca_p = std::path::PathBuf::from(&cfg.cp_server_ca_file);
     if !cert_p.exists() || !key_p.exists() || !ca_p.exists() {
         return Ok(None);
     }
-    let cert = std::fs::read(&cert_p).context("read server.crt")?;
-    let key = std::fs::read(&key_p).context("read server.key")?;
-    let ca = std::fs::read(&ca_p).context("read client-ca.crt")?;
-    let tls = portcullis_control::tls_config(&cert, &key, &ca)
-        .map_err(|e| anyhow::anyhow!("build mTLS config: {e}"))?;
+    let cert = std::fs::read(&cert_p).context("read client.crt")?;
+    let key = std::fs::read(&key_p).context("read client.key")?;
+    let ca = std::fs::read(&ca_p)
+        .with_context(|| format!("read CP server CA {}", ca_p.display()))?;
+    let tls = portcullis_control::client_tls_config(&cert, &key, &ca, &cfg.cp_server_name)
+        .map_err(|e| anyhow::anyhow!("build mTLS client config: {e}"))?;
     Ok(Some(tls))
 }
 

@@ -4,16 +4,87 @@ syntax = "proto3";
 // Wire-compat rule: never renumber/retype/reuse a field tag; only add new tags.
 package wifihub.enforcement.v1;
 
-// Engine-side gRPC service. The Go control plane is the client; it also consumes
-// a server-stream of SessionEvents. Transport is gRPC/tonic over the WireGuard
-// overlay, mutually authenticated (mTLS). The engine NEVER speaks RADIUS.
+// Enforcement contract. Mutually authenticated with mTLS; the engine NEVER
+// speaks RADIUS.
+//
+// ## Connection direction (CGNAT)
+// Sites sit behind carrier-grade NAT and have no inbound reachability, so the
+// **engine is the gRPC client**: it dials the control plane and holds a single
+// long-lived bidirectional stream (`Attach`). Commands (grant/revoke/get/list)
+// travel control-plane -> engine as `ControlFrame`s; events, acks and health
+// travel engine -> control-plane as `EngineFrame`s.
+//
+// (The stream is named `Attach`, not `Connect`, because a `Connect` rpc collides
+// with the tonic client's generated `connect` constructor.)
+//
+// The unary RPCs below are retained for on-net / dev / integration use where the
+// control plane can reach the engine directly; they are not used behind CGNAT.
 service Enforcement {
+  // Production path (engine dials): one bidirectional stream carries everything.
+  rpc Attach (stream EngineFrame) returns (stream ControlFrame);
+
+  // On-net / dev only (control plane dials the engine).
   rpc GrantSession (GrantRequest) returns (GrantReply);
   rpc RevokeSession(RevokeRequest) returns (Ack);
   rpc GetSession   (Key)          returns (SessionInfo);
   rpc ListSessions (ListRequest)  returns (stream SessionInfo);
   rpc StreamEvents (StreamReq)    returns (stream SessionEvent); // engine -> control plane
   rpc Health       (Empty)        returns (HealthReply);
+}
+
+// ---------------------------------------------------------------------------
+// Bidirectional control channel (engine dials the control plane).
+// ---------------------------------------------------------------------------
+
+// engine -> control plane. `correlation_id` echoes the id of the ControlFrame
+// this frame answers (0 for unsolicited frames: hello, events, health).
+message EngineFrame {
+  uint64 correlation_id = 1;
+  oneof msg {
+    Hello        hello    = 2; // first frame after Connect
+    SessionEvent event    = 3; // lifecycle/accounting (was StreamEvents)
+    CommandAck   ack      = 4; // terminal reply to grant/revoke
+    SessionInfo  session  = 5; // a row answering get/list
+    ListEnd      list_end = 6; // terminates a get/list response
+    HealthReply  health   = 7; // reply to a Ping, or periodic
+  }
+}
+
+// control plane -> engine. `correlation_id` is echoed back in the answering
+// EngineFrame(s) so overlapping requests can be matched.
+message ControlFrame {
+  uint64 correlation_id = 1;
+  oneof msg {
+    GrantRequest  grant  = 2;
+    RevokeRequest revoke = 3;
+    Key           get    = 4;
+    ListRequest   list   = 5;
+    Ping          ping   = 6; // heartbeat; engine replies with a HealthReply
+  }
+}
+
+// Sent once by the engine as the first frame after Connect. Lets the control
+// plane reconcile (adopt/repair) against the engine's currently-authorized
+// sessions — the kernel-as-truth adoption path (§7.8) carried over the wire.
+message Hello {
+  string store_id            = 1; // informational — identity is bound to the client cert
+  string engine_version      = 2;
+  repeated SessionInfo active = 3;
+}
+
+message CommandAck {
+  bool   ok         = 1;
+  string message    = 2; // error detail when !ok
+  string session_id = 3; // set for a successful grant
+}
+
+message ListEnd {
+  bool   ok      = 1;
+  string message = 2;
+}
+
+message Ping {
+  int64 ts_unix = 1;
 }
 
 message GrantRequest {

@@ -40,8 +40,8 @@ endef
 define Package/portcullis/description
   portcullis holds the internet gate shut until the WiFi Hub control plane
   authorizes a client, then enforces, meters, and expires that grant. Owns one
-  nftables table (inet wifihub); speaks gRPC/mTLS to the control plane over
-  WireGuard. RAM-only state; CAP_NET_ADMIN, non-root.
+  nftables table (inet wifihub); dials the control plane outbound over an
+  mTLS gRPC stream (CGNAT-safe). RAM-only state; CAP_NET_ADMIN, non-root.
 endef
 
 # Copy the workspace into the build dir (deploy/.. == repo root).
