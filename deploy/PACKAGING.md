@@ -166,10 +166,12 @@ The package ships **no secrets and no per-site identity** — provision them aft
 install (the fleet pipeline does this automatically; here are the manual steps):
 
 ```sh
-# 7a. Identity + control endpoint
+# 7a. Identity + control endpoint (the engine DIALS this outbound — CGNAT-safe,
+#     no inbound port is exposed on the router).
 uci set portcullis.main.store_id='SITE-0042'
 uci set portcullis.main.control_endpoint='https://cp.example.internal:8443'
-uci set portcullis.main.wg_interface='wg-hub'
+uci set portcullis.main.cp_server_ca_file='/etc/portcullis/tls/cp-ca.crt'
+uci set portcullis.main.cp_server_name='cp.example.internal'
 uci commit portcullis
 
 # 7b. Per-site HMAC key (signs the redirect identity tuple)
@@ -177,16 +179,19 @@ install -d -m700 -o portcullis -g portcullis /etc/portcullis
 head -c32 /dev/urandom > /etc/portcullis/hmac.key
 chmod 600 /etc/portcullis/hmac.key && chown portcullis:portcullis /etc/portcullis/hmac.key
 
-# 7c. mTLS material for the gRPC control channel (provisioned, not generated here)
+# 7c. mTLS material for the control channel (provisioned, not generated here).
+#     The engine is the CLIENT: it presents client.{crt,key} and verifies the
+#     control plane's server cert against cp-ca.crt.
 install -d -m700 -o portcullis -g portcullis /etc/portcullis/tls
-#   place: server.crt  server.key  client-ca.crt   (all 0600, owned by portcullis)
+#   place: client.crt  client.key  cp-ca.crt   (all 0600, owned by portcullis)
 
-# 7d. WireGuard overlay (wg-hub) must be up so the control plane is reachable.
-#     dnsmasq-full must be the active resolver for the walled-garden nftset to work.
+# 7d. dnsmasq-full must be the active resolver for the walled-garden nftset to
+#     work. No overlay/tunnel is needed — outbound egress to the control plane
+#     endpoint is sufficient (allow it in the site firewall if egress-filtered).
 ```
 
-> Until the mTLS material is present the daemon **disables the control plane**
-> (no new grants) rather than serving an unauthenticated one — fail-closed.
+> Until the mTLS material is present the daemon **disables the control channel**
+> (no new grants) rather than dialing without an identity — fail-closed.
 
 ---
 

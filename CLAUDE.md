@@ -15,7 +15,7 @@ It is **not** a NAS, not an ad renderer, not a business-logic owner. Hard bounda
 - **Ad decisioning / OTP / rendering** live in the Next.js portal + Rust/Axum ad engine.
 - `portcullis` owns exactly **one nftables table** (`inet wifihub`) and never touches any other table or fw3's rules.
 
-Client data traffic breaks out **locally** at the store's WAN. The WireGuard overlay carries **control + accounting only**, never client data. Identity is the client **MAC** (visible at L2 locally), not IP.
+Client data traffic breaks out **locally** at the store's WAN. The router sits behind **CGNAT**, so the engine **dials the control plane outbound** over an mTLS gRPC bidirectional stream (no WireGuard, no inbound port) carrying **control + accounting only**, never client data. See `docs/design/cgnat-bidi-control-channel.md`. Identity is the client **MAC** (visible at L2 locally), not IP.
 
 ## Target architecture (Cargo workspace, TDD §6)
 
@@ -27,7 +27,7 @@ crates/
   portcullis-redirect/   :8080 HTTP 302 responder + MAC lookup via neigh table + HMAC signing
   portcullis-garden/     manages dnsmasq nftset entries (owns domain list only, no DNS logic)
   portcullis-accounting/ conntrack metering + quota watcher + event export
-  portcullis-control/    tonic gRPC server, mTLS over WireGuard
+  portcullis-control/    tonic gRPC client: dials CP over mTLS bidi stream (CGNAT-safe) + on-net/dev server
   portcullis-config/     UCI/TOML config types, load, hot-reload
 proto/enforcement.proto  contract shared with the Go control plane (package wifihub.enforcement.v1)
 deploy/                  procd init script, OpenWrt SDK Makefile, uci-defaults first-boot bootstrap

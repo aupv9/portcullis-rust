@@ -17,11 +17,13 @@ Reachable by **any unauthenticated client** on the Public-Hub SSID. Direct prece
 - The responder must serve **only** the 302 — no static files, no other routes, no info leak.
 - Recommend a **fuzz target** for the parser.
 
-## Surface 2 — control channel (gRPC over WireGuard)
+## Surface 2 — control channel (engine dials the CP over mTLS, CGNAT)
 
-- **mTLS must be enforced:** the server accepts grants only from the control plane's client cert (pin the cert / restrict to the expected CA). "Reachable over WG" is defence-in-depth, NOT the auth gate. Flag: accepting any client cert, disabled verification, plaintext listener, or binding the gRPC port on a non-WG interface.
+- **Direction:** the engine is the gRPC **client** (no WireGuard, no inbound port — the router is behind CGNAT). It dials the control plane and holds the `Attach` bidi stream. Flag any inbound control listener exposed on the router.
+- **mTLS must be enforced:** the engine presents a per-store **client** cert and verifies the CP **server** cert against a pinned CA (`cp_server_ca_file`); it must refuse to dial without a CA (no anonymous/skip-verify fallback). Flag disabled verification, `danger_accept_invalid_certs`, or an empty/optional CA.
+- **Tenant isolation (new, load-bearing):** the control plane must map the TLS client-cert identity → `store_id` and must NOT trust a `store_id` sent in `Hello`/`GrantRequest`. Flag engine code that would let a store assert another store's identity (though the binding itself lives in the Go CP).
 - TLS config: modern versions/ciphers, no downgrade. Cert/key file permissions and rotation story.
-- DoS/backpressure: bounded queues, slow-consumer handling on `StreamEvents` (a stuck CP must not wedge enforcement or OOM the box).
+- DoS/backpressure: bounded queues, slow-consumer handling on the event fan-out; reconnect backoff with jitter. A stuck/absent CP must not wedge enforcement or OOM the box, and must never fail open on new grants.
 
 ## Identity & crypto (MAC + HMAC, §7.2)
 
@@ -38,7 +40,7 @@ Reachable by **any unauthenticated client** on the Public-Hub SSID. Direct prece
 
 ## Secrets & config
 
-- HMAC key, WireGuard private keys, TLS keys: file perms, not world-readable, not in the `.ipk` as plaintext defaults, provisioned per-store at first boot. Flag any committed/baked secret.
+- HMAC key, mTLS client key/cert + pinned CP server CA: file perms, not world-readable, not in the `.ipk` as plaintext defaults, provisioned per-store at first boot. Flag any committed/baked secret.
 - No secrets in logs, metrics labels, or error messages.
 
 ## Supply chain & memory safety

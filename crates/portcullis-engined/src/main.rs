@@ -6,10 +6,11 @@
 //! - ensures the base `inet wifihub` ruleset exists and **adopts** the kernel
 //!   `auth` set on start so no authorized client is dropped across a restart
 //!   (kernel-as-truth, §7.8);
-//! - constructs the `SessionManager` (the `Enforcer` + `MeteringSink`) and the
-//!   gRPC control service sharing one bounded event channel;
-//! - launches the background tasks: gRPC server (mTLS), :8080 redirect responder,
-//!   accounting metering loop, walled-garden reconciler, and the expiry timer;
+//! - constructs the `SessionManager` (the `Enforcer` + `MeteringSink`) sharing
+//!   one bounded event channel with the control channel;
+//! - launches the background tasks: the outbound control channel (mTLS bidi
+//!   stream — the engine dials the control plane, CGNAT), :8080 redirect
+//!   responder, accounting metering loop, walled-garden reconciler, expiry timer;
 //! - shuts down gracefully on SIGTERM (procd stop).
 //!
 //! All runtime state is in RAM (tmpfs); nothing is written to NAND (§5.4).
@@ -89,22 +90,20 @@ fn load_config() -> anyhow::Result<Config> {
 pub(crate) struct Wired {
     pub mgr: Arc<portcullis_session::SessionManager>,
     pub event_tx: tokio::sync::broadcast::Sender<portcullis_types::SessionEvent>,
-    /// Retained so the composition root can poll `subscriber_count()` for the
-    /// `cp_connected` health flag / metric (a live `StreamEvents` client).
-    pub grpc_sink: portcullis_control::GrpcEventSink,
 }
 
 /// Assemble the core domain wiring around a given nft writer (real or mock).
 ///
 /// Order matters for the construction cycle (§ see `control::event_channel`):
-/// mint the event channel + sink first, build the `SessionManager` with the
-/// sink, then the gRPC service from the manager + the shared sender.
+/// mint the event channel + sink first, then build the `SessionManager` with the
+/// sink. The control channel task later subscribes to `event_tx` and drives
+/// `mgr` as the `Enforcer`.
 pub(crate) fn wire(writer: Arc<dyn RulesetWriter>) -> Wired {
     let (event_tx, grpc_sink) =
         portcullis_control::service::event_channel(portcullis_control::DEFAULT_EVENT_BUFFER);
-    let sink: Arc<dyn EventSink> = Arc::new(grpc_sink.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(grpc_sink);
     let mgr = Arc::new(portcullis_session::SessionManager::new(writer, sink));
-    Wired { mgr, event_tx, grpc_sink }
+    Wired { mgr, event_tx }
 }
 
 #[cfg(test)]

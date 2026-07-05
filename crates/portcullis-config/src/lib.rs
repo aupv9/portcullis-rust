@@ -34,11 +34,29 @@ pub struct Config {
     /// Stable store identity, e.g. `SITE-0042`. Signed into the redirect HMAC.
     pub store_id: String,
 
-    /// gRPC control-plane endpoint, reached over the WireGuard overlay.
+    /// gRPC control-plane endpoint the engine **dials outbound** (the router sits
+    /// behind CGNAT, so it is the client — see `docs/design/cgnat-bidi-control-channel.md`).
     pub control_endpoint: String,
 
-    /// WireGuard interface carrying control + accounting traffic.
-    pub wg_interface: String,
+    /// Path to the CA that signs the control plane's **server** certificate; the
+    /// engine verifies the CP against it when dialing. Defaulted for
+    /// backward-compatible configs.
+    #[serde(default = "default_cp_server_ca_file")]
+    pub cp_server_ca_file: String,
+
+    /// Expected server name (SNI / cert CN·SAN) of the control plane, verified
+    /// during the TLS handshake. Empty => derive from `control_endpoint`.
+    #[serde(default)]
+    pub cp_server_name: String,
+
+    /// Cap (seconds) on the reconnect exponential backoff to the control plane.
+    #[serde(default = "default_reconnect_max_secs")]
+    pub control_reconnect_max_secs: u64,
+
+    /// HTTP/2 keepalive interval (seconds) on the control channel, kept below the
+    /// carrier CGNAT idle timeout so the outbound mapping stays fresh.
+    #[serde(default = "default_keepalive_secs")]
+    pub control_keepalive_secs: u64,
 
     /// Path to the HMAC key file (§13 — the key lives outside this config).
     pub hmac_key_file: String,
@@ -58,7 +76,7 @@ pub struct Config {
     /// Default per-session rate limit in kbps (`0` == unlimited).
     pub default_rate_kbps: u64,
 
-    /// TCP port for the Prometheus `/metrics` endpoint, bound on the WG overlay
+    /// TCP port for the Prometheus `/metrics` endpoint, bound on loopback
     /// (TDD §12). `0` disables the endpoint. `#[serde(default)]` so existing
     /// configs (which predate this field) still parse under `deny_unknown_fields`.
     #[serde(default = "default_metrics_port")]
@@ -82,13 +100,28 @@ fn default_reconcile_interval() -> u64 {
     60
 }
 
+fn default_cp_server_ca_file() -> String {
+    "/etc/portcullis/tls/cp-ca.crt".to_string()
+}
+
+fn default_reconnect_max_secs() -> u64 {
+    60
+}
+
+fn default_keepalive_secs() -> u64 {
+    20
+}
+
 impl Default for Config {
     fn default() -> Self {
         // Mirrors the §9 example.
         Config {
             store_id: String::new(),
             control_endpoint: "https://cp.wifihub.internal:8443".to_string(),
-            wg_interface: "wg-hub".to_string(),
+            cp_server_ca_file: default_cp_server_ca_file(),
+            cp_server_name: String::new(),
+            control_reconnect_max_secs: default_reconnect_max_secs(),
+            control_keepalive_secs: default_keepalive_secs(),
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
             responder_port: 8080,
             accounting_interval: 15,
@@ -223,9 +256,6 @@ impl Config {
                 "control_endpoint must not be empty".to_string(),
             ));
         }
-        if self.wg_interface.trim().is_empty() {
-            return Err(Error::Config("wg_interface must not be empty".to_string()));
-        }
         if self.hmac_key_file.trim().is_empty() {
             return Err(Error::Config("hmac_key_file must not be empty".to_string()));
         }
@@ -260,7 +290,14 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
     match key {
         "store_id" => cfg.store_id = val.to_string(),
         "control_endpoint" => cfg.control_endpoint = val.to_string(),
-        "wg_interface" => cfg.wg_interface = val.to_string(),
+        "cp_server_ca_file" => cfg.cp_server_ca_file = val.to_string(),
+        "cp_server_name" => cfg.cp_server_name = val.to_string(),
+        "control_reconnect_max_secs" => cfg.control_reconnect_max_secs = parse_u64(val)?,
+        "control_keepalive_secs" => cfg.control_keepalive_secs = parse_u64(val)?,
+        // Deprecated: WireGuard was removed (the engine now dials the control
+        // plane directly, see the CGNAT design doc). Accept-and-ignore so
+        // already-provisioned on-flash configs still parse during rollout.
+        "wg_interface" => {}
         "hmac_key_file" => cfg.hmac_key_file = val.to_string(),
         "responder_port" => cfg.responder_port = parse_u16(val)?,
         "accounting_interval" => cfg.accounting_interval = parse_u64(val)?,
@@ -354,8 +391,8 @@ pub enum ReloadImpact {
     /// Apply in place without dropping sessions (garden FQDNs, tier defaults,
     /// accounting interval).
     HotReloadable,
-    /// Touches a foundational binding (control endpoint, WG interface, HMAC
-    /// key file, responder port) — the daemon must restart.
+    /// Touches a foundational binding (control endpoint, control-channel TLS,
+    /// HMAC key file, responder port) — the daemon must restart.
     RequiresRestart,
 }
 
@@ -366,7 +403,8 @@ pub enum ReloadImpact {
 /// [`ReloadImpact::HotReloadable`].
 pub fn diff(old: &Config, new: &Config) -> ReloadImpact {
     let requires_restart = old.control_endpoint != new.control_endpoint
-        || old.wg_interface != new.wg_interface
+        || old.cp_server_ca_file != new.cp_server_ca_file
+        || old.cp_server_name != new.cp_server_name
         || old.hmac_key_file != new.hmac_key_file
         || old.responder_port != new.responder_port
         || old.store_id != new.store_id;
@@ -390,8 +428,8 @@ mod tests {
     const UCI_EXAMPLE: &str = r#"
 config portcullis 'main'
     option store_id           'SITE-0042'
-    option control_endpoint   'https://cp.wifihub.internal:8443'   # over WG overlay
-    option wg_interface       'wg-hub'
+    option control_endpoint   'https://cp.wifihub.internal:8443'   # engine dials outbound
+    option cp_server_ca_file  '/etc/portcullis/tls/cp-ca.crt'
     option hmac_key_file      '/etc/portcullis/hmac.key'
     option responder_port     '8080'
     option accounting_interval '15'
@@ -409,7 +447,7 @@ config portcullis 'main'
         let cfg = Config::from_uci_str(UCI_EXAMPLE).unwrap();
         assert_eq!(cfg.store_id, "SITE-0042");
         assert_eq!(cfg.control_endpoint, "https://cp.wifihub.internal:8443");
-        assert_eq!(cfg.wg_interface, "wg-hub");
+        assert_eq!(cfg.cp_server_ca_file, "/etc/portcullis/tls/cp-ca.crt");
         assert_eq!(cfg.hmac_key_file, "/etc/portcullis/hmac.key");
         assert_eq!(cfg.responder_port, 8080);
         assert_eq!(cfg.accounting_interval, 15);
@@ -462,11 +500,47 @@ config portcullis 'main'
     }
 
     #[test]
+    fn uci_deprecated_wg_interface_is_ignored() {
+        // Migration: an already-provisioned on-flash config carrying the removed
+        // wg_interface option must still parse (accept-and-ignore) rather than
+        // wedge the daemon at startup during rollout.
+        let uci = "config portcullis 'main'\n    option store_id 'X'\n    option wg_interface 'wg-hub'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert_eq!(cfg.store_id, "X");
+    }
+
+    #[test]
+    fn uci_parses_cp_client_options() {
+        let uci = "config portcullis 'main'\n\
+            option store_id 'X'\n\
+            option cp_server_ca_file '/etc/portcullis/tls/cp-ca.crt'\n\
+            option cp_server_name 'cp.wifihub.internal'\n\
+            option control_reconnect_max_secs '30'\n\
+            option control_keepalive_secs '10'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert_eq!(cfg.cp_server_ca_file, "/etc/portcullis/tls/cp-ca.crt");
+        assert_eq!(cfg.cp_server_name, "cp.wifihub.internal");
+        assert_eq!(cfg.control_reconnect_max_secs, 30);
+        assert_eq!(cfg.control_keepalive_secs, 10);
+    }
+
+    #[test]
+    fn diff_cp_server_ca_requires_restart() {
+        let old = Config::from_uci_str(UCI_EXAMPLE).unwrap();
+        let mut new = old.clone();
+        new.cp_server_ca_file = "/etc/portcullis/tls/other-ca.crt".to_string();
+        assert_eq!(diff(&old, &new), ReloadImpact::RequiresRestart);
+    }
+
+    #[test]
     fn toml_roundtrip_equals_original() {
         let original = Config {
             store_id: "SITE-0042".to_string(),
             control_endpoint: "https://cp.wifihub.internal:8443".to_string(),
-            wg_interface: "wg-hub".to_string(),
+            cp_server_ca_file: "/etc/portcullis/tls/cp-ca.crt".to_string(),
+            cp_server_name: String::new(),
+            control_reconnect_max_secs: 60,
+            control_keepalive_secs: 20,
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
             responder_port: 8080,
             accounting_interval: 15,
@@ -491,7 +565,7 @@ config portcullis 'main'
     fn default_matches_section_9_defaults() {
         let d = Config::default();
         assert_eq!(d.control_endpoint, "https://cp.wifihub.internal:8443");
-        assert_eq!(d.wg_interface, "wg-hub");
+        assert_eq!(d.cp_server_ca_file, "/etc/portcullis/tls/cp-ca.crt");
         assert_eq!(d.hmac_key_file, "/etc/portcullis/hmac.key");
         assert_eq!(d.responder_port, 8080);
         assert_eq!(d.accounting_interval, 15);
