@@ -3,9 +3,9 @@
 //! Hand-rolled to avoid the `prometheus` crate's registry/label machinery on the
 //! 256 MB MIPS box: the recorder is a fixed set of atomics and the encoder is a
 //! `write!` over them (~no allocation on the increment path — a counter bump is
-//! one `fetch_add`). Served on the WireGuard address (same trust boundary as the
-//! gRPC control channel, §13); the endpoint itself is unauthenticated — WG is the
-//! boundary — so bind it only on the overlay interface.
+//! one `fetch_add`). The endpoint is unauthenticated, so it is bound on
+//! **loopback** only (§12) — there is no overlay network to expose it on now
+//! that WireGuard is gone; scrape it locally.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

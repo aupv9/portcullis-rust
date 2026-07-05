@@ -11,11 +11,13 @@ fn main() {
         }
     }
 
-    // Generate the tonic server bindings for the shared enforcement contract.
-    // Server-only: the engine is the gRPC server; the Go control plane is the client.
+    // Generate both tonic client and server bindings for the shared contract.
+    // Client: the engine dials the control plane over the `Connect` bidi stream
+    // (production path behind CGNAT). Server: retained for the on-net/dev unary
+    // RPCs and the service unit tests.
     tonic_build::configure()
         .build_server(true)
-        .build_client(false)
+        .build_client(true)
         .compile_protos(&["../../proto/enforcement.proto"], &["../../proto"])
         .expect("failed to compile proto/enforcement.proto");
 

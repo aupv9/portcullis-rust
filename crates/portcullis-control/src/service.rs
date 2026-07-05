@@ -137,6 +137,8 @@ type EventStream =
     Pin<Box<dyn Stream<Item = Result<pb::SessionEvent, Status>> + Send + 'static>>;
 type SessionInfoStream =
     Pin<Box<dyn Stream<Item = Result<pb::SessionInfo, Status>> + Send + 'static>>;
+type ControlFrameStream =
+    Pin<Box<dyn Stream<Item = Result<pb::ControlFrame, Status>> + Send + 'static>>;
 
 /// Turn a domain `Error` into a `tonic::Status` with an appropriate code. The
 /// guiding rule: validation/identity problems are `InvalidArgument`, a missing
@@ -161,6 +163,21 @@ fn status_from_domain(err: portcullis_types::Error) -> Status {
 
 #[tonic::async_trait]
 impl pb::enforcement_server::Enforcement for EnforcementService {
+    type AttachStream = ControlFrameStream;
+
+    /// The `Attach` bidirectional stream is the **production** control path, but
+    /// there the *engine is the client* (it dials the control plane — CGNAT). The
+    /// engine-side server exists only for the on-net/dev unary RPCs, so serving
+    /// `Attach` here (engine acting as the control plane) is not supported.
+    async fn attach(
+        &self,
+        _request: Request<tonic::Streaming<pb::EngineFrame>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        Err(Status::unimplemented(
+            "engine is the Attach client, not server; use portcullis_control::run_control_channel",
+        ))
+    }
+
     async fn grant_session(
         &self,
         request: Request<pb::GrantRequest>,

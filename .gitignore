@@ -8,7 +8,7 @@
 # reproducible dependency set is intended. Do not ignore it.
 
 # ── Secrets / provisioned material (never commit) ───────────────────────────
-# Per-store HMAC key, mTLS identity + CA, WireGuard keys (provisioned at boot).
+# Per-store HMAC key, mTLS client identity + pinned CP server CA (provisioned at boot).
 *.key
 *.pem
 *.crt
