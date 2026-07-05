@@ -35,7 +35,7 @@ Every PR must keep all of these green:
 
 ```bash
 cargo build --workspace
-cargo test  --workspace                          # currently 130 tests
+cargo test  --workspace                          # currently 165 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
