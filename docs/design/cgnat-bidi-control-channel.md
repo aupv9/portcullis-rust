@@ -1,8 +1,13 @@
 # Design: CGNAT-safe control channel via router-initiated bidirectional gRPC stream
 
-Status: **Proposed**
+Status: **Implemented (engine/Rust side)** — Go control plane pending.
 Supersedes: the WireGuard overlay + "control plane dials the router" model
-(current `portcullis-control` server, `wg_interface` config, `mTLS over WireGuard`).
+(the former `portcullis-control` server, `wg_interface` config, mTLS-over-WireGuard).
+
+WireGuard has been removed from the codebase. The engine now dials the control
+plane over the `Attach` bidi stream (Phases 0–5 landed: proto, config, control
+transport + `channel.rs` driver, engined rewiring, deploy/docs). Phase 6 (netns
+E2E against a mock CP server) and the Go control-plane rewrite remain.
 
 ---
 
@@ -111,7 +116,7 @@ sequenceDiagram
   participant CP as Control plane (server)
   Eng->>CP: TCP + TLS handshake (client cert = store identity)
   CP-->>Eng: server cert verified against pinned CA
-  Eng->>CP: Connect() opens bidi stream
+  Eng->>CP: Attach() opens bidi stream
   Eng->>CP: EngineFrame{Hello: store_id, version, active-session snapshot}
   CP-->>Eng: (reconcile: adopt/repair against snapshot)
   loop steady state
@@ -128,12 +133,16 @@ Additive changes only — **never renumber/retype/reuse a field tag** (proto rul
 `enforcement.proto:4`). All existing messages (`GrantRequest`, `RevokeRequest`,
 `SessionEvent`, …) are reused verbatim inside the new frames.
 
+> The stream rpc is named **`Attach`**, not `Connect`: a `Connect` rpc collides
+> with the tonic client's generated `connect` constructor. `correlation_id` lives
+> at the **frame** level (not on individual reply messages).
+
 ```proto
 service Enforcement {
-  // NEW: the router dials this. Long-lived, bidirectional. This is the only
-  // control path used in production behind CGNAT. The CP (Go) SERVES it; the
-  // engine is the CLIENT. Commands travel CP->engine, events engine->CP.
-  rpc Connect (stream EngineFrame) returns (stream ControlFrame);
+  // NEW: the engine dials this. Long-lived, bidirectional. The only control path
+  // used in production behind CGNAT. The CP (Go) SERVES it; the engine is the
+  // CLIENT. Commands travel CP->engine, events engine->CP.
+  rpc Attach (stream EngineFrame) returns (stream ControlFrame);
 
   // The original unary RPCs are retained for on-net / dev / integration tests
   // where the CP can reach the engine directly. Not used behind CGNAT.
@@ -145,61 +154,59 @@ service Enforcement {
   rpc Health       (Empty)        returns (HealthReply);
 }
 
-// engine -> control plane
+// engine -> control plane. correlation_id echoes the ControlFrame being answered
+// (0 for unsolicited frames: hello, event, health).
 message EngineFrame {
+  uint64 correlation_id = 1;
   oneof msg {
-    Hello        hello   = 1; // sent once, first frame after Connect
-    SessionEvent event   = 2; // lifecycle/accounting events (was StreamEvents)
-    CommandAck   ack     = 3; // response to a ControlFrame (see correlation_id)
-    SessionInfo  session = 4; // a row in response to Get/ListSessions
-    ListEnd      list_end = 5; // terminates a ListSessions response
-    HealthReply  health  = 6; // periodic or on-demand health
+    Hello        hello    = 2; // first frame after Attach
+    SessionEvent event    = 3; // lifecycle/accounting events (was StreamEvents)
+    CommandAck   ack      = 4; // terminal reply to grant/revoke
+    SessionInfo  session  = 5; // a row answering get/list
+    ListEnd      list_end = 6; // terminates a get/list response
+    HealthReply  health   = 7; // reply to a Ping, or periodic
   }
 }
 
-// control plane -> engine
+// control plane -> engine. correlation_id is echoed back in the answering frames.
 message ControlFrame {
-  uint64 correlation_id = 1;  // echoed back in CommandAck / SessionInfo / ListEnd
+  uint64 correlation_id = 1;
   oneof msg {
     GrantRequest  grant  = 2;
     RevokeRequest revoke = 3;
     Key           get    = 4;
     ListRequest   list   = 5;
-    Ping          ping   = 6; // heartbeat; engine replies with a Health or Pong
+    Ping          ping   = 6; // heartbeat; engine replies with a HealthReply
   }
 }
 
 message Hello {
-  string store_id       = 1; // informational only — identity is bound to the cert
-  string engine_version = 2;
-  // Snapshot of the engine's currently-authorized sessions, so the CP can
-  // reconcile (adopt/repair) on (re)connect — the kernel-as-truth adoption
-  // path (§7.8) carried over the wire.
-  repeated SessionInfo active = 3;
+  string store_id            = 1; // informational only — identity is bound to the cert
+  string engine_version      = 2;
+  repeated SessionInfo active = 3; // snapshot for CP reconcile on (re)connect (§7.8)
 }
 
 message CommandAck {
-  uint64 correlation_id = 1;
-  bool   ok             = 2;
-  string message        = 3; // error detail when !ok (maps from tonic::Status)
-  string session_id     = 4; // set for a successful Grant
+  bool   ok         = 1;
+  string message    = 2; // error detail when !ok
+  string session_id = 3; // set for a successful Grant
 }
 
-message ListEnd { uint64 correlation_id = 1; bool ok = 2; string message = 3; }
+message ListEnd { bool ok = 1; string message = 2; }
 message Ping    { int64 ts_unix = 1; }
 ```
 
 ### Correlation & dispatch rules
 
-- Each `ControlFrame` carries a CP-assigned `correlation_id`.
-- A `Grant`/`Revoke`/`Get` produces exactly one terminal `EngineFrame` echoing
-  that id: `CommandAck` (grant/revoke), or `SessionInfo` then nothing / `ListEnd`
-  (get/list). `ListSessions` streams zero-or-more `SessionInfo` then one
-  `ListEnd`.
-- The engine's command handler calls the **same `Arc<dyn Enforcer>`** used by the
-  unary server today; error → `CommandAck{ok:false}` with the message from
-  `status_from_domain` (never a silent accept — §11 preserved).
-- Events (`EngineFrame.event`) are unsolicited and carry no correlation id.
+- Each `ControlFrame` carries a CP-assigned `correlation_id`; every answering
+  `EngineFrame` echoes it at the frame level.
+- `Grant`/`Revoke` → one `CommandAck`. `Get` → a `SessionInfo` then a `ListEnd`
+  (found), or a failed `ListEnd` (missing). `List` → zero-or-more `SessionInfo`
+  then one `ListEnd`. `Ping` → a `HealthReply`.
+- The engine's command handler calls the **same `Arc<dyn Enforcer>`** as the
+  unary path; a validation/enforcer error → `CommandAck{ok:false}` (or a failed
+  `ListEnd`) with the error message — never a silent accept (§11 preserved).
+- Events (`EngineFrame.event`) are unsolicited and use `correlation_id = 0`.
 
 ## 5. Security model
 
@@ -238,7 +245,7 @@ Phased; each phase compiles and tests green on the host (`cargo test --workspace
 TDD per crate as the existing code does.
 
 ### Phase 0 — proto contract (coordinate with Go CP team first)
-- `proto/enforcement.proto`: add `Connect` rpc + `EngineFrame`, `ControlFrame`,
+- `proto/enforcement.proto`: add `Attach` rpc + `EngineFrame`, `ControlFrame`,
   `Hello`, `CommandAck`, `ListEnd`, `Ping` (§4). Keep all existing tags.
 - Regenerate tonic bindings (`build.rs` already compiles the proto). Confirm the
   Go side regenerates and agrees on frame semantics.
@@ -258,7 +265,7 @@ TDD per crate as the existing code does.
 ### Phase 2 — control-channel driver (new `portcullis-control/src/channel.rs`)
 - `run_control_channel(cfg, enforcer: Arc<dyn Enforcer>, events: broadcast::Sender<SessionEvent>, metrics, cp_state_cb)`:
   1. **Connect loop** with backoff+jitter; on each attempt build `Channel`
-     (Phase 1) + `EnforcementClient`, open `Connect(stream EngineFrame)`.
+     (Phase 1) + `EnforcementClient`, open `Attach(stream EngineFrame)`.
   2. On open: send `Hello` (store id, version, `enforcer.list()` snapshot).
   3. **Inbound task**: read `ControlFrame`s, dispatch on the oneof to
      `enforcer.grant/revoke/get/list`, map results/errors via the existing
@@ -316,7 +323,7 @@ TDD per crate as the existing code does.
 - Update `netns-harness` and `openwrt-build` skill docs where they mention WG.
 
 ### Phase 6 — integration tests (`netns-harness`)
-- Add a **mock CP gRPC server** (serves `Connect`) as a test fixture.
+- Add a **mock CP gRPC server** (serves `Attach`) as a test fixture.
 - Assert end-to-end over a real socket: router dials → `Hello` snapshot received
   → CP sends `Grant` → engine authorizes (ruleset verdict flips unauth→forward) →
   `Ack ok` → CP sends `Revoke` → dropped.
@@ -345,7 +352,7 @@ TDD per crate as the existing code does.
 
 | Crate / path | Change |
 |---|---|
-| `proto/enforcement.proto` | +`Connect` rpc, +frame/Hello/Ack messages (additive) |
+| `proto/enforcement.proto` | +`Attach` rpc, +frame/Hello/Ack messages (additive) |
 | `portcullis-control` | server → **client**; new `channel.rs` driver; `client_tls_config`; keep unary server for dev |
 | `portcullis-config` | −`wg_interface`; +CP CA / server-name / keepalive / backoff fields; migration |
 | `portcullis-engined` | swap serve task for connect-loop task; client TLS load; `cp_connected` wiring; metrics bind |

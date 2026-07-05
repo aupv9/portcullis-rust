@@ -38,7 +38,8 @@ on real RUTM11 hardware (TDD §16 POC), not in generic CI.
 ## Provisioning boundary
 
 Per-store identity is **not** baked into the package (TDD §13): `store_id`,
-`control_endpoint`, the per-store HMAC key, and the mTLS/WireGuard material are
-injected by the fleet provisioning pipeline into `/etc/config/portcullis` and
+`control_endpoint`, the per-store HMAC key, and the mTLS material (client
+cert/key + pinned control-plane server CA) are injected by the fleet
+provisioning pipeline into `/etc/config/portcullis` and
 `/etc/portcullis/{hmac.key,tls/}` (`0600`, owned by the `portcullis` user). The
 first-boot script only prepares directories and the dnsmasq garden wiring.

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "tonic gRPC server (Enforcement service) + mTLS over WireGuard; bridges proto <-> domain and fans events to the control plane (TDD §7.5, §13)."
+description = "Engine control-plane edge: dials the control plane over an mTLS bidirectional gRPC stream (CGNAT-safe), bridges proto <-> domain, and fans events (TDD §7.5, §13)."
 
 [dependencies]
 portcullis-types.workspace = true

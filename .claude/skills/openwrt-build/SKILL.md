@@ -37,7 +37,7 @@ Declare these as package dependencies in the Makefile so they're pulled or co-bu
 - **procd init script** with respawn (threshold/timeout/retry), started early at boot.
 - **Least privilege:** dedicated non-root user with **`CAP_NET_ADMIN` only** (via procd capabilities). No root.
 - **State dir is tmpfs** (`/tmp/portcullis/`) — NEVER write runtime state to NAND (flash wear bricks routers; TDD §5.4). Audit for zero NAND writes under sustained load (§18 item 4).
-- **Config via UCI** (`/etc/config/portcullis`), bootstrapped by `uci-defaults/` at first boot (store_id, control endpoint over WG, WG keys, HMAC key, dnsmasq-full garden config). Hot-reloadable: garden FQDN list, tier defaults, accounting interval. Restart-required: WG/control endpoint, HMAC key, responder port.
+- **Config via UCI** (`/etc/config/portcullis`), bootstrapped by `uci-defaults/` at first boot (store_id, outbound control endpoint, mTLS client cert/key + pinned CP server CA, HMAC key, dnsmasq-full garden config). No WireGuard — the engine dials the control plane outbound (CGNAT). Hot-reloadable: garden FQDN list, tier defaults, accounting interval. Restart-required: control endpoint, CP server CA/name, HMAC key, responder port.
 
 ## Fleet context
 
