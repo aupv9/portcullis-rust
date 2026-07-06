@@ -313,10 +313,6 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "cp_server_name" => cfg.cp_server_name = val.to_string(),
         "control_reconnect_max_secs" => cfg.control_reconnect_max_secs = parse_u64(val)?,
         "control_keepalive_secs" => cfg.control_keepalive_secs = parse_u64(val)?,
-        // Deprecated: WireGuard was removed (the engine now dials the control
-        // plane directly, see the CGNAT design doc). Accept-and-ignore so
-        // already-provisioned on-flash configs still parse during rollout.
-        "wg_interface" => {}
         "hmac_key_file" => cfg.hmac_key_file = val.to_string(),
         "responder_port" => cfg.responder_port = parse_u16(val)?,
         "accounting_interval" => cfg.accounting_interval = parse_u64(val)?,
@@ -520,16 +516,6 @@ config portcullis 'main'
     fn uci_unknown_option_is_error() {
         let uci = "config portcullis 'main'\n    option bogus 'x'\n";
         assert!(Config::from_uci_str(uci).is_err());
-    }
-
-    #[test]
-    fn uci_deprecated_wg_interface_is_ignored() {
-        // Migration: an already-provisioned on-flash config carrying the removed
-        // wg_interface option must still parse (accept-and-ignore) rather than
-        // wedge the daemon at startup during rollout.
-        let uci = "config portcullis 'main'\n    option store_id 'X'\n    option wg_interface 'wg-hub'\n";
-        let cfg = Config::from_uci_str(uci).unwrap();
-        assert_eq!(cfg.store_id, "X");
     }
 
     #[test]

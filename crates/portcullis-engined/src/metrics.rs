@@ -8,8 +8,8 @@
 //! (`mipsel-unknown-linux-musl`, the RUTM11) has no native 64-bit atomics and
 //! would fail to link; every mutation here is on a cold/low-frequency path, so
 //! the tiny lock is free in practice. The endpoint is unauthenticated, so it is
-//! bound on **loopback** only (§12) — there is no overlay network to expose it on
-//! now that WireGuard is gone; scrape it locally.
+//! bound on **loopback** only (§12) — the router has no private management
+//! network to expose it on; scrape it locally.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
