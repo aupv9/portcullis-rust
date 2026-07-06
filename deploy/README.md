@@ -1,8 +1,16 @@
 # 📦 deploy/ — OpenWrt packaging for portcullis
 
 Artifacts that turn the Rust workspace into an installable RutOS/OpenWrt package
-for the Teltonika RUTM11 (`ramips/mt7621`, `mipsel-unknown-linux-musl`). See the
-[`openwrt-build`](../.claude/skills/openwrt-build) skill.
+for the Teltonika **RUTM11** (`ramips/mt7621`) and **RUT200** (`ramips/mt76x8`) —
+same `mipsel-unknown-linux-musl` triple and `mipsel_24kc` arch, different SDK
+subtarget. See the [`openwrt-build`](../.claude/skills/openwrt-build) skill.
+
+> 🪶 **Flash budget.** The RUT200 has only **16 MB SPI NOR flash** (vs the RUTM11's
+> roomy NAND). The package is built with the size-first `release-min` cargo profile
+> (`panic=abort` + `-Z build-std-features=panic_immediate_abort`) and, by default,
+> UPX-packed so the on-flash binary lands ~1 MB. Pass `PORTCULLIS_UPX=0` to skip
+> packing. Install `upx` (or `upx-ucl`) on the build host, or you'll get a warning
+> and an uncompressed binary.
 
 > 📘 **Full step-by-step build + install + provision + verify guide:
 > [`PACKAGING.md`](./PACKAGING.md).** Or run [`build-ipk.sh`](./build-ipk.sh)

@@ -2,7 +2,10 @@
 
 End-to-end guide to turn this Rust workspace into an OpenWrt package and install
 it on a **Teltonika RUTM11** (RutOS 7.x = OpenWrt 21.02, `ramips/mt7621`,
-`mipsel-unknown-linux-musl`).
+`mipsel-unknown-linux-musl`) or a **Teltonika RUT200** (MT7628, `ramips/mt76x8`,
+same triple / `mipsel_24kc` arch). The only differences are the SDK subtarget you
+unpack and — because the RUT200 has just **16 MB SPI NOR flash** — that the binary
+is UPX-packed by default (see [§5.1](#51-size--the-rut200-16-mb-flash-budget)).
 
 > TL;DR
 > ```sh
@@ -52,13 +55,17 @@ by the build script and runs on the build host.
 ## 2. Get & unpack the SDK
 
 ```sh
-# Example — replace with the exact SDK tarball for your RutOS version:
+# Example — replace with the exact SDK tarball for your RutOS version.
+# RUTM11 (MT7621):
 wget <RUTOS_SDK_URL>/openwrt-sdk-*-ramips-mt7621_*.tar.xz
 tar xf openwrt-sdk-*-ramips-mt7621_*.tar.xz
 cd openwrt-sdk-*-ramips-mt7621*/
+# RUT200 (MT7628): use the ramips/mt76x8 SDK instead —
+#   openwrt-sdk-*-ramips-mt76x8_*.tar.xz
 ```
 
-Everything below runs **from the SDK root**.
+Everything below runs **from the SDK root**. The recipe is subtarget-agnostic
+(same `mipsel-unknown-linux-musl` triple); only the SDK you unpack differs.
 
 ---
 
@@ -95,7 +102,8 @@ make menuconfig                # optional: navigate to
                                #   Network ---> portcullis  → <M> (build as module/.ipk)
 ```
 
-Confirm the architecture is `mipsel_24kc` (mt7621). Save and exit.
+Confirm the architecture is `mipsel_24kc` (both mt7621 and mt76x8 use it). Save
+and exit.
 
 ---
 
@@ -114,6 +122,31 @@ bin/packages/mipsel_24kc/base/portcullis_0.1.0-1_mipsel_24kc.ipk
 ```
 
 (arch string may differ slightly by SDK; `ls bin/packages/*/*/portcullis_*.ipk`).
+
+### 5.1 Size — the RUT200 16 MB flash budget
+
+The RUT200's 16 MB SPI NOR leaves only a few MB of writable overlay after RutOS,
+so the package is built small by default:
+
+- **`release-min` cargo profile** (`--profile release-min`, `panic = "abort"`),
+  plus `-Z build-std-features=panic_immediate_abort` to drop the panic-format
+  machinery from `std` — a sizeable win on MIPS. The `Build/Compile` step already
+  passes both.
+- **UPX compression** of the final binary (`PORTCULLIS_UPX=1`, the default). This
+  keeps the on-flash binary ~1 MB no matter how well (or poorly) the device's
+  overlay filesystem compresses. The packed binary self-decompresses into RAM at
+  start — negligible on the RUT200's 128 MB. Install `upx`/`upx-ucl` on the build
+  host; if it's missing the build warns and ships the uncompressed binary.
+
+```sh
+# roomy RUTM11 NAND — packing optional:
+make package/portcullis/compile V=s PORTCULLIS_UPX=0
+# RUT200 (tight flash) — default:
+make package/portcullis/compile V=s            # PORTCULLIS_UPX=1
+```
+
+Measured on the x86_64 host proxy (device numbers differ but track the same way):
+`release` 3.49 MB → `release-min` 3.09 MB → `release-min` + UPX **1.12 MB** (−68 %).
 
 ### Route A note (rust feed)
 
