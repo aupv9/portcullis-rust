@@ -14,7 +14,7 @@
 ![clippy](https://img.shields.io/badge/clippy-D%20warnings%20clean-brightgreen)
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
 ![binary](https://img.shields.io/badge/binary-~2.4MB-informational)
-![target](https://img.shields.io/badge/target-mipsel--musl%20(RUTM11)-lightgrey)
+![target](https://img.shields.io/badge/target-mipsel--musl%20(RUTM11%20%2F%20RUT200)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
 </div>
@@ -273,14 +273,15 @@ mTLS material is provisioned separately at `/etc/portcullis/tls/` — the engine
 
 ## 🪶 Performance & footprint
 
-Tuned for the RUTM11 (MIPS 880 MHz, **256 MB RAM**; budgets: <15 MB binary, <30 MB RSS — TDD §14).
+Tuned for the RUTM11 (MIPS 880 MHz, **256 MB RAM**, NAND; budgets: <15 MB binary, <30 MB RSS — TDD §14), and squeezed further for the **RUT200** (MT7628, **128 MB RAM**, **16 MB SPI NOR flash**).
 
 | | Before tuning | After |
 |---|---|---|
 | Release binary (host arm64) | 6.9 MB | **2.4 MB** (−65%) |
 | Runtime regex engine | ~290 KiB | **removed** |
+| RUT200 build (host x86_64 proxy) | 3.49 MB | **1.12 MB** (−68%, `release-min` + UPX) |
 
-Techniques: size-first release profile (`opt-level="z"`, LTO, `codegen-units=1`, `strip`), dropped `tracing-subscriber` `env-filter`, `SessionId` → `Box<str>`, bounded event buffer, allocation-free HMAC signing. See [`.claude/skills/embedded-perf`](./.claude/skills/embedded-perf).
+Techniques: size-first release profile (`opt-level="z"`, LTO, `codegen-units=1`, `strip`), dropped `tracing-subscriber` `env-filter`, `SessionId` → `Box<str>`, bounded event buffer, allocation-free HMAC signing. **RUT200 flash squeeze:** a `release-min` profile (`panic="abort"` + `-Z build-std-features=panic_immediate_abort`) and UPX-packing the `.ipk` binary (`PORTCULLIS_UPX=1`, default) so it fits the 16 MB flash — see [`deploy/PACKAGING.md §5.1`](./deploy/PACKAGING.md). More in [`.claude/skills/embedded-perf`](./.claude/skills/embedded-perf).
 
 ---
 

@@ -4,14 +4,19 @@
 # RutOS/OpenWrt SDK (ramips/mt7621). Convenience wrapper around the steps in
 # PACKAGING.md; run it from anywhere.
 #
+# Works for both ramips routers in scope (same mipsel_24kc arch):
+#   - RUTM11: ramips/mt7621 SDK
+#   - RUT200: ramips/mt76x8 SDK (16 MB flash — keep PORTCULLIS_UPX=1)
+#
 # Usage:
-#   SDK_DIR=/path/to/openwrt-sdk-...-ramips-mt7621 ./deploy/build-ipk.sh
+#   SDK_DIR=/path/to/openwrt-sdk-...-ramips-mt76x8 ./deploy/build-ipk.sh
 #   ./deploy/build-ipk.sh /path/to/sdk            # SDK dir as first arg
 #
 # Env:
-#   SDK_DIR    path to the extracted SDK root (required)
-#   JOBS       parallel build jobs (default: nproc)
-#   DOCKER=1   use the SDK's ./scripts/dockerbuild wrapper (Teltonika SDKs)
+#   SDK_DIR          path to the extracted SDK root (required)
+#   JOBS             parallel build jobs (default: nproc)
+#   DOCKER=1         use the SDK's ./scripts/dockerbuild wrapper (Teltonika SDKs)
+#   PORTCULLIS_UPX   1 (default) UPX-packs the binary for tight flash; 0 disables
 #
 # Prereqs: a Linux x86_64 host with the SDK's build deps installed. This script
 # does NOT download the SDK (its URL is version-specific — see PACKAGING.md §2).
@@ -25,6 +30,8 @@ DEPLOY_DIR="$SCRIPT_DIR"
 
 SDK_DIR="${SDK_DIR:-${1:-}}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+PORTCULLIS_UPX="${PORTCULLIS_UPX:-1}"
+export PORTCULLIS_UPX   # imported by deploy/Makefile (PORTCULLIS_UPX?=1)
 
 if [[ -z "$SDK_DIR" ]]; then
 	echo "error: set SDK_DIR (or pass the SDK path as arg 1). See deploy/PACKAGING.md §2." >&2
@@ -38,6 +45,11 @@ fi
 echo ">> repo:  $REPO_ROOT"
 echo ">> sdk:   $SDK_DIR"
 echo ">> jobs:  $JOBS"
+echo ">> upx:   $PORTCULLIS_UPX"
+if [[ "$PORTCULLIS_UPX" == "1" ]] && ! command -v upx >/dev/null 2>&1; then
+	echo ">> WARNING: PORTCULLIS_UPX=1 but 'upx' is not on PATH — the binary will NOT" >&2
+	echo ">>          be compressed. Install 'upx' (or 'upx-ucl'), or set PORTCULLIS_UPX=0." >&2
+fi
 
 cd "$SDK_DIR"
 

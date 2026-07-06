@@ -69,10 +69,30 @@ notes = "host build/test target is the CI-equivalent (TDD §15); device target i
 
 # Size-first release profile for the embedded MIPS target (TDD §14: <15 MB binary,
 # <30 MB RSS). The .text is mmap'd so a smaller binary is also the biggest RSS win.
-# `panic = "abort"` is intentionally NOT set (keeps unwinding semantics); revisit
-# with `-Z build-std panic_immediate_abort` only if the on-device size check falls short.
+# `panic = "abort"` is intentionally NOT set here (keeps unwinding semantics for the
+# roomier RUTM11/NAND target); the ultra-constrained RUT200 path uses `release-min`
+# below instead.
 [profile.release]
 opt-level = "z"      # optimize for size; benchmark "s" too (sometimes smaller+faster after LTO)
 lto = true           # link-time optimization across crates
 codegen-units = 1    # one unit -> better cross-fn optimization (slower compile)
 strip = true         # drop symbols (large win on static musl)
+
+# Ultra-size profile for the Teltonika RUT200 (MT7628, 128 MB RAM, **16 MB SPI
+# NOR flash** — far tighter than the RUTM11's NAND). Inherits `release` and adds
+# `panic = "abort"`: drops the unwinding tables/landing pads (a daemon that panics
+# should die and let procd respawn it — it re-adopts kernel state on restart, so
+# unwinding buys nothing here). Pairs with `-Z build-std-features=panic_immediate_abort`
+# on the cross build (deploy/Makefile) to also strip the panic-formatting machinery
+# — a large win on MIPS. The .ipk is then UPX-packed (deploy, UPX=1) to fit flash.
+[profile.release-min]
+inherits = "release"
+panic = "abort"      # no unwinding tables; pairs with build-std panic_immediate_abort
+opt-level = "z"
+lto = "fat"          # whole-program LTO (max cross-crate inlining/dead-code elim)
+codegen-units = 1
+strip = "symbols"
+overflow-checks = false
+debug = false
+debug-assertions = false
+incremental = false

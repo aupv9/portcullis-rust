@@ -53,6 +53,7 @@ These come from §5/§7 and are load-bearing — violating them causes flash fai
 - `kmod-nft-*` + `nftables` userspace may not ship in stock RutOS — may need SDK-building. `dnsmasq-full` (not stock slim dnsmasq) is required for `nftset=`.
 - Firewall backend: **`nftables-rs` (drives `nft -j` JSON)** is chosen — pure-Rust, easiest MIPS cross-compile; fork/exec per batch is fine because per-store churn is tiny. Abstracted behind the `FirewallBackend` trait so it can be revisited (fallback: `rustables` netlink, or iptables/ipset).
 - Resource budget: < 30 MB RSS steady-state, binary < 15 MB, on 256 MB RAM.
+- **Secondary target — RUT200 (MT7628, `ramips/mt76x8`):** same `mipsel-unknown-linux-musl` triple / `mipsel_24kc` arch, but only **128 MB RAM and 16 MB SPI NOR flash**. Flash is the binding constraint: the package builds with the `release-min` profile (`panic="abort"` + `-Z build-std-features=panic_immediate_abort`) and is UPX-packed by default (`PORTCULLIS_UPX=1`) so the on-flash binary lands ~1 MB. See `deploy/PACKAGING.md §5.1`.
 
 ## Commands (planned — workspace does not exist yet)
 
