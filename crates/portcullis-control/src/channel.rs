@@ -228,6 +228,25 @@ async fn handle_control_frame(
             let h = convert::health_to_pb(enforcer.health().await);
             vec![frame(cid, engine_frame::Msg::Health(h))]
         }
+        // Config-push + introspection variants from the reconciled superset proto
+        // (SetTierPolicies/SetGarden/SetEnforcement/SetEngineParameters and the
+        // GetEngineInfo/GetMetrics queries). Not implemented yet: answer each Set*
+        // with a rejecting CommandAck (never fail open / never silently accept a
+        // config the engine won't apply) and the get_* queries likewise, so the
+        // control plane learns the engine lacks the capability instead of hanging.
+        control_frame::Msg::SetTierPolicies(_)
+        | control_frame::Msg::SetGarden(_)
+        | control_frame::Msg::SetEnforcement(_)
+        | control_frame::Msg::SetEngineParameters(_)
+        | control_frame::Msg::GetEngineInfo(_)
+        | control_frame::Msg::GetMetrics(_) => {
+            vec![frame(
+                cid,
+                engine_frame::Msg::Ack(ack_err(portcullis_types::Error::BadRequest(
+                    "config-push / introspection command not implemented by this engine".into(),
+                ))),
+            )]
+        }
     }
 }
 

@@ -1,7 +1,14 @@
 syntax = "proto3";
 
-// Contract shared with the Go control plane (TDD §7.5, Appendix A).
+// CONTROL-PLANE COPY of the enforcement contract, owned by domain/server.
+// Independent from portcullis's core/portcullis-rust/proto/enforcement.proto:
+// two folders, one wire contract (same package wifihub.enforcement.v1, same
+// field tags). This copy is the reconciled superset — it also declares the
+// on-net/dev config RPCs and the config-over-stream ControlFrame/EngineFrame
+// variants (tags 7-12 / 8-9) the engine will grow into.
+//
 // Wire-compat rule: never renumber/retype/reuse a field tag; only add new tags.
+// When either side adds a field, mirror it here/there to keep the wire in sync.
 package wifihub.enforcement.v1;
 
 // Enforcement contract. Mutually authenticated with mTLS; the engine NEVER
@@ -30,6 +37,16 @@ service Enforcement {
   rpc ListSessions (ListRequest)  returns (stream SessionInfo);
   rpc StreamEvents (StreamReq)    returns (stream SessionEvent); // engine -> control plane
   rpc Health       (Empty)        returns (HealthReply);
+
+  // Config-push + introspection. Unary here for the on-net/dev path; behind
+  // CGNAT the SAME commands travel as ControlFrame/EngineFrame variants (below)
+  // so the control plane can drive an engine reachable only over Attach.
+  rpc SetEnforcement     (SetEnforcementRequest)      returns (Ack);          // global on/off gate
+  rpc SetGarden          (SetGardenRequest)           returns (Ack);          // control-plane-managed walled garden
+  rpc SetTierPolicies    (SetTierPoliciesRequest)     returns (Ack);          // fleet-wide per-tier grant defaults
+  rpc SetEngineParameters(SetEngineParametersRequest) returns (Ack);          // runtime timers + session cap
+  rpc GetEngineInfo      (Empty)                       returns (EngineInfo);   // version, capabilities, cursor, config hashes
+  rpc GetMetrics         (Empty)                       returns (MetricsReply); // runtime counters for fleet monitoring
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +64,8 @@ message EngineFrame {
     SessionInfo  session  = 5; // a row answering get/list
     ListEnd      list_end = 6; // terminates a get/list response
     HealthReply  health   = 7; // reply to a Ping, or periodic
+    EngineInfo   engine_info = 8; // reply to ControlFrame.get_engine_info
+    MetricsReply metrics     = 9; // reply to ControlFrame.get_metrics
   }
 }
 
@@ -60,6 +79,14 @@ message ControlFrame {
     Key           get    = 4;
     ListRequest   list   = 5;
     Ping          ping   = 6; // heartbeat; engine replies with a HealthReply
+    // Config-push + introspection over the stream (CGNAT path). Set* commands
+    // are answered by an EngineFrame CommandAck; get_* by the matching reply.
+    SetTierPoliciesRequest     set_tier_policies     = 7;
+    SetGardenRequest           set_garden            = 8;
+    SetEnforcementRequest      set_enforcement       = 9;
+    SetEngineParametersRequest set_engine_parameters = 10;
+    Empty                      get_engine_info       = 11; // -> EngineFrame.engine_info
+    Empty                      get_metrics           = 12; // -> EngineFrame.metrics
   }
 }
 
@@ -147,6 +174,7 @@ enum EventKind {
   EXPIRED        = 2;
   REVOKED        = 3;
   QUOTA_EXCEEDED = 4;
+  IDLE_TIMEOUT   = 5; // no metered traffic within idle_timeout (Idle-Timeout)
 }
 
 message SessionEvent {
@@ -156,10 +184,19 @@ message SessionEvent {
   uint64    bytes_in   = 4;
   uint64    bytes_out  = 5;
   int64     ts_unix    = 6;
+  // Monotonic per engine boot, starting at 1 (epoch = EngineInfo.boot_id).
+  // 0 = pre-replay engine. The control plane persists (boot_id, seq) as its
+  // consumption cursor and resumes via StreamReq.resume_after_seq.
+  uint64    seq        = 7;
 }
 
 message StreamReq {
   string store_id = 1;
+  // Replay events with seq > resume_after_seq still in the engine's in-RAM
+  // buffer, then continue live; if evicted, start at the oldest retained event.
+  uint64 resume_after_seq = 2;
+  // The boot_id the cursor belongs to; empty/mismatched => engine replays all.
+  string boot_id = 3;
 }
 
 message HealthReply {
@@ -167,6 +204,69 @@ message HealthReply {
   bool kernel_table_present  = 2;
   bool cp_connected          = 3;
   bool last_reconcile_ok     = 4;
+  bool enforcement_enabled   = 5; // global gate state (true = blocking unauth traffic)
+}
+
+// ---------------------------------------------------------------------------
+// Config-push + introspection (carried unary on-net, or as ControlFrame/
+// EngineFrame variants over Attach behind CGNAT).
+// ---------------------------------------------------------------------------
+
+message SetEnforcementRequest {
+  bool enabled = 1;
+}
+
+message SetGardenRequest {
+  repeated string fqdns = 1;
+}
+
+message TierPolicy {
+  string tier        = 1; // [a-z0-9_-]{1,32} (conventional: public | home | retail); control plane owns the set
+  uint32 ttl_seconds = 2; // 0 = unset -> engine built-in default (1800s)
+  uint64 quota_bytes = 3; // 0 = unset -> unlimited
+  uint64 rate_bps    = 4; // 0 = unset -> unlimited
+}
+
+message SetTierPoliciesRequest {
+  repeated TierPolicy policies = 1;
+}
+
+message SetEngineParametersRequest {
+  uint32 accounting_interval_secs = 1; // 0 = default 15;   bounds [1, 3600]
+  uint32 garden_tick_secs         = 2; // 0 = default 30;   bounds [5, 3600]
+  uint32 expiry_tick_secs         = 3; // 0 = default 1;    bounds [1, 60]
+  uint32 max_sessions             = 4; // 0 = default 4096; bounds [1, 16384]
+  // Idle-Timeout equivalent. UNLIKE the fields above, 0 = DISABLED (not a
+  // default); when set, bounds are [30, 86400].
+  uint32 idle_timeout_secs        = 5; // 0 = disabled;     bounds [30, 86400]
+}
+
+message EngineInfo {
+  string version = 1;               // engine CARGO_PKG_VERSION, e.g. "0.4.0"
+  string boot_id = 2;               // random per daemon start; event-seq epoch
+  uint64 event_latest_seq = 3;      // 0 = no events emitted yet this boot
+  uint64 event_oldest_seq = 4;      // oldest seq still replayable (0 = none)
+  repeated string capabilities = 5; // e.g. "tier_policies","engine_params","event_replay","shaper"
+  bool   enforcement_enabled = 6;
+  string tier_policies_hash = 7;
+  string engine_params_hash = 8;
+  string garden_hash = 9;
+}
+
+message MetricsReply {
+  uint64 sessions_active           = 1;  // gauge
+  uint64 grants_total              = 2;
+  uint64 grant_failures_total      = 3;  // incl. writer/kernel errors during grant
+  uint64 revokes_total             = 4;
+  uint64 expires_total             = 5;
+  uint64 quota_kills_total         = 6;
+  uint64 events_emitted_total      = 7;  // == EventLog latest_seq
+  uint64 events_evicted_total      = 8;  // events pushed out of the replay buffer
+  uint64 shaper_failures_total     = 9;
+  uint64 redirect_rejections_total = 10; // rate-limiter rejections on the :8080 responder
+  uint64 rss_bytes                 = 11; // /proc/self/status VmRSS (0 if unreadable)
+  uint64 uptime_secs               = 12;
+  uint64 idle_kills_total          = 13; // sessions torn down for idle_timeout
 }
 
 message Empty {}

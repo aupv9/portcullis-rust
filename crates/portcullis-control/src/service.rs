@@ -270,6 +270,57 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
         let h = self.enforcer.health().await;
         Ok(Response::new(convert::health_to_pb(h)))
     }
+
+    // -----------------------------------------------------------------------
+    // Config-push + introspection RPCs (reconciled superset proto). These are
+    // declared on the shared contract so the on-net/dev unary path matches the
+    // ControlFrame/EngineFrame variants used behind CGNAT, but the engine does
+    // not implement config-push or fleet introspection yet. Return Unimplemented
+    // (fail closed — never pretend a config was applied). Do NOT wire these to
+    // the enforcer until the config commands land.
+    // -----------------------------------------------------------------------
+
+    async fn set_enforcement(
+        &self,
+        _request: Request<pb::SetEnforcementRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        Err(Status::unimplemented("SetEnforcement not implemented by this engine"))
+    }
+
+    async fn set_garden(
+        &self,
+        _request: Request<pb::SetGardenRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        Err(Status::unimplemented("SetGarden not implemented by this engine"))
+    }
+
+    async fn set_tier_policies(
+        &self,
+        _request: Request<pb::SetTierPoliciesRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        Err(Status::unimplemented("SetTierPolicies not implemented by this engine"))
+    }
+
+    async fn set_engine_parameters(
+        &self,
+        _request: Request<pb::SetEngineParametersRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        Err(Status::unimplemented("SetEngineParameters not implemented by this engine"))
+    }
+
+    async fn get_engine_info(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::EngineInfo>, Status> {
+        Err(Status::unimplemented("GetEngineInfo not implemented by this engine"))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::MetricsReply>, Status> {
+        Err(Status::unimplemented("GetMetrics not implemented by this engine"))
+    }
 }
 
 /// Adapt a bounded `broadcast::Receiver<SessionEvent>` into a `Stream` of wire
@@ -521,7 +572,11 @@ mod tests {
         let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
         // Subscribe BEFORE emitting so the bounded channel buffers it.
         let resp = svc
-            .stream_events(Request::new(pb::StreamReq { store_id: "s".into() }))
+            .stream_events(Request::new(pb::StreamReq {
+                store_id: "s".into(),
+                resume_after_seq: 0,
+                boot_id: String::new(),
+            }))
             .await
             .unwrap();
         let mut stream = resp.into_inner();

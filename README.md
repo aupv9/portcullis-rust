@@ -55,11 +55,11 @@ flowchart LR
   ENG <-->|"engine dials out (CGNAT)<br/>gRPC / mTLS bidi stream<br/>control + accounting only"| CP
 
   subgraph CPlane["☁️ Control plane (central)"]
-    CP["Go control plane<br/>NAS-of-record"]
-    RAD["FreeRADIUS + Postgres"]
-    CH[("ClickHouse")]
-    CP --> RAD
-    CP --> CH
+    CP["Go control plane<br/>NAS-of-record (no RADIUS)"]
+    PG[("Postgres / Cloud SQL")]
+    RD[("Redis")]
+    CP --> PG
+    CP --> RD
   end
   PORTAL["🖥️ Next.js portal<br/>ad slots A/B/C/D"] --> CP
 ```
@@ -220,7 +220,7 @@ The engine is the **server**; the Go control plane is the client. See [`proto/en
 | `StreamEvents(StreamReq) → stream SessionEvent` | **engine → CP** | GRANTED / INTERIM / EXPIRED / REVOKED / QUOTA_EXCEEDED |
 | `Health(Empty) → HealthReply` | CP → engine | backend / kernel-table / cp-connected / reconcile flags |
 
-> 🔒 The engine **never speaks RADIUS** — it emits `SessionEvent`s; the control plane (NAS-of-record) translates them to RADIUS Accounting.
+> 🔒 The engine **never speaks RADIUS** — it emits `SessionEvent`s over the stream; the control plane (NAS-of-record) records them as session accounting in Postgres. **RADIUS has been dropped platform-wide** — there is no FreeRADIUS anywhere.
 
 ---
 

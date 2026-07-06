@@ -11,7 +11,7 @@ The full Cargo workspace is implemented and tested (9 crates; host build/tests +
 The **data-plane enforcement arm** of an ad-gated public-WiFi captive portal — a single Tokio daemon running on each site's OpenWrt router (built for the Teltonika RUTM11; one router per site, scaling to thousands of sites). Its one job: **no client reaches the internet until the central control plane explicitly grants a session**, then enforce/meter/expire that grant.
 
 It is **not** a NAS, not an ad renderer, not a business-logic owner. Hard boundaries (do not blur these):
-- **RADIUS** is spoken only by the Go control plane. `portcullis` never speaks RADIUS — it emits `SessionEvent`s; the control plane translates them to RADIUS Accounting.
+- **RADIUS has been dropped platform-wide** (no FreeRADIUS anywhere). `portcullis` never spoke RADIUS regardless — it emits `SessionEvent`s over the control stream and the Go control plane (NAS-of-record) records them as session accounting in Postgres.
 - **Ad decisioning / OTP / rendering** live in the Next.js portal + Rust/Axum ad engine.
 - `portcullis` owns exactly **one nftables table** (`inet wifihub`) and never touches any other table or fw3's rules.
 
@@ -76,7 +76,7 @@ cargo build --release --target mipsel-unknown-linux-musl
 ./scripts/dockerbuild make pm                    # produces bin/packages/<arch>/*.ipk
 ```
 
-When adding the proto, regenerate the tonic bindings from `proto/enforcement.proto` (the Go control plane shares this contract — keep `package wifihub.enforcement.v1` and the message fields in sync).
+Proto codegen is driven by **Buf** (`buf.yaml` + `buf.gen.yaml` at the crate-tree root), not `build.rs`. After editing `proto/enforcement.proto`, run `buf generate` from `core/portcullis-rust`: it writes the committed prost+tonic bindings to `crates/portcullis-control/src/gen/` (remote plugins `neoeinstein-prost`/`neoeinstein-tonic`, pinned to tonic 0.12/prost 0.13 — bump them together with the crate's tonic/prost). `lib.rs` `include!`s the prost file (which self-includes the `.tonic.rs`). `buf lint`/`buf build` guard style + wire-compat. The Go control plane keeps its OWN copy at `domain/server/proto/` — two folders, one wire contract: keep `package wifihub.enforcement.v1` and field tags in sync between them.
 
 ## When choosing an implementation approach
 

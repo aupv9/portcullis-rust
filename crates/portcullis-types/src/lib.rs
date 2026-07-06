@@ -449,9 +449,41 @@ pub trait MeteringSink: Send + Sync {
     async fn apply_counters(&self, snapshot: Vec<(MacAddr, Counters)>) -> Result<()>;
 }
 
+/// A `u64` counter/gauge cell that works on **every** target. 32-bit MIPS (the
+/// RUTM11, `mipsel-unknown-linux-musl`) has no native `AtomicU64`, so a tiny
+/// `Mutex` is used instead of pulling in `portable-atomic`. Every mutation is on
+/// a cold / low-frequency path (grants, revokes, expiries, reconciles, DNAT
+/// redirects, gauge refresh at scrape time — all human-paced or already the slow
+/// path), so lock contention is a non-issue. Replaces the `AtomicU64` metrics
+/// cells that would not link for mipsel.
+#[derive(Debug, Default)]
+pub struct Counter(std::sync::Mutex<u64>);
+
+impl Counter {
+    /// Increment by one.
+    pub fn inc(&self) {
+        self.inc_by(1);
+    }
+
+    /// Increment by `n`.
+    pub fn inc_by(&self, n: u64) {
+        *self.0.lock().expect("counter mutex poisoned") += n;
+    }
+
+    /// Overwrite with an absolute value (for gauge-style cells).
+    pub fn set(&self, n: u64) {
+        *self.0.lock().expect("counter mutex poisoned") = n;
+    }
+
+    /// Current value.
+    pub fn get(&self) -> u64 {
+        *self.0.lock().expect("counter mutex poisoned")
+    }
+}
+
 /// A monotonically-increasing counter exported over the `/metrics` endpoint
-/// (TDD §12). Kept as a small fixed enum so the sink is a couple of atomics —
-/// no label maps, no per-metric heap.
+/// (TDD §12). Kept as a small fixed enum so the sink is a couple of counter
+/// cells — no label maps, no per-metric heap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
     Grant,
@@ -474,7 +506,8 @@ pub enum Gauge {
 /// Port for recording metrics. Implemented by the concrete atomic-backed
 /// recorder in `portcullis-engined`; injected into the crates that have the
 /// increment sites (session, nft writer, redirect). Sync + cheap on purpose —
-/// an increment is one `AtomicU64::fetch_add`, never blocks the hot path.
+/// an increment is one short `Mutex`-guarded `+= 1` (see [`Counter`]), always on
+/// a low-frequency path, so it never meaningfully blocks the hot path.
 pub trait MetricsSink: Send + Sync {
     fn incr(&self, metric: Metric);
     fn set_gauge(&self, gauge: Gauge, value: u64);

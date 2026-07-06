@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portcullis-engine
+  namespace: portcullis
+  labels:
+    app: portcullis-engine
+spec:
+  replicas: 1
+  # nftables/kernel-as-truth: never run two writers against the same table.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: portcullis-engine
+  template:
+    metadata:
+      labels:
+        app: portcullis-engine
+    spec:
+      containers:
+        - name: portcullis
+          # Tag is patched by build-images.sh / rollback.sh (immutable vX.Y.Z).
+          image: portcullis-engine:v0.2.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # ensure_base() shells out to `nft` and is FATAL on failure, so the
+            # container needs to program netfilter. privileged covers nft +
+            # conntrack + neigh access in the k3d (Docker Desktop) VM kernel.
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          ports:
+            - name: grpc
+              containerPort: 8443
+            - name: redirect
+              containerPort: 8080
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: PORTCULLIS_CONFIG
+              value: "/etc/portcullis/config.toml"
+            - name: PORTCULLIS_PORTAL_URL
+              value: "https://portal.wifihub.vn"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/portcullis/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: tls
+              mountPath: /etc/portcullis/tls
+              readOnly: true
+            - name: hmac
+              mountPath: /etc/portcullis/hmac.key
+              subPath: hmac.key
+              readOnly: true
+            # Runtime state is tmpfs (RAM) only — mirrors the on-device invariant.
+            - name: run
+              mountPath: /tmp/portcullis
+            - name: dnsmasq
+              mountPath: /tmp/dnsmasq.d
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: portcullis-config
+        - name: tls
+          secret:
+            secretName: portcullis-mtls
+        - name: hmac
+          secret:
+            secretName: portcullis-hmac
+        - name: run
+          emptyDir:
+            medium: Memory
+        - name: dnsmasq
+          emptyDir:
+            medium: Memory

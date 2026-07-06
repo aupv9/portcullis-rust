@@ -24,7 +24,12 @@
 
 pub mod pb {
     #![allow(clippy::all)]
-    tonic::include_proto!("wifihub.enforcement.v1");
+    // Generated ahead-of-time by Buf (buf.yaml + buf.gen.yaml at core/portcullis-rust)
+    // and committed under src/gen; regenerate with `buf generate`. Only the prost
+    // file is included — it self-includes the companion .tonic.rs at its end, so
+    // the tonic client/server land in THIS module and their `super::` message
+    // references resolve to the prost messages here.
+    include!("gen/wifihub.enforcement.v1.rs");
 }
 
 pub mod channel;
