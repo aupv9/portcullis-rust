@@ -145,6 +145,10 @@ pub fn event_kind_from_pb(k: pb::EventKind) -> portcullis_types::EventKind {
         pb::EventKind::Expired => E::Expired,
         pb::EventKind::Revoked => E::Revoked,
         pb::EventKind::QuotaExceeded => E::QuotaExceeded,
+        // New wire variant (superset proto); the engine does not yet emit or
+        // map idle-timeout events. Fold onto Expired as the closest domain kind
+        // rather than panic — keeps the stream forward-compatible.
+        pb::EventKind::IdleTimeout => E::Expired,
     }
 }
 
@@ -156,6 +160,9 @@ pub fn session_event_to_pb(ev: &SessionEvent) -> pb::SessionEvent {
         bytes_in: ev.bytes_in,
         bytes_out: ev.bytes_out,
         ts_unix: ev.ts_unix,
+        // Per-boot monotonic sequence (superset proto). Event replay/resume is
+        // not wired yet; emit 0 (= pre-replay engine, per the proto comment).
+        seq: 0,
     }
 }
 
@@ -169,6 +176,10 @@ pub fn health_to_pb(h: HealthStatus) -> pb::HealthReply {
         kernel_table_present: h.kernel_table_present,
         cp_connected: h.cp_connected,
         last_reconcile_ok: h.last_reconcile_ok,
+        // Global enforcement gate (superset proto). The on/off toggle is not
+        // wired into HealthStatus yet; report enabled (the fail-closed default —
+        // the engine enforces unless explicitly told otherwise).
+        enforcement_enabled: true,
     }
 }
 

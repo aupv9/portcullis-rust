@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+deploy/k8s/tls/
+*.md
+!README.md

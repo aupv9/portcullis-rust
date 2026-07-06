@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: portcullis-engine
+  namespace: portcullis
+  labels:
+    app: portcullis-engine
+spec:
+  # NodePort so the Go control plane (running in the OTHER cluster, k3s-cluster)
+  # can dial the engine's gRPC across clusters via the k3d host port mapping
+  # (host 8443 -> nodePort 30843 -> pod 8443).
+  type: NodePort
+  selector:
+    app: portcullis-engine
+  ports:
+    - name: grpc
+      port: 8443
+      targetPort: 8443
+      nodePort: 30843
+      protocol: TCP
