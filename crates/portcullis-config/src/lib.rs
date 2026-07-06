@@ -90,10 +90,22 @@ pub struct Config {
     /// Walled-garden FQDNs always reachable pre-auth (portal, CDN, OTP, pay).
     #[serde(default)]
     pub garden_fqdn: Vec<String>,
+
+    /// Firewall backend selection (TDD §17 option A vs B): `"auto"` (default —
+    /// probe for kernel nft NAT support, fall back to ipset), `"nft"` (force
+    /// [`portcullis_types`]-agnostic `NftJsonBackend`), or `"ipset"` (force the
+    /// stock-RutOS `IpsetIptablesBackend`). `#[serde(default)]` so pre-existing
+    /// configs (which predate this field) still parse under `deny_unknown_fields`.
+    #[serde(default = "default_firewall_backend")]
+    pub firewall_backend: String,
 }
 
 fn default_metrics_port() -> u16 {
     9090
+}
+
+fn default_firewall_backend() -> String {
+    "auto".to_string()
 }
 
 fn default_reconcile_interval() -> u64 {
@@ -131,6 +143,7 @@ impl Default for Config {
             metrics_port: default_metrics_port(),
             reconcile_interval: default_reconcile_interval(),
             garden_fqdn: Vec::new(),
+            firewall_backend: default_firewall_backend(),
         }
     }
 }
@@ -270,6 +283,12 @@ impl Config {
         if self.default_ttl < 1 {
             return Err(Error::Config("default_ttl must be >= 1 second".to_string()));
         }
+        if !matches!(self.firewall_backend.as_str(), "auto" | "ipset" | "nft") {
+            return Err(Error::Config(format!(
+                "firewall_backend must be one of auto|ipset|nft, got '{}'",
+                self.firewall_backend
+            )));
+        }
         Ok(())
     }
 }
@@ -306,6 +325,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "default_rate_kbps" => cfg.default_rate_kbps = parse_u64(val)?,
         "metrics_port" => cfg.metrics_port = parse_u16(val)?,
         "reconcile_interval" => cfg.reconcile_interval = parse_u64(val)?,
+        "firewall_backend" => cfg.firewall_backend = val.to_string(),
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -407,7 +427,10 @@ pub fn diff(old: &Config, new: &Config) -> ReloadImpact {
         || old.cp_server_name != new.cp_server_name
         || old.hmac_key_file != new.hmac_key_file
         || old.responder_port != new.responder_port
-        || old.store_id != new.store_id;
+        || old.store_id != new.store_id
+        // The backend is selected once at composition (before the writer actor
+        // spawns); switching it means rebuilding the kernel ruleset.
+        || old.firewall_backend != new.firewall_backend;
 
     if requires_restart {
         ReloadImpact::RequiresRestart
@@ -555,6 +578,7 @@ config portcullis 'main'
                 "otp.gateway".to_string(),
                 "pay.example".to_string(),
             ],
+            firewall_backend: "auto".to_string(),
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
@@ -628,6 +652,49 @@ config portcullis 'main'
         let old = Config::from_uci_str(UCI_EXAMPLE).unwrap();
         let mut new = old.clone();
         new.responder_port = 9090;
+        assert_eq!(diff(&old, &new), ReloadImpact::RequiresRestart);
+    }
+
+    #[test]
+    fn firewall_backend_parses_defaults_and_validates() {
+        // Absent (pre-existing config files, UCI and TOML): defaults to "auto".
+        let old =
+            Config::from_uci_str("config portcullis 'main'\n    option store_id 'S'\n").unwrap();
+        assert_eq!(old.firewall_backend, "auto");
+        assert_eq!(Config::default().firewall_backend, "auto");
+
+        // Explicit UCI option parses.
+        let uci =
+            "config portcullis 'main'\n    option store_id 'S'\n    option firewall_backend 'nft'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert_eq!(cfg.firewall_backend, "nft");
+        cfg.validate().unwrap();
+
+        // Every allowed value validates; anything else is rejected.
+        for ok in ["auto", "ipset", "nft"] {
+            let cfg = Config {
+                store_id: "S".into(),
+                firewall_backend: ok.into(),
+                ..Config::default()
+            };
+            cfg.validate().unwrap();
+        }
+        let bad = Config {
+            store_id: "S".into(),
+            firewall_backend: "iptables".into(),
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn diff_firewall_backend_requires_restart() {
+        let old = Config {
+            store_id: "S".into(),
+            ..Config::default()
+        };
+        let mut new = old.clone();
+        new.firewall_backend = "nft".to_string();
         assert_eq!(diff(&old, &new), ReloadImpact::RequiresRestart);
     }
 

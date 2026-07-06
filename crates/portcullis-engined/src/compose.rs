@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portcullis_config::Config;
+use portcullis_nft::FirewallBackend;
 use portcullis_types::{
     CounterSource, Enforcer, Metric, MeteringSink, MetricsSink, RulesetWriter, UnknownKernelPolicy,
 };
@@ -29,9 +30,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //    responder before any of them start.
     let metrics = Arc::new(Metrics::default());
 
-    // 1. nft backend + single-owner writer actor (§7.9). The only path to
-    //    netfilter; every mutation is serialized through this actor.
-    let backend = Box::new(portcullis_nft::NftJsonBackend::default());
+    // 1. Firewall backend + single-owner writer actor (§7.9). The only path to
+    //    netfilter; every mutation is serialized through this actor. The backend
+    //    is config-selected (`firewall_backend`, default "auto"): stock RutOS has
+    //    no nftables NAT chain support (CONFIG_NFT_NAT unset), so the auto-probe
+    //    fails there and picks ipset + iptables/ip6tables (TDD §17 option B).
+    //    Both implement the same FirewallBackend seam.
+    let backend = detect_backend(&cfg);
     let (writer_handle, _writer_join) =
         portcullis_nft::spawn_with_metrics(backend, metrics.clone());
     let writer: Arc<dyn RulesetWriter> = Arc::new(writer_handle);
@@ -244,6 +249,65 @@ fn metrics_listen_addr(cfg: &Config) -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port))
 }
 
+/// Select the firewall backend per `cfg.firewall_backend` (TDD §17 option A vs
+/// B): `"nft"` / `"ipset"` force one; `"auto"` (the default) probes the running
+/// kernel for nft NAT chain support and falls back to the ipset+iptables backend
+/// on stock RutOS (no CONFIG_NFT_NAT). The ipset backend's tcp:80 REDIRECT is
+/// wired to `cfg.responder_port` so it always targets the live responder.
+fn detect_backend(cfg: &Config) -> Box<dyn FirewallBackend> {
+    detect_backend_with(cfg, "nft")
+}
+
+/// [`detect_backend`] with an injectable `nft` program path for the probe (unit
+/// tests stand in a fake script, cf. the shaper's `fake_tc` pattern).
+fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> {
+    let use_nft = match cfg.firewall_backend.as_str() {
+        "nft" => true,
+        "ipset" => false,
+        // "auto" — the only other value config validation admits.
+        _ => {
+            let supported = probe_nft_nat(nft_bin);
+            tracing::info!(nft_nat_supported = supported, "firewall_backend=auto kernel probe");
+            supported
+        }
+    };
+    if use_nft {
+        tracing::info!(backend = "nft", "firewall backend selected");
+        Box::new(portcullis_nft::NftJsonBackend::default())
+    } else {
+        tracing::info!(backend = "ipset", "firewall backend selected");
+        Box::new(
+            portcullis_nft::IpsetIptablesBackend::default()
+                .with_redirect_port(cfg.responder_port),
+        )
+    }
+}
+
+/// Probe whether the running kernel supports nftables NAT chains: add a scratch
+/// table, add a `type nat hook prerouting` chain into it (the exact step that
+/// fails ENOENT without CONFIG_NFT_NAT), then delete the table. Any failure —
+/// including a missing `nft` binary — means "no", never an error: the caller
+/// falls back to the ipset backend.
+fn probe_nft_nat(program: &str) -> bool {
+    let run = |args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !run(&["add", "table", "inet", "wifihub_probe"]) {
+        return false;
+    }
+    let nat_ok = run(&[
+        "add", "chain", "inet", "wifihub_probe", "probe", "{", "type", "nat", "hook",
+        "prerouting", "priority", "-50", ";", "}",
+    ]);
+    // Best-effort cleanup either way: the scratch table must not linger.
+    let _ = run(&["delete", "table", "inet", "wifihub_probe"]);
+    nat_ok
+}
+
 /// Load the engine's **client** identity + the pinned control-plane **server**
 /// CA from [`TLS_DIR`] and build the mutual-TLS client config used to dial the
 /// control plane. Returns `Ok(None)` if the material isn't present yet (the
@@ -286,5 +350,110 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fake `nft`: logs each invocation's args and exits 0, except (when
+    /// `fail_on_chain`) any command mentioning `chain` — mimicking a kernel
+    /// without CONFIG_NFT_NAT, where only the NAT chain add fails. Same
+    /// temp-dir script pattern as the shaper tests' `fake_tc`.
+    fn fake_nft(tag: &str, fail_on_chain: bool) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portcullis-nft-probe-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("nft.log");
+        let script = dir.join("nft");
+        let fail_branch = if fail_on_chain {
+            "case \"$*\" in *chain*) exit 1;; esac\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n{fail_branch}exit 0\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), log)
+    }
+
+    fn lines(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn probe_nft_nat_passes_and_cleans_up_when_kernel_supports_nat() {
+        let (nft, log) = fake_nft("nat-ok", false);
+        assert!(probe_nft_nat(&nft));
+        let cmds = lines(&log);
+        assert_eq!(cmds[0], "add table inet wifihub_probe");
+        assert_eq!(
+            cmds[1],
+            "add chain inet wifihub_probe probe { type nat hook prerouting priority -50 ; }"
+        );
+        assert_eq!(cmds[2], "delete table inet wifihub_probe");
+    }
+
+    #[test]
+    fn probe_nft_nat_fails_without_nat_chain_support_but_still_cleans_up() {
+        let (nft, log) = fake_nft("no-nat", true);
+        assert!(!probe_nft_nat(&nft));
+        // The scratch table is deleted even after the failed chain add.
+        assert!(lines(&log)
+            .iter()
+            .any(|c| c == "delete table inet wifihub_probe"));
+    }
+
+    #[test]
+    fn probe_nft_nat_fails_closed_when_nft_binary_is_missing() {
+        assert!(!probe_nft_nat("/nonexistent/portcullis-test-nft"));
+    }
+
+    /// `detect_backend_with` selects the right adapter. Backends are opaque
+    /// (`Box<dyn FirewallBackend>`), so we distinguish them by their error
+    /// variant on a doomed `ensure_base`: the ipset backend maps a spawn/exit
+    /// failure to `Error::Backend`, the nft backend to `Error::NftTransaction`.
+    #[tokio::test]
+    async fn detect_backend_honours_forced_choice_and_auto_probe() {
+        use portcullis_types::Error;
+
+        let cfg = |backend: &str| Config {
+            store_id: "S".into(),
+            firewall_backend: backend.to_string(),
+            ..Config::default()
+        };
+        // Point both backends at a binary that always fails, so ensure_base
+        // errors and reveals which adapter was chosen — without a kernel.
+        async fn is_ipset(b: Box<dyn FirewallBackend>) -> bool {
+            matches!(b.ensure_base().await, Err(Error::Backend(_)))
+        }
+        async fn is_nft(b: Box<dyn FirewallBackend>) -> bool {
+            matches!(b.ensure_base().await, Err(Error::NftTransaction(_)))
+        }
+
+        // Forced choices never run the probe (the nft binary is absent here).
+        let missing = "/nonexistent/portcullis-test-nft";
+        assert!(is_nft(detect_backend_with(&cfg("nft"), missing)).await);
+        assert!(is_ipset(detect_backend_with(&cfg("ipset"), missing)).await);
+
+        // auto: the probe outcome decides.
+        let (nat_ok, _log) = fake_nft("auto-yes", false);
+        assert!(is_nft(detect_backend_with(&cfg("auto"), &nat_ok)).await);
+        let (no_nat, _log) = fake_nft("auto-no", true);
+        assert!(is_ipset(detect_backend_with(&cfg("auto"), &no_nat)).await);
+        // ...and a box with no nft at all falls back to ipset (RUTM11 today).
+        assert!(is_ipset(detect_backend_with(&cfg("auto"), missing)).await);
     }
 }
