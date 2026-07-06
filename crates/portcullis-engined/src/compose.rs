@@ -242,8 +242,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Metrics endpoint listen address, bound on **loopback**: without the WireGuard
-/// overlay there is no private network to expose it on, and the endpoint is
+/// Metrics endpoint listen address, bound on **loopback**: the router has no
+/// private management network to expose it on, and the endpoint is
 /// unauthenticated (§12). Local scrape only.
 fn metrics_listen_addr(cfg: &Config) -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port))
