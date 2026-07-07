@@ -19,6 +19,7 @@ portcullis-session.workspace = true
 portcullis-redirect.workspace = true
 portcullis-garden.workspace = true
 portcullis-accounting.workspace = true
+portcullis-provision.workspace = true
 portcullis-control.workspace = true
 tonic = { workspace = true, features = ["tls"] }
 axum.workspace = true

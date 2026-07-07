@@ -10,8 +10,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use portcullis_types::{
-    Error, GrantParams, HealthStatus, MacAddr, Result, RevokeReason, SessionEvent, SessionId,
-    SessionInfo, Tier,
+    Error, GrantParams, HealthStatus, MacAddr, ProvisionSpec, ProvisionState, ProvisionStatus,
+    Result, RevokeReason, SessionEvent, SessionId, SessionInfo, Tier,
 };
 
 use crate::pb;
@@ -180,6 +180,57 @@ pub fn health_to_pb(h: HealthStatus) -> pb::HealthReply {
         // wired into HealthStatus yet; report enabled (the fail-closed default —
         // the engine enforces unless explicitly told otherwise).
         enforcement_enabled: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hotspot provisioning (P0.5): pb::ProvisionHotspotRequest -> domain
+// ProvisionSpec, and domain ProvisionStatus -> pb::ProvisionStatus.
+// ---------------------------------------------------------------------------
+
+/// Translate a wire [`pb::ProvisionHotspotRequest`] into the domain
+/// [`ProvisionSpec`] the provision subsystem consumes — so the subsystem never
+/// depends on the generated proto. Field-level validation (allowlist, subnet,
+/// timeout bounds) lives in `portcullis-provision::validate`; this mapping is a
+/// straight, total copy (empty strings carried verbatim, defaulted by the spec /
+/// validator), rejecting nothing here so the subsystem produces the single
+/// authoritative `CommandAck`.
+pub fn provision_request_to_spec(req: pb::ProvisionHotspotRequest) -> ProvisionSpec {
+    ProvisionSpec {
+        provision_id: req.provision_id,
+        enabled: req.enabled,
+        ssid: req.ssid,
+        radio: req.radio,
+        encryption: req.encryption,
+        key: req.key,
+        isolate: req.isolate,
+        bridge_name: req.bridge_name,
+        ipaddr: req.ipaddr,
+        netmask: req.netmask,
+        dhcp_start: req.dhcp_start,
+        dhcp_limit: req.dhcp_limit,
+        dhcp_leasetime: req.dhcp_leasetime,
+        confirm_timeout_secs: req.confirm_timeout_secs,
+    }
+}
+
+fn provision_state_to_pb(s: ProvisionState) -> pb::ProvisionState {
+    match s {
+        ProvisionState::AppliedPending => pb::ProvisionState::ProvisionAppliedPending,
+        ProvisionState::Committed => pb::ProvisionState::ProvisionCommitted,
+        ProvisionState::RolledBack => pb::ProvisionState::ProvisionRolledBack,
+        ProvisionState::Failed => pb::ProvisionState::ProvisionFailed,
+    }
+}
+
+/// Map a domain [`ProvisionStatus`] to the wire message the engine pushes up as
+/// an `EngineFrame.provision_status`.
+pub fn provision_status_to_pb(s: &ProvisionStatus) -> pb::ProvisionStatus {
+    pb::ProvisionStatus {
+        provision_id: s.provision_id.clone(),
+        state: provision_state_to_pb(s.state) as i32,
+        message: s.message.clone(),
+        bridge_name: s.bridge_name.clone(),
     }
 }
 
@@ -353,6 +404,58 @@ mod tests {
         assert_eq!(pb.bytes_in, 100);
         assert_eq!(pb.bytes_out, 200);
         assert_eq!(pb.ts_unix, 1_700_000_123);
+    }
+
+    #[test]
+    fn provision_request_maps_all_fields_to_spec() {
+        let req = pb::ProvisionHotspotRequest {
+            provision_id: "prov-9".into(),
+            ssid: "Guest".into(),
+            radio: "radio0".into(),
+            encryption: "psk2".into(),
+            key: "supersecret".into(),
+            isolate: true,
+            bridge_name: "br-hotspot".into(),
+            ipaddr: "10.0.0.1".into(),
+            netmask: "255.255.255.0".into(),
+            dhcp_start: "10".into(),
+            dhcp_limit: "200".into(),
+            dhcp_leasetime: "2h".into(),
+            confirm_timeout_secs: 120,
+            enabled: true,
+        };
+        let spec = provision_request_to_spec(req);
+        assert_eq!(spec.provision_id, "prov-9");
+        assert!(spec.enabled);
+        assert_eq!(spec.ssid, "Guest");
+        assert_eq!(spec.encryption, "psk2");
+        assert_eq!(spec.key, "supersecret");
+        assert!(spec.isolate);
+        assert_eq!(spec.bridge_name, "br-hotspot");
+        assert_eq!(spec.ipaddr, "10.0.0.1");
+        assert_eq!(spec.confirm_timeout_secs, 120);
+    }
+
+    #[test]
+    fn provision_status_maps_states() {
+        let cases = [
+            (ProvisionState::AppliedPending, pb::ProvisionState::ProvisionAppliedPending),
+            (ProvisionState::Committed, pb::ProvisionState::ProvisionCommitted),
+            (ProvisionState::RolledBack, pb::ProvisionState::ProvisionRolledBack),
+            (ProvisionState::Failed, pb::ProvisionState::ProvisionFailed),
+        ];
+        for (domain, wire) in cases {
+            let s = ProvisionStatus {
+                provision_id: "p".into(),
+                state: domain,
+                message: "m".into(),
+                bridge_name: "br-hotspot".into(),
+            };
+            let pb = provision_status_to_pb(&s);
+            assert_eq!(pb.state, wire as i32);
+            assert_eq!(pb.provision_id, "p");
+            assert_eq!(pb.bridge_name, "br-hotspot");
+        }
     }
 
     #[test]

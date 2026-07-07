@@ -11,7 +11,8 @@ use anyhow::Context;
 use portcullis_config::Config;
 use portcullis_nft::FirewallBackend;
 use portcullis_types::{
-    CounterSource, Enforcer, Metric, MeteringSink, MetricsSink, RulesetWriter, UnknownKernelPolicy,
+    CounterSource, Enforcer, Metric, MeteringSink, MetricsSink, Provisioner, RulesetWriter,
+    UnknownKernelPolicy,
 };
 
 use crate::metrics::Metrics;
@@ -70,6 +71,31 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // 4b. Hotspot provisioning subsystem (P0.5) — spawned as an ISOLATED task,
+    //     completely separate from enforcement (its own actor + tmpfs state +
+    //     shell-out runner). It renders a FIXED allowlist of UCI sections and
+    //     holds each apply under a LOCAL commit-confirm watchdog. Fail-OPEN
+    //     (rollback), the ONE exception to the engine's fail-closed rule: it
+    //     manages router config, not enforcement, and kernel-as-truth means a
+    //     provision fault never drops an authorized client. Spawned BEFORE the
+    //     control channel so its handle + status stream can be wired in.
+    let (provisioner, provision_status_rx, provision_join) =
+        portcullis_provision::run_provision_subsystem(
+            portcullis_provision::ProcessRunner,
+            portcullis_provision::DEFAULT_STATE_DIR,
+            // The redirect-responder port opened by the hotspot_portal firewall
+            // rule so pre-auth guests can reach the captive redirect. LOCAL engine
+            // setting, not on the wire.
+            cfg.responder_port,
+        );
+    let provisioner: Arc<dyn Provisioner> = Arc::new(provisioner);
+    tasks.push(provision_join);
+    // The control channel consumes the status stream (fans it into outbound
+    // EngineFrames). Kept in an Option so it is moved into the channel task only
+    // when TLS is present; otherwise the subsystem still runs (watchdog rollback
+    // works without the CP) and statuses simply buffer in the mpsc.
+    let mut provision_status_rx = Some(provision_status_rx);
+
     // 5. Outbound control channel over mutual TLS (§13, CGNAT design doc). The
     //    engine dials the control plane and holds a long-lived bidirectional
     //    stream: commands arrive on it, events/acks are pushed back. It
@@ -82,14 +108,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 store_id: cfg.store_id.clone(),
                 keepalive: Duration::from_secs(cfg.control_keepalive_secs.max(1)),
                 reconnect_max: Duration::from_secs(cfg.control_reconnect_max_secs.max(1)),
+                provisioner: provisioner.clone(),
             };
             let enforcer = w.mgr.clone() as Arc<dyn Enforcer>;
             let events = w.event_tx.clone();
             let mgr = w.mgr.clone();
             let m = metrics.clone();
+            // Move the provision status stream into the channel task so it fans
+            // ProvisionStatus (incl. unsolicited watchdog ROLLED_BACK) up to the CP.
+            let status_rx = provision_status_rx
+                .take()
+                .expect("provision status receiver taken once");
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
-                portcullis_control::run_control_channel(chan_cfg, enforcer, events, move |up| {
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, status_rx, move |up| {
                     mgr.set_cp_connected(up);
                     if !up {
                         m.incr(Metric::CpDisconnect);
@@ -271,14 +303,28 @@ fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> 
             supported
         }
     };
+    // P0: scope the FORWARD/PREROUTING gate to the hotspot interface so only the
+    // public SSID is gated (br-lan untouched). Empty `hotspot_iface` → the
+    // backend installs no gate at all (fail-OPEN; see the backend docs).
     if use_nft {
-        tracing::info!(backend = "nft", "firewall backend selected");
-        Box::new(portcullis_nft::NftJsonBackend::default())
+        tracing::info!(
+            backend = "nft",
+            hotspot_iface = %cfg.hotspot_iface,
+            "firewall backend selected"
+        );
+        Box::new(
+            portcullis_nft::NftJsonBackend::default().with_hotspot_iface(cfg.hotspot_iface.clone()),
+        )
     } else {
-        tracing::info!(backend = "ipset", "firewall backend selected");
+        tracing::info!(
+            backend = "ipset",
+            hotspot_iface = %cfg.hotspot_iface,
+            "firewall backend selected"
+        );
         Box::new(
             portcullis_nft::IpsetIptablesBackend::default()
-                .with_redirect_port(cfg.responder_port),
+                .with_redirect_port(cfg.responder_port)
+                .with_hotspot_iface(cfg.hotspot_iface.clone()),
         )
     }
 }
