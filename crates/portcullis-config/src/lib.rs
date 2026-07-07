@@ -98,6 +98,17 @@ pub struct Config {
     /// configs (which predate this field) still parse under `deny_unknown_fields`.
     #[serde(default = "default_firewall_backend")]
     pub firewall_backend: String,
+
+    /// The hotspot interface enforcement scopes to (P0) — the bridge the
+    /// `portcullis-provision` subsystem creates (P0.5), e.g. `br-hotspot`. Empty
+    /// (the default) means "not scoped": enforcement binds fleet-wide as before,
+    /// which is the pre-P0 behaviour and the root of the whole-LAN-block incident.
+    /// Once provisioning lands, the control plane fills this with the resulting
+    /// bridge so the FORWARD/redirect jumps gate ONLY the public SSID.
+    /// `#[serde(default)]` so pre-existing configs still parse under
+    /// `deny_unknown_fields`.
+    #[serde(default)]
+    pub hotspot_iface: String,
 }
 
 fn default_metrics_port() -> u16 {
@@ -144,6 +155,7 @@ impl Default for Config {
             reconcile_interval: default_reconcile_interval(),
             garden_fqdn: Vec::new(),
             firewall_backend: default_firewall_backend(),
+            hotspot_iface: String::new(),
         }
     }
 }
@@ -322,6 +334,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "metrics_port" => cfg.metrics_port = parse_u16(val)?,
         "reconcile_interval" => cfg.reconcile_interval = parse_u64(val)?,
         "firewall_backend" => cfg.firewall_backend = val.to_string(),
+        "hotspot_iface" => cfg.hotspot_iface = val.to_string(),
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -565,6 +578,7 @@ config portcullis 'main'
                 "pay.example".to_string(),
             ],
             firewall_backend: "auto".to_string(),
+            hotspot_iface: "br-hotspot".to_string(),
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
@@ -671,6 +685,21 @@ config portcullis 'main'
             ..Config::default()
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn hotspot_iface_parses_and_defaults_empty() {
+        // Absent (pre-existing configs): defaults to empty (not scoped).
+        let old =
+            Config::from_uci_str("config portcullis 'main'\n    option store_id 'S'\n").unwrap();
+        assert_eq!(old.hotspot_iface, "");
+        assert_eq!(Config::default().hotspot_iface, "");
+
+        // Explicit UCI option parses (the P0.5 bridge feeding P0 scoping).
+        let uci = "config portcullis 'main'\n    option store_id 'S'\n    option hotspot_iface 'br-hotspot'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert_eq!(cfg.hotspot_iface, "br-hotspot");
+        cfg.validate().unwrap();
     }
 
     #[test]

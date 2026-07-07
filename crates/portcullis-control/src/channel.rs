@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::SinkExt;
-use portcullis_types::{Enforcer, SessionEvent};
-use tokio::sync::broadcast;
+use portcullis_types::{Enforcer, ProvisionStatus, Provisioner, SessionEvent};
+use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
 use tonic::Request;
 
@@ -56,6 +56,12 @@ pub struct ControlChannelConfig {
     pub keepalive: Duration,
     /// Cap on the reconnect backoff.
     pub reconnect_max: Duration,
+    /// Hotspot provisioning subsystem (P0.5). `provision_hotspot` /
+    /// `confirm_provision` frames are dispatched here; its upward
+    /// [`ProvisionStatus`] stream (see [`run`]'s `provision_status`) is fanned
+    /// into outbound `EngineFrame`s. Isolated from the [`Enforcer`]: a provision
+    /// fault cannot affect enforcement.
+    pub provisioner: Arc<dyn Provisioner>,
 }
 
 /// Run the control channel until `events` is closed (engine shutting down).
@@ -63,10 +69,17 @@ pub struct ControlChannelConfig {
 /// Reconnects forever with backoff. `cp_state(true/false)` is invoked on
 /// connect/disconnect so the composition root can drive the `cp_connected`
 /// health flag and the disconnect metric.
+///
+/// `provision_status` is the provision subsystem's upward mpsc: [`ProvisionStatus`]
+/// frames (including the UNSOLICITED watchdog-driven `ROLLED_BACK`) are fanned
+/// into outbound `EngineFrame`s. Held across reconnects like the event receiver
+/// — a status emitted while disconnected buffers in the mpsc; the control plane
+/// re-reads provision state on reconnect regardless.
 pub async fn run<F>(
     cfg: ControlChannelConfig,
     enforcer: Arc<dyn Enforcer>,
     events: broadcast::Sender<SessionEvent>,
+    mut provision_status: mpsc::Receiver<ProvisionStatus>,
     cp_state: F,
 ) where
     F: Fn(bool) + Send + Sync,
@@ -82,7 +95,7 @@ pub async fn run<F>(
         // a disconnect (and count the metric) after an actual up->down
         // transition — not on every failed dial.
         let mut established = false;
-        match connect_once(&cfg, &enforcer, &mut rx, &cp_state, &mut established).await {
+        match connect_once(&cfg, &enforcer, &mut rx, &mut provision_status, &cp_state, &mut established).await {
             Ok(()) => tracing::info!("control channel closed; reconnecting"),
             Err(e) => tracing::warn!(error = %e, "control channel error; reconnecting"),
         }
@@ -112,6 +125,7 @@ async fn connect_once<F>(
     cfg: &ControlChannelConfig,
     enforcer: &Arc<dyn Enforcer>,
     rx: &mut broadcast::Receiver<SessionEvent>,
+    provision_status: &mut mpsc::Receiver<ProvisionStatus>,
     cp_state: &F,
     established: &mut bool,
 ) -> portcullis_types::Result<()>
@@ -145,7 +159,7 @@ where
         tokio::select! {
             msg = inbound.message() => match msg {
                 Ok(Some(ctrl)) => {
-                    for out in handle_control_frame(ctrl, enforcer).await {
+                    for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner).await {
                         if out_tx.send(out).await.is_err() {
                             return Ok(()); // outbound half gone; reconnect
                         }
@@ -166,17 +180,39 @@ where
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()), // shutdown
             },
+            ps = provision_status.recv() => match ps {
+                Some(s) => {
+                    // Unsolicited (correlation_id 0): the CP correlates by
+                    // provision_id, and a watchdog rollback has no request to echo.
+                    let f = frame(0, engine_frame::Msg::ProvisionStatus(convert::provision_status_to_pb(&s)));
+                    if out_tx.send(f).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                // The provision subsystem shut down; keep the control channel up
+                // (enforcement is independent) — just stop forwarding statuses.
+                None => {
+                    tracing::debug!("provision status channel closed; stopping status fan-out");
+                    // Fall through: replace the closed receiver behaviour by
+                    // simply not selecting it again would require restructuring;
+                    // a closed mpsc recv() returns None immediately forever, which
+                    // would busy-loop. Guard by awaiting pending instead.
+                    std::future::pending::<()>().await;
+                }
+            },
         }
     }
 }
 
-/// Dispatch one inbound [`pb::ControlFrame`] to the domain [`Enforcer`] and
-/// produce the answering [`pb::EngineFrame`]s (echoing `correlation_id`).
+/// Dispatch one inbound [`pb::ControlFrame`] to the domain [`Enforcer`] (or the
+/// isolated [`Provisioner`]) and produce the answering [`pb::EngineFrame`]s
+/// (echoing `correlation_id`).
 ///
 /// Never panics; every error path yields an ack/list-end with `ok: false`.
 async fn handle_control_frame(
     ctrl: pb::ControlFrame,
     enforcer: &Arc<dyn Enforcer>,
+    provisioner: &Arc<dyn Provisioner>,
 ) -> Vec<pb::EngineFrame> {
     let cid = ctrl.correlation_id;
     let Some(msg) = ctrl.msg else {
@@ -227,6 +263,28 @@ async fn handle_control_frame(
         control_frame::Msg::Ping(_) => {
             let h = convert::health_to_pb(enforcer.health().await);
             vec![frame(cid, engine_frame::Msg::Health(h))]
+        }
+        // Hotspot provisioning (P0.5) — routed to the ISOLATED Provisioner, never
+        // the Enforcer. `provision` returns once APPLIED_PENDING (or an error if
+        // validation/apply failed and nothing durable was left); the terminal
+        // COMMITTED / ROLLED_BACK outcome arrives later as an UNSOLICITED
+        // ProvisionStatus over the status fan-out. We answer the request itself
+        // with a CommandAck: ok = accepted/applied-pending, err = ack_err (never
+        // a silent accept, never a panic that could reach enforcement).
+        control_frame::Msg::ProvisionHotspot(p) => {
+            let spec = convert::provision_request_to_spec(p);
+            let ack = match provisioner.provision(spec).await {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(portcullis_types::Error::Other(e.to_string())),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        control_frame::Msg::ConfirmProvision(c) => {
+            let ack = match provisioner.confirm(&c.provision_id).await {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(portcullis_types::Error::Other(e.to_string())),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
         }
         // Config-push + introspection variants from the reconciled superset proto
         // (SetTierPolicies/SetGarden/SetEnforcement/SetEngineParameters and the
@@ -397,6 +455,46 @@ mod tests {
         }
     }
 
+    /// Records provision/confirm calls; never applies anything. `fail` makes
+    /// both operations error (to exercise the ack-err path).
+    struct MockProvisioner {
+        fail: bool,
+        provisions: AtomicUsize,
+        confirms: AtomicUsize,
+    }
+    impl MockProvisioner {
+        fn ok() -> Arc<Self> {
+            Arc::new(MockProvisioner { fail: false, provisions: AtomicUsize::new(0), confirms: AtomicUsize::new(0) })
+        }
+        fn failing() -> Arc<Self> {
+            Arc::new(MockProvisioner { fail: true, provisions: AtomicUsize::new(0), confirms: AtomicUsize::new(0) })
+        }
+    }
+
+    #[tonic::async_trait]
+    impl portcullis_types::Provisioner for MockProvisioner {
+        async fn provision(&self, _spec: portcullis_types::ProvisionSpec) -> Result<(), portcullis_types::ProvisionError> {
+            self.provisions.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(portcullis_types::ProvisionError::Invalid("bad spec".into()));
+            }
+            Ok(())
+        }
+        async fn confirm(&self, _id: &str) -> Result<(), portcullis_types::ProvisionError> {
+            self.confirms.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(portcullis_types::ProvisionError::NoPending("x".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A no-op provisioner arc for the enforcement-focused tests that don't drive
+    /// a provision frame.
+    fn prov() -> Arc<dyn Provisioner> {
+        MockProvisioner::ok() as Arc<dyn Provisioner>
+    }
+
     fn grant_ctrl(cid: u64, mac: &str) -> pb::ControlFrame {
         pb::ControlFrame {
             correlation_id: cid,
@@ -422,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn grant_frame_acks_ok_and_echoes_correlation() {
-        let out = handle_control_frame(grant_ctrl(7, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(grant_ctrl(7, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].correlation_id, 7);
         let ack = ack_of(&out[0]);
@@ -432,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_grant_acks_error_not_silent_accept() {
-        let out = handle_control_frame(grant_ctrl(1, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::failing() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(grant_ctrl(1, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov()).await;
         let ack = ack_of(&out[0]);
         assert!(!ack.ok);
         assert!(!ack.message.is_empty());
@@ -440,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_mac_grant_acks_error() {
-        let out = handle_control_frame(grant_ctrl(1, "garbage"), &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(grant_ctrl(1, "garbage"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         let ack = ack_of(&out[0]);
         assert!(!ack.ok);
     }
@@ -454,7 +552,7 @@ mod tests {
                 reason: pb::RevokeReason::RevokeQuota as i32,
             })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         assert_eq!(out[0].correlation_id, 3);
         assert!(ack_of(&out[0]).ok);
     }
@@ -465,7 +563,7 @@ mod tests {
             correlation_id: 5,
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Session(_))));
         match &out[1].msg {
@@ -481,7 +579,7 @@ mod tests {
             correlation_id: 5,
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov()).await;
         assert_eq!(out.len(), 1);
         match &out[0].msg {
             Some(engine_frame::Msg::ListEnd(le)) => assert!(!le.ok),
@@ -495,7 +593,7 @@ mod tests {
             correlation_id: 9,
             msg: Some(control_frame::Msg::List(pb::ListRequest { page_size: 0, page_token: String::new() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         // 2 sessions + 1 list_end
         assert_eq!(out.len(), 3);
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Session(_))));
@@ -509,7 +607,7 @@ mod tests {
             correlation_id: 2,
             msg: Some(control_frame::Msg::Ping(pb::Ping { ts_unix: 100 })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         match &out[0].msg {
             Some(engine_frame::Msg::Health(h)) => assert!(h.backend_ok),
             other => panic!("expected Health, got {other:?}"),
@@ -519,8 +617,95 @@ mod tests {
     #[tokio::test]
     async fn empty_frame_is_ignored_no_panic() {
         let ctrl = pb::ControlFrame { correlation_id: 0, msg: None };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>)).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
         assert!(out.is_empty());
+    }
+
+    fn provision_ctrl(cid: u64, id: &str) -> pb::ControlFrame {
+        pb::ControlFrame {
+            correlation_id: cid,
+            msg: Some(control_frame::Msg::ProvisionHotspot(pb::ProvisionHotspotRequest {
+                provision_id: id.into(),
+                ssid: "Guest".into(),
+                radio: "radio0".into(),
+                encryption: "none".into(),
+                key: String::new(),
+                isolate: true,
+                bridge_name: "br-hotspot".into(),
+                ipaddr: "10.0.0.1".into(),
+                netmask: "255.255.255.0".into(),
+                dhcp_start: "10".into(),
+                dhcp_limit: "200".into(),
+                dhcp_leasetime: "2h".into(),
+                confirm_timeout_secs: 90,
+                enabled: true,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_frame_acks_ok_and_routes_to_provisioner() {
+        let p = MockProvisioner::ok();
+        let out = handle_control_frame(
+            provision_ctrl(11, "prov-1"),
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(p.clone() as Arc<dyn Provisioner>),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].correlation_id, 11);
+        assert!(ack_of(&out[0]).ok);
+        assert_eq!(p.provisions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provision_frame_failure_acks_error_not_silent_accept() {
+        let out = handle_control_frame(
+            provision_ctrl(1, "prov-x"),
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(MockProvisioner::failing() as Arc<dyn Provisioner>),
+        )
+        .await;
+        let ack = ack_of(&out[0]);
+        assert!(!ack.ok);
+        assert!(!ack.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_frame_acks_ok_and_routes_to_provisioner() {
+        let p = MockProvisioner::ok();
+        let ctrl = pb::ControlFrame {
+            correlation_id: 12,
+            msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest {
+                provision_id: "prov-1".into(),
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(p.clone() as Arc<dyn Provisioner>),
+        )
+        .await;
+        assert_eq!(out[0].correlation_id, 12);
+        assert!(ack_of(&out[0]).ok);
+        assert_eq!(p.confirms.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn confirm_unknown_provision_acks_error() {
+        let ctrl = pb::ControlFrame {
+            correlation_id: 3,
+            msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest {
+                provision_id: "nope".into(),
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(MockProvisioner::failing() as Arc<dyn Provisioner>),
+        )
+        .await;
+        assert!(!ack_of(&out[0]).ok);
     }
 
     #[tokio::test]

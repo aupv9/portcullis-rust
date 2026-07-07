@@ -94,6 +94,20 @@ fn match_set_accept(proto: &str, field: &str, set_name: &str) -> Value {
     ])
 }
 
+/// An `iifname == "<iface>"` match statement (P0 interface scoping). Prepended
+/// to the gating rules (the forward `drop` and the prerouting `redirect`) so
+/// they fire ONLY for ingress from the hotspot SSID; everything else (br-lan…)
+/// falls through untouched.
+fn iifname_match(iface: &str) -> Value {
+    json!({
+        "match": {
+            "op": "==",
+            "left": { "meta": { "key": "iifname" } },
+            "right": iface
+        }
+    })
+}
+
 /// `ct state established,related accept`.
 fn ct_established_accept() -> Value {
     json!([
@@ -108,17 +122,33 @@ fn ct_established_accept() -> Value {
     ])
 }
 
-/// A single terminal verdict statement, e.g. `drop`.
-fn verdict_only(verdict: &str) -> Value {
-    json!([ { verdict: null } ])
-}
-
 /// Build the full base ruleset as the `nft -j` command array.
 ///
 /// The returned value is `{"nftables": [ ... ]}` — the exact shape `nft -j -f -`
 /// consumes on stdin. Order matters: table, then sets, then chains, then the
 /// rules within each chain in evaluation order.
-pub fn build_base_ruleset() -> Value {
+///
+/// P0 interface scoping (`hotspot_iface`):
+/// - `Some("br-hotspot")` → the two **gating** rules (the prerouting
+///   `tcp dport 80 redirect` and the forward terminal `drop`) are prefixed with
+///   `iifname "br-hotspot"`, so ONLY ingress from the hotspot SSID is
+///   redirected/dropped. br-lan and every other interface fall through untouched.
+/// - `None` (or empty) → those two gating rules are **omitted entirely**
+///   (fail-OPEN): the table, sets, chains and the auth/garden `accept` rules are
+///   still created (so kernel-as-truth adoption keeps working), but nothing is
+///   redirected or dropped — the whole router, including br-lan, is untouched.
+///   This is the ONE deliberate fail-open, gated on an unset interface.
+pub fn build_base_ruleset(hotspot_iface: Option<&str>) -> Value {
+    let iface = hotspot_iface.filter(|s| !s.trim().is_empty());
+    if iface.is_none() {
+        tracing::warn!(
+            target: "portcullis_nft",
+            "no hotspot_iface configured: enforcement is INERT — the wifihub table/sets/chains \
+             are created but the prerouting redirect and forward drop are omitted (nothing gated; \
+             br-lan and the whole router are untouched). Set hotspot_iface to gate the SSID."
+        );
+    }
+
     let prio_dstnat = json!({ "base": "dstnat", "offset": PRIO_DSTNAT_OFFSET });
     let prio_filter = json!({ "base": "filter", "offset": PRIO_FILTER_OFFSET });
 
@@ -149,20 +179,21 @@ pub fn build_base_ruleset() -> Value {
         CHAIN_PREROUTING,
         match_set_accept("ip6", "daddr", SET_GARDEN6),
     )));
-    // tcp dport 80 redirect to :8080
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        json!([
-            {
-                "match": {
-                    "op": "==",
-                    "left": { "payload": { "protocol": "tcp", "field": "dport" } },
-                    "right": 80
-                }
-            },
-            { "redirect": { "port": REDIRECT_PORT } }
-        ]),
-    )));
+    // [iifname "<iface>"] tcp dport 80 redirect to :8080 — the captive gate.
+    // Only emitted when scoped to a hotspot iface (fail-OPEN otherwise).
+    if let Some(iface) = iface {
+        let mut expr: Vec<Value> = Vec::new();
+        expr.push(iifname_match(iface));
+        expr.push(json!({
+            "match": {
+                "op": "==",
+                "left": { "payload": { "protocol": "tcp", "field": "dport" } },
+                "right": 80
+            }
+        }));
+        expr.push(json!({ "redirect": { "port": REDIRECT_PORT } }));
+        cmds.push(add(rule_obj(CHAIN_PREROUTING, Value::Array(expr))));
+    }
 
     // forward rules, in order; terminal drop last.
     cmds.push(add(rule_obj(CHAIN_FORWARD, ct_established_accept())));
@@ -178,14 +209,32 @@ pub fn build_base_ruleset() -> Value {
         CHAIN_FORWARD,
         match_set_accept("ip6", "daddr", SET_GARDEN6),
     )));
-    cmds.push(add(rule_obj(CHAIN_FORWARD, verdict_only("drop"))));
+    // [iifname "<iface>"] drop — the only globally-terminal verdict (§7.1).
+    // Only emitted when scoped to a hotspot iface (fail-OPEN otherwise).
+    if let Some(iface) = iface {
+        cmds.push(add(rule_obj(
+            CHAIN_FORWARD,
+            json!([iifname_match(iface), { "drop": null }]),
+        )));
+    }
 
     json!({ "nftables": cmds })
 }
 
 /// Build the equivalent human-readable nft script (for DEBUG logging only;
-/// the JSON form is what is actually applied).
-pub fn build_base_script() -> String {
+/// the JSON form is what is actually applied). Mirrors [`build_base_ruleset`]'s
+/// P0 interface scoping: with a hotspot iface the gate rules carry `iifname`;
+/// with none they are omitted (fail-OPEN).
+pub fn build_base_script(hotspot_iface: Option<&str>) -> String {
+    let iface = hotspot_iface.filter(|s| !s.trim().is_empty());
+    // The two gating lines, scoped to the hotspot iface or omitted entirely.
+    let (redirect_line, drop_line) = match iface {
+        Some(i) => (
+            format!("\t\tiifname \"{i}\" tcp dport 80 redirect to :{REDIRECT_PORT}\n"),
+            format!("\t\tiifname \"{i}\" drop\n"),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         "table {fam} {tbl} {{\n\
          \tset {g4} {{ type ipv4_addr; flags interval; }}\n\
@@ -196,7 +245,7 @@ pub fn build_base_script() -> String {
          \t\tether saddr @{auth} accept\n\
          \t\tip daddr @{g4} accept\n\
          \t\tip6 daddr @{g6} accept\n\
-         \t\ttcp dport 80 redirect to :{port}\n\
+         {redirect_line}\
          \t}}\n\
          \tchain {fwd} {{\n\
          \t\ttype filter hook forward priority filter - 50; policy accept;\n\
@@ -204,7 +253,7 @@ pub fn build_base_script() -> String {
          \t\tether saddr @{auth} accept\n\
          \t\tip daddr @{g4} accept\n\
          \t\tip6 daddr @{g6} accept\n\
-         \t\tdrop\n\
+         {drop_line}\
          \t}}\n\
          }}\n",
         fam = TABLE_FAMILY,
@@ -214,7 +263,6 @@ pub fn build_base_script() -> String {
         auth = SET_AUTH,
         pre = CHAIN_PREROUTING,
         fwd = CHAIN_FORWARD,
-        port = REDIRECT_PORT,
     )
 }
 
@@ -222,13 +270,55 @@ pub fn build_base_script() -> String {
 mod tests {
     use super::*;
 
+    /// The scoped iface used by the "gate present" assertions.
+    const IFACE: &str = "br-hotspot";
+
     fn cmds(v: &Value) -> &Vec<Value> {
         v.get("nftables").unwrap().as_array().unwrap()
     }
 
+    /// Collect the `expr` arrays of every rule in `chain`.
+    fn rule_exprs<'a>(rs: &'a Value, chain: &str) -> Vec<&'a Vec<Value>> {
+        cmds(rs)
+            .iter()
+            .filter_map(|c| c.get("add").and_then(|a| a.get("rule")))
+            .filter(|r| r["chain"] == chain)
+            .map(|r| r["expr"].as_array().unwrap())
+            .collect()
+    }
+
+    /// Does this rule expr redirect tcp dport 80 to :8080?
+    fn is_redirect_80(expr: &[Value]) -> bool {
+        let dport80 = expr.iter().any(|e| {
+            e.get("match")
+                .map(|m| {
+                    m["left"]["payload"]["protocol"] == "tcp"
+                        && m["left"]["payload"]["field"] == "dport"
+                        && m["right"] == 80
+                })
+                .unwrap_or(false)
+        });
+        let redirect = expr
+            .iter()
+            .any(|e| e.get("redirect").map(|r| r["port"] == 8080).unwrap_or(false));
+        dport80 && redirect
+    }
+
+    /// The `iifname == "<iface>"` guard, if this rule carries one.
+    fn iifname_of(expr: &[Value]) -> Option<&str> {
+        expr.iter().find_map(|e| {
+            let m = e.get("match")?;
+            if m["left"]["meta"]["key"] == "iifname" {
+                m["right"].as_str()
+            } else {
+                None
+            }
+        })
+    }
+
     #[test]
     fn ruleset_has_single_inet_wifihub_table() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(Some(IFACE));
         let tables: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("table")))
@@ -240,7 +330,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_all_three_sets_with_correct_types_and_flags() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(Some(IFACE));
         let sets: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("set")))
@@ -261,7 +351,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_both_chains_with_right_hooks_and_priorities() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(Some(IFACE));
         let chains: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("chain")))
@@ -283,60 +373,115 @@ mod tests {
 
     #[test]
     fn prerouting_redirects_tcp_80_to_8080() {
-        let rs = build_base_ruleset();
-        let redirect = cmds(&rs).iter().any(|c| {
-            let Some(rule) = c.get("add").and_then(|a| a.get("rule")) else {
-                return false;
-            };
-            if rule["chain"] != "prerouting" {
-                return false;
-            }
-            let expr = rule["expr"].as_array().unwrap();
-            let has_dport_80 = expr.iter().any(|e| {
-                e.get("match")
-                    .map(|m| {
-                        m["left"]["payload"]["protocol"] == "tcp"
-                            && m["left"]["payload"]["field"] == "dport"
-                            && m["right"] == 80
-                    })
-                    .unwrap_or(false)
-            });
-            let has_redirect_8080 = expr
-                .iter()
-                .any(|e| e.get("redirect").map(|r| r["port"] == 8080).unwrap_or(false));
-            has_dport_80 && has_redirect_8080
-        });
+        let rs = build_base_ruleset(Some(IFACE));
+        let redirect = rule_exprs(&rs, "prerouting")
+            .iter()
+            .any(|expr| is_redirect_80(expr));
         assert!(redirect, "prerouting must redirect tcp dport 80 to :8080");
     }
 
     #[test]
-    fn forward_chain_ends_with_terminal_drop() {
-        let rs = build_base_ruleset();
-        // The last rule in the forward chain must be a bare drop.
-        let forward_rules: Vec<&Value> = cmds(&rs)
-            .iter()
-            .filter_map(|c| c.get("add").and_then(|a| a.get("rule")))
-            .filter(|r| r["chain"] == "forward")
-            .collect();
-        let last = forward_rules.last().unwrap();
-        let expr = last["expr"].as_array().unwrap();
-        assert_eq!(expr.len(), 1);
-        assert!(expr[0].get("drop").is_some(), "last forward rule must be drop");
+    fn forward_chain_ends_with_iface_scoped_drop() {
+        let rs = build_base_ruleset(Some(IFACE));
+        // P0: the terminal forward rule is `iifname "<iface>" drop`.
+        let forward = rule_exprs(&rs, "forward");
+        let last = forward.last().unwrap();
+        // Two statements now: the iifname guard, then the drop.
+        assert_eq!(last.len(), 2);
+        assert_eq!(iifname_of(last), Some(IFACE), "drop must be iface-scoped");
+        assert!(
+            last.iter().any(|e| e.get("drop").is_some()),
+            "last forward rule must drop"
+        );
+    }
+
+    #[test]
+    fn scoped_gate_carries_iifname_on_both_backends_rules() {
+        // P0 (nft): with a hotspot iface, BOTH gating rules carry
+        // `iifname "<iface>"` — the prerouting redirect and the forward drop.
+        let rs = build_base_ruleset(Some(IFACE));
+
+        let redirect = rule_exprs(&rs, "prerouting")
+            .into_iter()
+            .find(|expr| is_redirect_80(expr))
+            .expect("redirect rule present");
+        assert_eq!(
+            iifname_of(redirect),
+            Some(IFACE),
+            "prerouting redirect must be scoped to the hotspot iface"
+        );
+
+        let drop = rule_exprs(&rs, "forward")
+            .into_iter()
+            .find(|expr| expr.iter().any(|e| e.get("drop").is_some()))
+            .expect("forward drop present");
+        assert_eq!(
+            iifname_of(drop),
+            Some(IFACE),
+            "forward drop must be scoped to the hotspot iface"
+        );
+    }
+
+    #[test]
+    fn unset_iface_omits_gate_but_keeps_base_fail_open() {
+        // P0 fail-OPEN: with no hotspot iface the table/sets/chains + auth/garden
+        // accept rules are STILL created (kernel-as-truth adoption keeps working),
+        // but NO prerouting redirect and NO forward drop are emitted — nothing is
+        // gated, so br-lan and the whole router are untouched.
+        for none in [None, Some(""), Some("   ")] {
+            let rs = build_base_ruleset(none);
+
+            // Base still present.
+            let tables = cmds(&rs)
+                .iter()
+                .filter(|c| c.get("add").and_then(|a| a.get("table")).is_some())
+                .count();
+            assert_eq!(tables, 1, "table still created ({none:?})");
+            let sets = cmds(&rs)
+                .iter()
+                .filter(|c| c.get("add").and_then(|a| a.get("set")).is_some())
+                .count();
+            assert_eq!(sets, 3, "all sets still created ({none:?})");
+            let chains = cmds(&rs)
+                .iter()
+                .filter(|c| c.get("add").and_then(|a| a.get("chain")).is_some())
+                .count();
+            assert_eq!(chains, 2, "both chains still created ({none:?})");
+
+            // The auth/garden RETURN(accept) exemptions are still present.
+            let s = serde_json::to_string(&rs).unwrap();
+            assert!(s.contains("@auth"), "auth exemption kept ({none:?})");
+            assert!(s.contains("@garden4"), "garden exemption kept ({none:?})");
+
+            // But NO gate: no redirect, no drop.
+            let has_redirect = rule_exprs(&rs, "prerouting")
+                .iter()
+                .any(|expr| is_redirect_80(expr));
+            assert!(!has_redirect, "no redirect when unset ({none:?})");
+            let has_drop = rule_exprs(&rs, "forward")
+                .iter()
+                .any(|expr| expr.iter().any(|e| e.get("drop").is_some()));
+            assert!(!has_drop, "no forward drop when unset ({none:?})");
+            // And never an iifname match (nothing to scope).
+            assert!(!s.contains("iifname"), "no iifname when unset ({none:?})");
+        }
     }
 
     #[test]
     fn no_postrouting_or_masquerade() {
         // We must not duplicate fw3's NAT.
-        let rs = build_base_ruleset();
-        let s = serde_json::to_string(&rs).unwrap();
-        assert!(!s.contains("postrouting"), "must not define postrouting");
-        assert!(!s.contains("masquerade"), "must not masquerade");
-        assert!(!s.contains("snat"), "must not snat");
+        for iface in [Some(IFACE), None] {
+            let rs = build_base_ruleset(iface);
+            let s = serde_json::to_string(&rs).unwrap();
+            assert!(!s.contains("postrouting"), "must not define postrouting");
+            assert!(!s.contains("masquerade"), "must not masquerade");
+            assert!(!s.contains("snat"), "must not snat");
+        }
     }
 
     #[test]
     fn forward_accepts_established_and_auth() {
-        let rs = build_base_ruleset();
+        let rs = build_base_ruleset(Some(IFACE));
         let s = serde_json::to_string(&rs).unwrap();
         assert!(s.contains("established"));
         assert!(s.contains("@auth"));
@@ -346,13 +491,24 @@ mod tests {
 
     #[test]
     fn script_form_matches_invariants() {
-        let script = build_base_script();
+        let script = build_base_script(Some(IFACE));
         assert!(script.contains("table inet wifihub"));
         assert!(script.contains("priority dstnat - 50"));
         assert!(script.contains("priority filter - 50"));
-        assert!(script.contains("redirect to :8080"));
+        // Both gating lines are iface-scoped.
+        assert!(script.contains("iifname \"br-hotspot\" tcp dport 80 redirect to :8080"));
+        assert!(script.contains("iifname \"br-hotspot\" drop"));
         assert!(script.trim_end().ends_with("}"));
-        assert!(script.contains("drop"));
         assert!(!script.contains("masquerade"));
+    }
+
+    #[test]
+    fn script_form_omits_gate_when_unset() {
+        let script = build_base_script(None);
+        assert!(script.contains("table inet wifihub"));
+        // Base structure intact, but no gate + no iifname.
+        assert!(!script.contains("redirect to"));
+        assert!(!script.contains("drop"));
+        assert!(!script.contains("iifname"));
     }
 }

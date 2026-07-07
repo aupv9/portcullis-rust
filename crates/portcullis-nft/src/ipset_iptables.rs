@@ -61,6 +61,13 @@ pub struct IpsetIptablesBackend {
     /// Port the tcp:80 REDIRECT sends to — MUST equal the responder's listen
     /// port so the hijacked request reaches the portcullis responder.
     redirect_port: u16,
+    /// The hotspot interface enforcement is scoped to (P0). `Some("br-hotspot")`
+    /// → the FORWARD/PREROUTING jumps carry `-i <iface>` so ONLY that ingress is
+    /// gated (br-lan untouched). `None`/empty → the jumps are NOT installed at
+    /// all (fail-OPEN — nothing to gate; NEVER blanket-block the whole router).
+    /// The `wifihub_fwd`/`wifihub_pre` chains + auth/garden sets are still
+    /// created either way (kernel-as-truth adoption keeps working).
+    hotspot_iface: Option<String>,
 }
 
 impl Default for IpsetIptablesBackend {
@@ -72,6 +79,7 @@ impl Default for IpsetIptablesBackend {
                 ("ip6tables".to_string(), IPSET_G6.to_string()),
             ],
             redirect_port: REDIRECT_PORT,
+            hotspot_iface: None,
         }
     }
 }
@@ -81,6 +89,19 @@ impl IpsetIptablesBackend {
     /// `responder_port` so the REDIRECT and the responder always agree.
     pub fn with_redirect_port(mut self, port: u16) -> Self {
         self.redirect_port = port;
+        self
+    }
+
+    /// Scope enforcement to the hotspot interface (P0). An empty string means
+    /// "not scoped" → the interface-scoped FORWARD/PREROUTING jumps are omitted
+    /// (fail-OPEN). Pass the daemon's configured `hotspot_iface`.
+    pub fn with_hotspot_iface(mut self, iface: impl Into<String>) -> Self {
+        let iface = iface.into();
+        self.hotspot_iface = if iface.trim().is_empty() {
+            None
+        } else {
+            Some(iface)
+        };
         self
     }
 
@@ -98,6 +119,7 @@ impl IpsetIptablesBackend {
                 (ip6tables_bin.into(), IPSET_G6.to_string()),
             ],
             redirect_port: REDIRECT_PORT,
+            hotspot_iface: None,
         }
     }
 
@@ -163,12 +185,20 @@ impl IpsetIptablesBackend {
     /// Ensure a user chain exists and is populated with exactly `rules`, then
     /// ensure a single jump into it from `hook` at position 1. `table` is
     /// `"nat"` or `"filter"`. Idempotent; safe to re-run.
+    ///
+    /// P0 interface scoping: when `iface` is `Some(name)` the jump carries
+    /// `-i <name>` so ONLY ingress from the hotspot SSID is gated (br-lan and
+    /// every other interface fall straight through to fw3). When `iface` is
+    /// `None` the jump is **not installed at all** (fail-OPEN — nothing to gate;
+    /// NEVER blanket-block the whole router). The chain itself is always created
+    /// and populated so kernel-as-truth adoption keeps working.
     async fn ensure_chain(
         ipt: &str,
         table: &str,
         chain: &str,
         hook: &str,
         rules: &[Vec<&str>],
+        iface: Option<&str>,
     ) -> Result<()> {
         // Create the chain if missing (ignore "already exists"), then flush so
         // the rule set below is authoritative. Flushing touches only our own
@@ -182,12 +212,19 @@ impl IpsetIptablesBackend {
             Self::run(ipt, &args).await?;
         }
 
-        // Ensure exactly one jump hook -> chain, inserted ahead of fw3 (pos 1).
-        // The chain is fully populated (drop-terminated) before the jump is
-        // added, so first-boot never has a fail-open window.
-        let check = ["-t", table, "-C", hook, "-j", chain];
+        // Ensure exactly one interface-scoped jump hook -> chain, inserted ahead
+        // of fw3 (pos 1). The chain is fully populated (drop-terminated) before
+        // the jump is added, so first-boot never has a fail-open window.
+        //
+        // With no hotspot_iface configured we deliberately install NO jump: the
+        // gating chain exists (adoption works) but nothing reaches it, so the
+        // whole router — including br-lan — is untouched (the P0 fail-OPEN case).
+        let Some(iface) = iface else {
+            return Ok(());
+        };
+        let check = ["-t", table, "-C", hook, "-i", iface, "-j", chain];
         if !Self::run_ok(ipt, &check).await {
-            Self::run(ipt, &["-t", table, "-I", hook, "1", "-j", chain]).await?;
+            Self::run(ipt, &["-t", table, "-I", hook, "1", "-i", iface, "-j", chain]).await?;
         }
         Ok(())
     }
@@ -215,7 +252,18 @@ impl FirewallBackend for IpsetIptablesBackend {
         .await?;
 
         // 2. Per-family iptables chains. Same shape for v4/v6, only the garden
-        //    set differs.
+        //    set differs. The FORWARD/PREROUTING jumps into these chains are
+        //    scoped to `hotspot_iface` (P0); with no iface configured they are
+        //    not installed at all (fail-OPEN — see below).
+        let iface = self.hotspot_iface.as_deref();
+        if iface.is_none() {
+            tracing::warn!(
+                target: "portcullis_nft",
+                "no hotspot_iface configured: enforcement is INERT — the wifihub_fwd/wifihub_pre \
+                 chains + sets are created but NOT jumped from FORWARD/PREROUTING (nothing gated; \
+                 br-lan and the whole router are untouched). Set hotspot_iface to gate the SSID."
+            );
+        }
         let port = self.redirect_port.to_string();
         for (ipt, gset) in &self.tables {
             // nat prerouting: exempt authed + garden, else redirect :80 -> :8080.
@@ -226,7 +274,7 @@ impl FirewallBackend for IpsetIptablesBackend {
                     "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", &port,
                 ],
             ];
-            Self::ensure_chain(ipt, "nat", CHAIN_NAT, "PREROUTING", &nat_rules).await?;
+            Self::ensure_chain(ipt, "nat", CHAIN_NAT, "PREROUTING", &nat_rules, iface).await?;
 
             // filter forward: pre-filter that only DROPs unauth non-garden new
             // traffic; everything else RETURNs and falls through to fw3.
@@ -238,7 +286,7 @@ impl FirewallBackend for IpsetIptablesBackend {
                 vec!["-m", "set", "--match-set", gset, "dst", "-j", "RETURN"],
                 vec!["-j", "DROP"],
             ];
-            Self::ensure_chain(ipt, "filter", CHAIN_FWD, "FORWARD", &fwd_rules).await?;
+            Self::ensure_chain(ipt, "filter", CHAIN_FWD, "FORWARD", &fwd_rules, iface).await?;
         }
         Ok(())
     }
@@ -384,6 +432,69 @@ zz:zz:zz:zz:zz:zz timeout 5
     }
 
     #[tokio::test]
+    async fn ensure_base_scopes_jumps_to_hotspot_iface() {
+        // P0: with hotspot_iface set, the FORWARD + PREROUTING jumps into
+        // wifihub_fwd/wifihub_pre must carry `-i br-hotspot` so ONLY the hotspot
+        // SSID is gated; br-lan is never touched.
+        let (ipset, _id) = fake_ipset("scope-set");
+        let (ipt, ilog, _iid) = fake_iptables("scope-set");
+        let backend = IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt)
+            .with_hotspot_iface("br-hotspot");
+        backend.ensure_base().await.unwrap();
+
+        let jumps = jump_inserts(&ilog);
+        // One jump per hook per family (v4 + v6): 2 FORWARD + 2 PREROUTING = 4.
+        let fwd: Vec<&String> = jumps.iter().filter(|l| l.contains(CHAIN_FWD)).collect();
+        let pre: Vec<&String> = jumps.iter().filter(|l| l.contains(CHAIN_NAT)).collect();
+        assert_eq!(fwd.len(), 2, "one FORWARD jump per family: {jumps:?}");
+        assert_eq!(pre.len(), 2, "one PREROUTING jump per family: {jumps:?}");
+
+        // The EXACT scoped argv forms.
+        assert!(
+            fwd.iter().all(|l| l
+                .contains("-t filter -I FORWARD 1 -i br-hotspot -j wifihub_fwd")),
+            "FORWARD jump must be `-i br-hotspot`: {fwd:?}"
+        );
+        assert!(
+            pre.iter().all(|l| l
+                .contains("-t nat -I PREROUTING 1 -i br-hotspot -j wifihub_pre")),
+            "PREROUTING jump must be `-i br-hotspot`: {pre:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_base_omits_jumps_when_iface_unset_but_builds_chains() {
+        // P0 fail-OPEN: with NO hotspot_iface, install NO FORWARD/PREROUTING
+        // jump (never blanket-block the whole router) — but the chains + their
+        // rules ARE still created so kernel-as-truth adoption keeps working.
+        let (ipset, _id) = fake_ipset("scope-unset");
+        let (ipt, ilog, _iid) = fake_iptables("scope-unset");
+        // Default backend has no iface; be explicit that empty == unset too.
+        let backend =
+            IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt).with_hotspot_iface("");
+        backend.ensure_base().await.unwrap();
+
+        // No jump was inserted at all.
+        assert!(
+            jump_inserts(&ilog).is_empty(),
+            "no jump must be inserted when hotspot_iface is unset"
+        );
+
+        // The chains were still created and populated (adoption keeps working):
+        // the wifihub_fwd DROP rule and the wifihub_pre REDIRECT rule are appended.
+        let all = lines(&ilog);
+        assert!(
+            all.iter().any(|l| l.contains("-A wifihub_fwd") && l.contains("DROP")),
+            "wifihub_fwd chain must still be populated with its DROP: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|l| l.contains("-A wifihub_pre") && l.contains("REDIRECT")),
+            "wifihub_pre chain must still be populated with its REDIRECT: {all:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn add_del_list_roundtrip_against_fake_ipset() {
         // Drive the backend through a fake `ipset` shell script that records
         // `add`/`del` into a members file and answers `list` from it — exercising
@@ -470,5 +581,58 @@ exit 0
         std::fs::write(&script, body).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         (script.display().to_string(), dir)
+    }
+
+    /// A fake `iptables`/`ip6tables` binary that records every invocation's argv
+    /// (one line per call) into a log file. `-N` (create chain) and `-C` (check)
+    /// exit non-zero so `ensure_chain` treats the chain as absent and the jump as
+    /// missing — forcing the real `-F`/`-A`/`-I` mutation path to run and be
+    /// logged. Every other command exits 0. Returns `(bin, log, dir)`.
+    fn fake_iptables(tag: &str) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portcullis-ipt-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ipt.log");
+        std::fs::write(&log, "").unwrap();
+        let script = dir.join("iptables");
+        // `-C` (jump-exists probe) must fail so the `-I` insert runs; `-N` is
+        // ignored idempotently by the caller via run_ok either way.
+        let body = format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+for a in "$@"; do
+  case "$a" in
+    -C) exit 1;;
+    -N) exit 1;;
+  esac
+done
+exit 0
+"#,
+            log = log.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), log, dir)
+    }
+
+    /// All logged iptables invocations, one argv per line.
+    fn lines(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Just the jump-insert invocations (`-I <hook> 1 ... -j <chain>`).
+    fn jump_inserts(log: &std::path::Path) -> Vec<String> {
+        lines(log)
+            .into_iter()
+            .filter(|l| l.contains("-I ") && l.contains("-j "))
+            .collect()
     }
 }

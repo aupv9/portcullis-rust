@@ -66,6 +66,7 @@ message EngineFrame {
     HealthReply  health   = 7; // reply to a Ping, or periodic
     EngineInfo   engine_info = 8; // reply to ControlFrame.get_engine_info
     MetricsReply metrics     = 9; // reply to ControlFrame.get_metrics
+    ProvisionStatus provision_status = 10; // hotspot-provision lifecycle (P0.5); unsolicited on watchdog rollback
   }
 }
 
@@ -87,6 +88,9 @@ message ControlFrame {
     SetEngineParametersRequest set_engine_parameters = 10;
     Empty                      get_engine_info       = 11; // -> EngineFrame.engine_info
     Empty                      get_metrics           = 12; // -> EngineFrame.metrics
+    // Hotspot network provisioning (P0.5) — isolated portcullis-provision subsystem.
+    ProvisionHotspotRequest    provision_hotspot     = 13; // -> CommandAck (accepted; then applied-pending)
+    ConfirmProvisionRequest    confirm_provision     = 14; // CP confirms a pending provision -> CommandAck
   }
 }
 
@@ -267,6 +271,58 @@ message MetricsReply {
   uint64 rss_bytes                 = 11; // /proc/self/status VmRSS (0 if unreadable)
   uint64 uptime_secs               = 12;
   uint64 idle_kills_total          = 13; // sessions torn down for idle_timeout
+}
+
+// ---------------------------------------------------------------------------
+// Hotspot network provisioning (P0.5). The engine's ISOLATED portcullis-provision
+// subsystem renders a FIXED allowlist of UCI sections (network.br_hotspot,
+// network.hotspot, wireless.wifi_hotspot, dhcp.hotspot), applies + reloads, then
+// holds the change under a LOCAL commit-confirm watchdog: the control plane must
+// send ConfirmProvision before confirm_timeout_secs or the engine ROLLS BACK
+// (CGNAT has no inbound rescue). The inet wifihub enforcement table is never
+// touched; this subsystem is fail-OPEN (rollback), unlike enforcement.
+// ---------------------------------------------------------------------------
+
+// Desired state of the hotspot network the engine should provision. Only the
+// owned sections are ever written; br-lan / admin config is never touched.
+message ProvisionHotspotRequest {
+  string provision_id         = 1;  // control-plane issued; echoed in ProvisionStatus + ConfirmProvision
+  string ssid                 = 2;  // public SSID
+  string radio                = 3;  // wifi-device, e.g. "radio0" (empty = engine default)
+  string encryption           = 4;  // "none" (open captive) | "psk2"...; empty = "none"
+  string key                  = 5;  // PSK when encryption != none
+  bool   isolate              = 6;  // AP client isolation
+  string bridge_name          = 7;  // resulting L2 iface, e.g. "br-hotspot" (== enforcement hotspot_iface)
+  string ipaddr               = 8;  // gateway IP on the hotspot net, e.g. "10.0.0.1"
+  string netmask              = 9;  // e.g. "255.255.255.0"
+  string dhcp_start           = 10; // dnsmasq pool start (host part), e.g. "10"
+  string dhcp_limit           = 11; // pool size, e.g. "200"
+  string dhcp_leasetime       = 12; // e.g. "2h"
+  uint32 confirm_timeout_secs = 13; // local watchdog window; 0 = engine default (90); bounds [15, 600]
+  bool   enabled              = 14; // true = provision/enable; false = teardown owned sections (also confirm-guarded)
+}
+
+// Control plane confirms a still-pending provision (it re-observed the engine
+// healthy after apply). Must arrive before the watchdog fires.
+message ConfirmProvisionRequest {
+  string provision_id = 1;
+}
+
+enum ProvisionState {
+  PROVISION_UNKNOWN         = 0;
+  PROVISION_APPLIED_PENDING = 1; // applied + reloaded; awaiting ConfirmProvision within the window
+  PROVISION_COMMITTED       = 2; // confirmed; change is permanent
+  PROVISION_ROLLED_BACK     = 3; // watchdog fired (no confirm) -> reverted to snapshot
+  PROVISION_FAILED          = 4; // apply/validation error -> no change persisted (or reverted)
+}
+
+// engine -> control plane: reports the lifecycle of a provision. Unsolicited
+// (correlation_id 0) for watchdog-driven ROLLED_BACK; correlated for the rest.
+message ProvisionStatus {
+  string         provision_id = 1;
+  ProvisionState state        = 2;
+  string         message      = 3; // detail (error, iface, etc.)
+  string         bridge_name  = 4; // resulting iface on COMMITTED (feeds enforcement scoping)
 }
 
 message Empty {}

@@ -8,6 +8,7 @@ members = [
     "crates/portcullis-redirect",
     "crates/portcullis-garden",
     "crates/portcullis-accounting",
+    "crates/portcullis-provision",
     "crates/portcullis-control",
     "crates/portcullis-engined",
 ]
@@ -29,6 +30,7 @@ portcullis-session = { path = "crates/portcullis-session" }
 portcullis-redirect = { path = "crates/portcullis-redirect" }
 portcullis-garden = { path = "crates/portcullis-garden" }
 portcullis-accounting = { path = "crates/portcullis-accounting" }
+portcullis-provision = { path = "crates/portcullis-provision" }
 portcullis-control = { path = "crates/portcullis-control" }
 # async / runtime. `rt` (current-thread scheduler) — NOT `rt-multi-thread`: the
 # daemon is I/O-bound control/metering (the data plane is in the kernel), so the
@@ -69,10 +71,14 @@ notes = "host build/test target is the CI-equivalent (TDD §15); device target i
 
 # Size-first release profile for the embedded MIPS target (TDD §14: <15 MB binary,
 # <30 MB RSS). The .text is mmap'd so a smaller binary is also the biggest RSS win.
-# `panic = "abort"` is intentionally NOT set (keeps unwinding semantics); revisit
-# with `-Z build-std panic_immediate_abort` only if the on-device size check falls short.
 [profile.release]
 opt-level = "z"      # optimize for size; benchmark "s" too (sometimes smaller+faster after LTO)
 lto = true           # link-time optimization across crates
 codegen-units = 1    # one unit -> better cross-fn optimization (slower compile)
 strip = true         # drop symbols (large win on static musl)
+panic = "abort"      # RUT200 flash budget (Tier 0): drop unwinding tables/landing pads.
+                     # The engine is fail-closed — a panic aborting is the desired behavior.
+                     # Affects RELEASE only (the .ipk); `cargo test` uses the dev profile
+                     # (unwind), so #[should_panic] + the test harness still work. Pairs
+                     # with the cross-build's -Z build-std=std,panic_abort AND
+                     # -Z build-std-features=panic_immediate_abort (strips std's panic-fmt).

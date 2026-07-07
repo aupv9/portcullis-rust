@@ -11,7 +11,7 @@
 pub struct EngineFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
-    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub msg: ::core::option::Option<engine_frame::Msg>,
 }
 /// Nested message and enum types in `EngineFrame`.
@@ -43,6 +43,9 @@ pub mod engine_frame {
         /// reply to ControlFrame.get_metrics
         #[prost(message, tag="9")]
         Metrics(super::MetricsReply),
+        /// hotspot-provision lifecycle (P0.5); unsolicited on watchdog rollback
+        #[prost(message, tag="10")]
+        ProvisionStatus(super::ProvisionStatus),
     }
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
@@ -52,7 +55,7 @@ pub mod engine_frame {
 pub struct ControlFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
-    #[prost(oneof="control_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(oneof="control_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
     pub msg: ::core::option::Option<control_frame::Msg>,
 }
 /// Nested message and enum types in `ControlFrame`.
@@ -87,6 +90,14 @@ pub mod control_frame {
         /// -> EngineFrame.metrics
         #[prost(message, tag="12")]
         GetMetrics(super::Empty),
+        /// Hotspot network provisioning (P0.5) — isolated portcullis-provision subsystem.
+        ///
+        /// -> CommandAck (accepted; then applied-pending)
+        #[prost(message, tag="13")]
+        ProvisionHotspot(super::ProvisionHotspotRequest),
+        /// CP confirms a pending provision -> CommandAck
+        #[prost(message, tag="14")]
+        ConfirmProvision(super::ConfirmProvisionRequest),
     }
 }
 /// Sent once by the engine as the first frame after Connect. Lets the control
@@ -393,6 +404,88 @@ pub struct MetricsReply {
     #[prost(uint64, tag="13")]
     pub idle_kills_total: u64,
 }
+// ---------------------------------------------------------------------------
+// Hotspot network provisioning (P0.5). The engine's ISOLATED portcullis-provision
+// subsystem renders a FIXED allowlist of UCI sections (network.br_hotspot,
+// network.hotspot, wireless.wifi_hotspot, dhcp.hotspot), applies + reloads, then
+// holds the change under a LOCAL commit-confirm watchdog: the control plane must
+// send ConfirmProvision before confirm_timeout_secs or the engine ROLLS BACK
+// (CGNAT has no inbound rescue). The inet wifihub enforcement table is never
+// touched; this subsystem is fail-OPEN (rollback), unlike enforcement.
+// ---------------------------------------------------------------------------
+
+/// Desired state of the hotspot network the engine should provision. Only the
+/// owned sections are ever written; br-lan / admin config is never touched.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProvisionHotspotRequest {
+    /// control-plane issued; echoed in ProvisionStatus + ConfirmProvision
+    #[prost(string, tag="1")]
+    pub provision_id: ::prost::alloc::string::String,
+    /// public SSID
+    #[prost(string, tag="2")]
+    pub ssid: ::prost::alloc::string::String,
+    /// wifi-device, e.g. "radio0" (empty = engine default)
+    #[prost(string, tag="3")]
+    pub radio: ::prost::alloc::string::String,
+    /// "none" (open captive) | "psk2"...; empty = "none"
+    #[prost(string, tag="4")]
+    pub encryption: ::prost::alloc::string::String,
+    /// PSK when encryption != none
+    #[prost(string, tag="5")]
+    pub key: ::prost::alloc::string::String,
+    /// AP client isolation
+    #[prost(bool, tag="6")]
+    pub isolate: bool,
+    /// resulting L2 iface, e.g. "br-hotspot" (== enforcement hotspot_iface)
+    #[prost(string, tag="7")]
+    pub bridge_name: ::prost::alloc::string::String,
+    /// gateway IP on the hotspot net, e.g. "10.0.0.1"
+    #[prost(string, tag="8")]
+    pub ipaddr: ::prost::alloc::string::String,
+    /// e.g. "255.255.255.0"
+    #[prost(string, tag="9")]
+    pub netmask: ::prost::alloc::string::String,
+    /// dnsmasq pool start (host part), e.g. "10"
+    #[prost(string, tag="10")]
+    pub dhcp_start: ::prost::alloc::string::String,
+    /// pool size, e.g. "200"
+    #[prost(string, tag="11")]
+    pub dhcp_limit: ::prost::alloc::string::String,
+    /// e.g. "2h"
+    #[prost(string, tag="12")]
+    pub dhcp_leasetime: ::prost::alloc::string::String,
+    /// local watchdog window; 0 = engine default (90); bounds \[15, 600\]
+    #[prost(uint32, tag="13")]
+    pub confirm_timeout_secs: u32,
+    /// true = provision/enable; false = teardown owned sections (also confirm-guarded)
+    #[prost(bool, tag="14")]
+    pub enabled: bool,
+}
+/// Control plane confirms a still-pending provision (it re-observed the engine
+/// healthy after apply). Must arrive before the watchdog fires.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfirmProvisionRequest {
+    #[prost(string, tag="1")]
+    pub provision_id: ::prost::alloc::string::String,
+}
+/// engine -> control plane: reports the lifecycle of a provision. Unsolicited
+/// (correlation_id 0) for watchdog-driven ROLLED_BACK; correlated for the rest.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProvisionStatus {
+    #[prost(string, tag="1")]
+    pub provision_id: ::prost::alloc::string::String,
+    #[prost(enumeration="ProvisionState", tag="2")]
+    pub state: i32,
+    /// detail (error, iface, etc.)
+    #[prost(string, tag="3")]
+    pub message: ::prost::alloc::string::String,
+    /// resulting iface on COMMITTED (feeds enforcement scoping)
+    #[prost(string, tag="4")]
+    pub bridge_name: ::prost::alloc::string::String,
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Empty {
@@ -461,6 +554,45 @@ impl EventKind {
             "REVOKED" => Some(Self::Revoked),
             "QUOTA_EXCEEDED" => Some(Self::QuotaExceeded),
             "IDLE_TIMEOUT" => Some(Self::IdleTimeout),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProvisionState {
+    ProvisionUnknown = 0,
+    /// applied + reloaded; awaiting ConfirmProvision within the window
+    ProvisionAppliedPending = 1,
+    /// confirmed; change is permanent
+    ProvisionCommitted = 2,
+    /// watchdog fired (no confirm) -> reverted to snapshot
+    ProvisionRolledBack = 3,
+    /// apply/validation error -> no change persisted (or reverted)
+    ProvisionFailed = 4,
+}
+impl ProvisionState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ProvisionState::ProvisionUnknown => "PROVISION_UNKNOWN",
+            ProvisionState::ProvisionAppliedPending => "PROVISION_APPLIED_PENDING",
+            ProvisionState::ProvisionCommitted => "PROVISION_COMMITTED",
+            ProvisionState::ProvisionRolledBack => "PROVISION_ROLLED_BACK",
+            ProvisionState::ProvisionFailed => "PROVISION_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROVISION_UNKNOWN" => Some(Self::ProvisionUnknown),
+            "PROVISION_APPLIED_PENDING" => Some(Self::ProvisionAppliedPending),
+            "PROVISION_COMMITTED" => Some(Self::ProvisionCommitted),
+            "PROVISION_ROLLED_BACK" => Some(Self::ProvisionRolledBack),
+            "PROVISION_FAILED" => Some(Self::ProvisionFailed),
             _ => None,
         }
     }

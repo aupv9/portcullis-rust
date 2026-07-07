@@ -26,6 +26,15 @@ config portcullis 'main'
 	# (no CONFIG_NFT_NAT) lands on ipset (TDD §17 option B). Changing this
 	# requires a restart (the backend is chosen once at composition).
 	option firewall_backend    'auto'
+	# Hotspot interface enforcement is scoped to (P0). The FORWARD/PREROUTING
+	# gate is bound to `-i <hotspot_iface>` (iptables) / `iifname "<iface>"`
+	# (nft) so ONLY the public SSID is gated — br-lan (admin) is never touched.
+	# Empty (the default) = NOT scoped: the engine still creates its table/sets/
+	# chains (kernel-as-truth adoption keeps working) but installs NO gate at all
+	# (fail-OPEN — nothing is blocked). The control plane fills this with the
+	# bridge the provision subsystem creates (e.g. 'br-hotspot'). Set it before
+	# expecting the captive to gate anything.
+	option hotspot_iface       ''
 	list   garden_fqdn         'portal.wifihub.vn'
 	list   garden_fqdn         'cdn.wifihub.vn'
 	list   garden_fqdn         'otp.gateway'

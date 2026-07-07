@@ -449,6 +449,157 @@ pub trait MeteringSink: Send + Sync {
     async fn apply_counters(&self, snapshot: Vec<(MacAddr, Counters)>) -> Result<()>;
 }
 
+// ---------------------------------------------------------------------------
+// Hotspot provisioning (P0.5). The ISOLATED `portcullis-provision` subsystem
+// (a separate crate + async task) renders a FIXED allowlist of UCI sections,
+// applies + reloads, then holds the change under a LOCAL commit-confirm
+// watchdog. It is deliberately fail-OPEN (rollback), the ONE exception to the
+// engine's fail-closed rule — it manages router *config*, not enforcement, and
+// kernel-as-truth means a provision fault never drops an authorized client.
+// This port lives here (not in the generated proto) so `portcullis-control`
+// and this hub crate need not depend on the prost types.
+// ---------------------------------------------------------------------------
+
+/// Desired state of the hotspot network the engine should provision — the
+/// *domain* value type, mirroring [`GrantParams`]. Distinct from the generated
+/// `pb::ProvisionHotspotRequest`: the wire message is translated into this by
+/// `portcullis-control` so the provision subsystem never touches generated code.
+///
+/// Only the four owned UCI sections are ever written (`network.br_hotspot`,
+/// `network.hotspot`, `wireless.wifi_hotspot`, `dhcp.hotspot`); `network.lan` /
+/// admin config and the `inet wifihub` enforcement table are never touched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvisionSpec {
+    /// Control-plane-issued id, echoed in [`ProvisionStatus`] and the confirm.
+    pub provision_id: String,
+    /// `true` = provision/enable the hotspot; `false` = tear down the owned
+    /// sections (also confirm-guarded).
+    pub enabled: bool,
+    /// Public SSID advertised on the hotspot AP.
+    pub ssid: String,
+    /// wifi-device the AP attaches to, e.g. `radio0` (empty = engine default).
+    pub radio: String,
+    /// `"none"` (open captive) or a WPA mode like `"psk2"` (empty = `"none"`).
+    pub encryption: String,
+    /// PSK, required when `encryption != "none"`.
+    pub key: String,
+    /// AP client isolation.
+    pub isolate: bool,
+    /// Resulting L2 bridge iface, e.g. `br-hotspot` — the same name enforcement
+    /// scopes to via `hotspot_iface`.
+    pub bridge_name: String,
+    /// Gateway IP on the hotspot subnet, e.g. `10.0.0.1`.
+    pub ipaddr: String,
+    /// Subnet mask, e.g. `255.255.255.0`.
+    pub netmask: String,
+    /// dnsmasq pool start (host part), e.g. `10`.
+    pub dhcp_start: String,
+    /// dnsmasq pool size, e.g. `200`.
+    pub dhcp_limit: String,
+    /// dnsmasq lease time, e.g. `2h`.
+    pub dhcp_leasetime: String,
+    /// Local commit-confirm watchdog window; `0` = engine default (90 s), bounds
+    /// `[15, 600]` (enforced during validation).
+    pub confirm_timeout_secs: u32,
+}
+
+impl Default for ProvisionSpec {
+    fn default() -> Self {
+        ProvisionSpec {
+            provision_id: String::new(),
+            enabled: true,
+            ssid: String::new(),
+            radio: "radio0".to_string(),
+            encryption: "none".to_string(),
+            key: String::new(),
+            isolate: true,
+            bridge_name: "br-hotspot".to_string(),
+            ipaddr: "10.0.0.1".to_string(),
+            netmask: "255.255.255.0".to_string(),
+            dhcp_start: "10".to_string(),
+            dhcp_limit: "200".to_string(),
+            dhcp_leasetime: "2h".to_string(),
+            confirm_timeout_secs: 0,
+        }
+    }
+}
+
+/// Lifecycle state reported for a provision (mirrors `pb::ProvisionState`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisionState {
+    /// Applied + reloaded; awaiting a confirm within the watchdog window.
+    AppliedPending,
+    /// Confirmed before the deadline; the change is permanent.
+    Committed,
+    /// Watchdog fired without a confirm → reverted to the pre-apply snapshot.
+    RolledBack,
+    /// Validation or apply error → no change persisted (or it was reverted).
+    Failed,
+}
+
+/// A provision-lifecycle report emitted engine → control plane. The subsystem
+/// pushes these upward; `portcullis-control` maps them to `pb::ProvisionStatus`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvisionStatus {
+    pub provision_id: String,
+    pub state: ProvisionState,
+    /// Detail (error text, iface, etc.).
+    pub message: String,
+    /// Resulting bridge iface, set on `Committed` (feeds enforcement scoping).
+    pub bridge_name: String,
+}
+
+/// Provision-subsystem errors (fail-OPEN: an error rolls back / leaves prior
+/// config, never drops an enforced client).
+#[derive(Debug, thiserror::Error)]
+pub enum ProvisionError {
+    /// The spec failed validation (out-of-allowlist target, bad subnet, bad
+    /// timeout, missing PSK, …) — nothing was applied.
+    #[error("invalid provision spec: {0}")]
+    Invalid(String),
+
+    /// A `uci` / `wifi` / init-script command failed while applying or reloading.
+    #[error("provision apply failed: {0}")]
+    Apply(String),
+
+    /// The commit-confirm rollback itself failed (the worst case — logged loudly).
+    #[error("provision rollback failed: {0}")]
+    Rollback(String),
+
+    /// No pending provision matched a confirm (unknown / already resolved id).
+    #[error("no pending provision for id: {0}")]
+    NoPending(String),
+
+    /// The provision actor task is gone (subsystem shut down).
+    #[error("provision subsystem unavailable: {0}")]
+    Unavailable(String),
+
+    /// tmpfs snapshot / marker I/O error.
+    #[error("provision i/o error: {0}")]
+    Io(String),
+}
+
+/// Control-plane-facing hotspot provisioning, implemented by the
+/// `portcullis-provision` handle and called by `portcullis-control` when a
+/// `provision_hotspot` / `confirm_provision` frame arrives. Object-safe.
+///
+/// Contract: [`provision`](Self::provision) validates the spec, snapshots the
+/// owned sections to tmpfs, applies + reloads, arms the local watchdog, and
+/// returns once the change is APPLIED_PENDING (the terminal COMMITTED /
+/// ROLLED_BACK outcome is delivered later as a [`ProvisionStatus`] on the
+/// subsystem's upward channel). [`confirm`](Self::confirm) commits a still-pending
+/// provision before its deadline.
+#[async_trait]
+pub trait Provisioner: Send + Sync {
+    /// Validate → snapshot → apply → reload → arm watchdog. Returns once the
+    /// change is applied and pending confirmation, or an error if validation /
+    /// apply failed (in which case nothing durable was left / it was reverted).
+    async fn provision(&self, spec: ProvisionSpec) -> std::result::Result<(), ProvisionError>;
+
+    /// Confirm a still-pending provision by id → Committed (cancels the watchdog).
+    async fn confirm(&self, provision_id: &str) -> std::result::Result<(), ProvisionError>;
+}
+
 /// A `u64` counter/gauge cell that works on **every** target. 32-bit MIPS (the
 /// RUTM11, `mipsel-unknown-linux-musl`) has no native `AtomicU64`, so a tiny
 /// `Mutex` is used instead of pulling in `portable-atomic`. Every mutation is on

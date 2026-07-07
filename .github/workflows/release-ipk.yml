@@ -61,13 +61,13 @@ jobs:
           # ld.lld rejects the ABI mismatch. Force the C side soft-float too.
           - arch: mipsel_24kc
             triple: mipsel-unknown-linux-musl
-            rustflags: "-C strip=symbols -C link-arg=-msoft-float"
+            rustflags: "-C strip=symbols -C link-arg=-msoft-float -Zunstable-options -Cpanic=immediate-abort"
             cflags_var: CFLAGS_mipsel_unknown_linux_musl
             cflags: "-msoft-float"
           # RUT9xx / RUT2xx (Atheros ath79, big-endian MIPS). Same soft-float fix.
           - arch: mips_24kc
             triple: mips-unknown-linux-musl
-            rustflags: "-C strip=symbols -C link-arg=-msoft-float"
+            rustflags: "-C strip=symbols -C link-arg=-msoft-float -Zunstable-options -Cpanic=immediate-abort"
             cflags_var: CFLAGS_mips_unknown_linux_musl
             cflags: "-msoft-float"
           # RUTX (Qualcomm IPQ40xx, ARMv7 cortex-a7). Hard-float (eabihf) matches
@@ -76,7 +76,7 @@ jobs:
           # under those names → let zig own the CRT (`link-self-contained=no`).
           - arch: arm_cortex-a7_neon-vfpv4
             triple: armv7-unknown-linux-musleabihf
-            rustflags: "-C strip=symbols -C link-self-contained=no"
+            rustflags: "-C strip=symbols -C link-self-contained=no -Zunstable-options -Cpanic=immediate-abort"
             cflags_var: ""
             cflags: ""
     steps:
@@ -128,10 +128,25 @@ jobs:
             export ${{ matrix.cflags_var }}="${{ matrix.cflags }}"
             echo "exported ${{ matrix.cflags_var }}=${{ matrix.cflags }}"
           fi
+          # -Cpanic=immediate-abort (via rustflags, needs -Zunstable-options) strips
+          # std's panic-fmt machinery on top of profile panic="abort". On current
+          # nightly this replaced the old `-Z build-std-features=panic_immediate_abort`.
           cargo +nightly zigbuild --release --locked \
             -Z build-std=std,panic_abort \
             --target ${{ matrix.triple }} \
             -p portcullis-engined
+
+      - name: Compress with UPX (flash budget)
+        run: |
+          # UPX cuts the on-flash binary ~70% (static-pie mipsel/mips/arm pack
+          # cleanly); it decompresses into RAM at exec — ideal for flash-poor /
+          # RAM-rich devices like the RUT200. Measured: 3.13MB -> 0.89MB (mipsel).
+          # `upx -t` verifies the packed file decompresses (integrity, not an exec
+          # test). ⚠️ VALIDATE ON DEVICE that the packed binary actually runs on
+          # the target (RUTM11/RUT200); if procd can't exec it, drop this step.
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          upx --best --lzma "target/${{ matrix.triple }}/release/portcullis"
+          upx -t "target/${{ matrix.triple }}/release/portcullis"
 
       - name: Package .ipk
         run: |
