@@ -30,6 +30,16 @@ pub trait FirewallBackend: Send + Sync {
 
     /// List the current `auth` set elements (for restart adoption / reconcile).
     async fn list_auth(&self) -> Result<Vec<AuthElement>>;
+
+    /// Re-scope enforcement to a new set of gated-SSID interfaces AT RUNTIME
+    /// (P-W1), re-applying ONLY the interface-scoped gating rules — NEVER
+    /// flushing the `auth`/garden sets (kernel-as-truth: authorized clients are
+    /// preserved across the re-scope). Fail-safe: a failure leaves the prior
+    /// scope live. Default is a no-op (for the [`MockBackend`] / test doubles);
+    /// the production backends override it.
+    async fn set_gated_ifaces(&self, _ifaces: Vec<String>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A mutation recorded by [`MockBackend`], for test assertions.

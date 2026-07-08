@@ -22,13 +22,17 @@
 mod conntrack;
 mod metering;
 mod mock;
+mod reaper;
 mod shaper;
 
 // Re-export the port we implement so downstream code can refer to it via this
 // crate, and the sink/resolver ports we consume.
-pub use portcullis_types::{CounterSource, MeteringSink, NeighResolver};
+pub use portcullis_types::{
+    CounterSource, FlowReaper, MeteringSink, NeighResolver, NoopReaper, NoopShaper, Shaper,
+};
 
 pub use conntrack::{parse_conntrack, ConntrackCli, ConntrackReader, ConntrackSource};
 pub use metering::{run_metering_loop, DEFAULT_INTERVAL};
 pub use mock::MockCounterSource;
-pub use shaper::{NoopShaper, Shaper, TcShaper};
+pub use reaper::{reap_orphan_flows, run_reap_loop, ConntrackReaper};
+pub use shaper::TcShaper;
