@@ -10,10 +10,11 @@
 ![status](https://img.shields.io/badge/status-alpha-orange)
 ![rust](https://img.shields.io/badge/rust-1.96%2B-blue?logo=rust)
 ![edition](https://img.shields.io/badge/edition-2021-blue)
-![tests](https://img.shields.io/badge/tests-130%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-275%20passing-brightgreen)
 ![clippy](https://img.shields.io/badge/clippy-D%20warnings%20clean-brightgreen)
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
-![binary](https://img.shields.io/badge/binary-~2.4MB-informational)
+![binary](https://img.shields.io/badge/binary-~0.9MB%20UPX-informational)
+![version](https://img.shields.io/badge/version-0.9.0-blue)
 ![target](https://img.shields.io/badge/target-mipsel--musl%20(RUTM11)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
@@ -83,8 +84,14 @@ Client **data** breaks out locally at the store's WAN. The engine dials the cont
 | ♻️ | **Restart adoption** — rebuild session view from the kernel; no client dropped | ✅ |
 | 🛡️ | **Fail-closed everywhere** — no error path ever fails open | ✅ |
 | 🪶 | **Embedded footprint** — ~2.4 MB binary, RAM-only state (no flash writes) | ✅ |
-| 🚄 | **Rate limiting / shaping** — `tc`/HTB per-tier (Phase-2 skeleton) | 🚧 |
-| 📦 | **OpenWrt `.ipk` packaging** — procd init, UCI config, first-boot bootstrap ([`deploy/`](./deploy)) | 🚧 scaffolded |
+| ✂️ | **Conntrack reaping** — sever established flows on de-auth, not just new (invariant #9) | ✅ |
+| 💤 | **Idle timeout** — de-auth + `IDLE_TIMEOUT` after no traffic in the window | ✅ |
+| 🎛️ | **CP config-push + introspection** — tiers / garden / enforce / params · engine-info (drift hashes) / metrics | ✅ |
+| 🔁 | **Hot-reload** — SIGHUP applies garden / params live, no session dropped | ✅ |
+| 🚄 | **Bandwidth shaping** — `tc`/HTB per-session cap, capability-gated `rate_bps` | ✅ † |
+| 📦 | **OpenWrt `.ipk` packaging** — procd init, UCI config, first-boot bootstrap ([`deploy/`](./deploy)) | 🚧 † |
+
+<sub>† wiring + tests ship now; execution on the RUTM11 (tc, nft-vs-fw3, packaged binary) is device-validation pending.</sub>
 
 ---
 
