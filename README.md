@@ -14,7 +14,7 @@
 ![clippy](https://img.shields.io/badge/clippy-D%20warnings%20clean-brightgreen)
 ![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)
 ![binary](https://img.shields.io/badge/binary-~0.9MB%20UPX-informational)
-![version](https://img.shields.io/badge/version-0.9.0-blue)
+![version](https://img.shields.io/badge/version-0.9.1-blue)
 ![target](https://img.shields.io/badge/target-mipsel--musl%20(RUTM11)-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
@@ -30,7 +30,7 @@ It is the mechanism behind a **video-gate ad slot**: the moment the gate complet
 
 > 🧭 It is **not** a NAS, **not** an ad renderer, **not** a business-logic owner — see [Boundaries](#-boundaries-what-it-deliberately-does-not-do).
 
-Design notes and the load-bearing invariants are summarized below and in [`CLAUDE.md`](./CLAUDE.md) and the per-area engineering notes in [`.claude/skills/`](./.claude/skills/).
+Design notes and the load-bearing invariants are summarized below and in [`CLAUDE.md`](./CLAUDE.md) and the per-area engineering notes in [`.claude/skills/`](./.claude/skills/). The **decisions behind the architecture** are recorded as ADRs in [`docs/adr/`](./docs/adr/) — the in-repo source of truth for *why* it's built this way.
 
 ---
 
