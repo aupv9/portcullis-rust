@@ -1,13 +1,8 @@
-//! Bandwidth shaping (TDD §7.7) — **optional Phase-2 module**.
+//! Bandwidth shaping — see ADR-0013.
 //!
-//! IMPORTANT: bandwidth shaping uses **`tc` (HTB)**, NOT nftables `limit`.
-//! `nft ... limit rate` rate-limits *packets per second*, not *bytes per
-//! second*, and is the classic wrong tool for `rate_bps`. A per-session HTB
-//! class is attached on grant and torn down on expiry/revoke.
-//!
-//! Phase 1 may ship without shaping if the uplink is otherwise capped
-//! (`rate_bps == 0` means unlimited — callers should skip shaping entirely).
-//! The [`NoopShaper`] is the Phase-1 default.
+//! Uses `tc` (HTB), NOT nftables `limit` (which caps packets/sec, not bytes/sec).
+//! A per-MAC HTB class is attached on grant and torn down on de-auth.
+//! `rate_bps == 0` = unlimited; [`NoopShaper`] is the default when shaping is off.
 
 use async_trait::async_trait;
 // The `Shaper` port + `NoopShaper` live in `portcullis-types` (like `FlowReaper`)
@@ -16,17 +11,14 @@ use async_trait::async_trait;
 use portcullis_types::{Error, MacAddr, Result, Shaper};
 use tokio::process::Command;
 
-/// `tc`/HTB per-MAC bandwidth shaper (G5). Attaches an HTB class capped at the
-/// grant's `rate_bps` on the LAN egress interface and steers the client's
-/// downstream traffic (matched by destination MAC) into it; the class is torn
-/// down on revoke/expiry.
+/// `tc`/HTB per-MAC bandwidth shaper (ADR-0013). A per-MAC HTB class capped at
+/// `rate_bps` on the LAN egress, with a filter matching the client's dst MAC;
+/// torn down on de-auth.
 ///
-/// NOTE (device-validated): the exact `tc` filter/class syntax and the classid
-/// allocation are validated on the MIPS target (§16/§18) — like the ipset/nft
-/// backends, the kernel-touching invocation is only exercised on-device / against
-/// a fake `tc` in tests. The classid allocation and the argument vectors are pure
-/// and unit-tested here; a live `tc` failure degrades (best-effort, never fails
-/// the grant — see the SessionManager wiring).
+/// The exact `tc` syntax is device-validated on the MIPS target (like the
+/// nft/ipset backends); the classid allocation + argument vectors are pure and
+/// unit-tested here. A live `tc` failure degrades (best-effort, never fails the
+/// grant).
 #[derive(Clone, Debug)]
 pub struct TcShaper {
     /// Egress interface the HTB qdisc lives on (e.g. the LAN bridge `br-lan`).

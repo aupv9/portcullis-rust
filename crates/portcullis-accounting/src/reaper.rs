@@ -1,22 +1,10 @@
-//! conntrack flow reaping on de-auth (invariant #9, conntrack ⊆ auth).
+//! conntrack flow reaping on de-auth — see ADR-0011 (`conntrack ⊆ auth`).
 //!
-//! Removing a MAC from the `@auth` set only gates *new* connections. An
-//! already-established flow keeps sailing through the `ct established,related
-//! accept` fast path indefinitely — so a revoked / expired / quota-capped client
-//! whose browser or VPN holds a long-lived socket stays online. Reaping the
-//! client's conntrack flows on de-auth closes that leak.
-//!
-//! Two paths use this:
-//! - the **de-auth fast path** (SessionManager) reaps the session's recorded IP
-//!   the moment it removes the MAC;
-//! - the **reconcile sweep** ([`reap_orphan_flows`]) reaps any neighbour IP whose
-//!   MAC is no longer in `@auth` — the backstop for IPs the session never
-//!   recorded (dual-stack, DHCP churn) and for cold start after a restart.
-//!
-//! Fail-closed: a reap error is a *degradation* (the leaked flow persists until
-//! the next sweep), never a fail-open. It must not abort a revoke or unblock the
-//! gate. The real invocation is thin; the exit-code interpretation is the pure,
-//! directly-tested seam ([`interpret_delete_output`]).
+//! Two paths: the de-auth fast path (SessionManager reaps the session's recorded
+//! IP) and the reconcile sweep ([`reap_orphan_flows`], reaps any neighbour IP
+//! whose MAC ∉ `@auth` — backstops dual-stack / DHCP churn / cold-start).
+//! Fail-closed: a reap error degrades (the flow persists until the next sweep),
+//! never aborts the de-auth. [`interpret_delete_output`] is the pure test seam.
 
 use std::collections::HashSet;
 use std::future::Future;

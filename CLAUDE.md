@@ -35,7 +35,7 @@ deploy/                  procd init script, OpenWrt SDK Makefile, uci-defaults f
 
 ## Invariants that are easy to break (read before touching enforcement code)
 
-These come from §5/§7 and are load-bearing — violating them causes flash failure, fail-open, or races:
+These come from §5/§7 and are load-bearing — violating them causes flash failure, fail-open, or races. The **decisions behind them are recorded as ADRs in [`docs/adr/`](docs/adr/)** — the in-repo source of truth for *why* the engine is shaped this way (each ADR links to the code that implements it):
 
 1. **No runtime state on flash.** All session/runtime state lives in RAM/tmpfs (`/tmp/portcullis/`). Writing session state to NAND wears it out and bricks routers (openNDS precedent, §5.4). No sqlite/redb-on-flash. Durability comes from the kernel holding the ruleset + the control plane as source of truth.
 2. **Kernel-as-truth, not process memory (§7.8).** The nftables `auth` set with per-element `timeout` is authoritative. On daemon restart, *adopt* existing kernel state (list `@auth`, rebuild in-RAM view, re-baseline accounting) — never drop authorized clients, never flush.
