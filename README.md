@@ -299,7 +299,7 @@ cargo test --workspace          # 130 unit tests across 9 crates
 | redirect | 30 | | **total** | **130** |
 
 - **Unit:** pure domain (`session`, `redirect` HMAC/parse) + `nft` against a `MockBackend`.
-- **Integration (planned):** Linux netns harness asserts verdicts (unauth→redirect, garden→allow, authed→forward, expired→re-gate, revoked→drop) + fault injection (kill -9 → adoption, CP loss → fail-closed). See [`.claude/skills/netns-harness`](./.claude/skills/netns-harness).
+- **Integration (netns):** [`crates/portcullis-engined/tests/netns.rs`](./crates/portcullis-engined/tests/netns.rs) runs the real binary in a router namespace and asserts verdicts (unauth→redirect, garden→allow, authed→forward, expired→re-gate, revoked→drop) + restart adoption. Root-gated + `#[ignore]` (plain `cargo test` skips them); a privileged CI job runs `-- --ignored`. CP-loss + live-flow-reap cases are scaffolded pending a mock control-plane server. See [`.claude/skills/netns-harness`](./.claude/skills/netns-harness).
 - **On-device:** RUTM11 acceptance (nft-vs-fw3 priorities, conntrack-under-NAT, flash-write audit).
 
 ---
@@ -308,8 +308,8 @@ cargo test --workspace          # 130 unit tests across 9 crates
 
 - [x] `deploy/` — procd init, OpenWrt SDK `.ipk` Makefile, UCI config, first-boot `uci-defaults` ([`deploy/`](./deploy))
 - [ ] MIPS cross-compile validated on-device + size/RSS validation (`-Z build-std`, RutOS SDK)
-- [ ] `tc`/HTB bandwidth shaping (Phase-2)
-- [ ] Linux netns integration + fault-injection suite in CI
+- [x] `tc`/HTB bandwidth shaping — wired (per-MAC HTB, capability-gated); tc execution pending on-device validation
+- [~] Linux netns integration + fault-injection suite in CI — scaffolded (verdict matrix + restart adoption); mock-CP cases (CP-loss, live-flow reap) pending
 - [ ] RFC 8910/8908 Captive Portal API (DHCP option 114) alongside CPD redirect
 - [ ] Evaluate openNDS-fork (FAS) vs from-scratch — the POC is the go/no-go gate (TDD §17/§18)
 
