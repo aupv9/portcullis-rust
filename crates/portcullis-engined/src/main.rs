@@ -26,6 +26,7 @@ use portcullis_types::{EventSink, RulesetWriter};
 
 mod compose;
 mod metrics;
+mod runtime;
 
 /// Default portal base for the signed redirect (§7.2). Overridable via the
 /// `PORTCULLIS_PORTAL_URL` env var; the UCI config (§9) doesn't carry it.
@@ -53,22 +54,24 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(tracing::Level::INFO);
     tracing_subscriber::fmt().with_max_level(level).init();
 
-    let cfg = load_config().context("load configuration")?;
+    let (cfg, path) = load_config().context("load configuration")?;
     tracing::info!(store = %cfg.store_id, "portcullis starting");
 
-    compose::run(cfg).await
+    compose::run(cfg, path).await
 }
 
 /// Load config from `$PORTCULLIS_CONFIG` (UCI or TOML by extension) or the
-/// conventional UCI path, falling back to defaults if absent.
-fn load_config() -> anyhow::Result<Config> {
+/// conventional UCI path, falling back to defaults if absent. Returns the config
+/// and the resolved path (the path is threaded to the composition root so a
+/// SIGHUP can reload it live — G7).
+fn load_config() -> anyhow::Result<(Config, PathBuf)> {
     let path = std::env::var("PORTCULLIS_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/config/portcullis"));
 
     if !path.exists() {
         tracing::warn!(path = %path.display(), "config file not found; using defaults");
-        return Ok(Config::default());
+        return Ok((Config::default(), path));
     }
 
     let raw = std::fs::read_to_string(&path)
@@ -81,7 +84,7 @@ fn load_config() -> anyhow::Result<Config> {
     .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
 
     cfg.validate().map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
-    Ok(cfg)
+    Ok((cfg, path))
 }
 
 /// Build the writer + session manager + control service, returning the pieces

@@ -11,7 +11,7 @@ The full Cargo workspace is implemented and tested (9 crates; host build/tests +
 The **data-plane enforcement arm** of an ad-gated public-WiFi captive portal — a single Tokio daemon running on each site's OpenWrt router (built for the Teltonika RUTM11; one router per site, scaling to thousands of sites). Its one job: **no client reaches the internet until the central control plane explicitly grants a session**, then enforce/meter/expire that grant.
 
 It is **not** a NAS, not an ad renderer, not a business-logic owner. Hard boundaries (do not blur these):
-- **RADIUS** is spoken only by the Go control plane. `portcullis` never speaks RADIUS — it emits `SessionEvent`s; the control plane translates them to RADIUS Accounting.
+- **RADIUS has been dropped platform-wide** (no FreeRADIUS anywhere). `portcullis` never spoke RADIUS regardless — it emits `SessionEvent`s over the control stream and the Go control plane (NAS-of-record) records them as session accounting in Postgres.
 - **Ad decisioning / OTP / rendering** live in the Next.js portal + Rust/Axum ad engine.
 - `portcullis` owns exactly **one nftables table** (`inet wifihub`) and never touches any other table or fw3's rules.
 
@@ -45,6 +45,7 @@ These come from §5/§7 and are load-bearing — violating them causes flash fai
 6. **Dual-path expiry:** the kernel set-element `timeout` is the backstop (removes the element even if the daemon is dead); the daemon also tracks `expires_at` to emit accounting-stop. Neither path alone can leave a permanent session.
 7. **MAC is the session key, signed by the router.** The redirect responder computes `sig = HMAC-SHA256(key, "<mac>|<store_id>|<ts>")`; the portal/control plane trust `mac`/`store` only because the signature validates. A client cannot forge another's MAC into a grant.
 8. **The redirect responder (:8080) is the primary inbound attack surface.** It's reachable by any unauthenticated client. Strict/bounded request parsing, no client-controlled data in privileged paths, fuzz the parser (cf. CVE-2023-38314, an openNDS NULL-deref DoS via a missing query param).
+9. **conntrack ⊆ auth.** Removing a MAC from the `auth` set only gates *new* connections; an already-established flow sails through the `ct established,related accept` fast path indefinitely. Every de-auth (revoke/expiry/quota/idle) MUST reap the client's conntrack flows (`FlowReaper`, `conntrack -D -s <ip>`), and a periodic reconcile sweep reaps any neighbour IP whose MAC ∉ `@auth`. Reaping is fail-closed degradation: a reap error is logged + metered, never aborts the de-auth or unblocks the gate; only LAN neighbours are candidates, so the router's own IPs and the outbound control-plane flow are never reaped. The `established,related accept` rule is a perf fast-path for *authed* clients, kept safe **only** by this invariant.
 
 ## Platform constraints (RUTM11 / RutOS — §5)
 
@@ -76,7 +77,7 @@ cargo build --release --target mipsel-unknown-linux-musl
 ./scripts/dockerbuild make pm                    # produces bin/packages/<arch>/*.ipk
 ```
 
-When adding the proto, regenerate the tonic bindings from `proto/enforcement.proto` (the Go control plane shares this contract — keep `package wifihub.enforcement.v1` and the message fields in sync).
+Proto codegen is driven by **Buf** (`buf.yaml` + `buf.gen.yaml` at the crate-tree root), not `build.rs`. After editing `proto/enforcement.proto`, run `buf generate` from `core/portcullis-rust`: it writes the committed prost+tonic bindings to `crates/portcullis-control/src/gen/` (remote plugins `neoeinstein-prost`/`neoeinstein-tonic`, pinned to tonic 0.12/prost 0.13 — bump them together with the crate's tonic/prost). `lib.rs` `include!`s the prost file (which self-includes the `.tonic.rs`). `buf lint`/`buf build` guard style + wire-compat. The Go control plane keeps its OWN copy at `domain/server/proto/` — two folders, one wire contract: keep `package wifihub.enforcement.v1` and field tags in sync between them.
 
 ## When choosing an implementation approach
 

@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use portcullis_types::{Enforcer, EventSink, SessionEvent};
+use portcullis_types::{EngineControl, Enforcer, EventSink, SessionEvent};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
@@ -43,6 +43,13 @@ pub const DEFAULT_EVENT_BUFFER: usize = 512;
 pub struct EnforcementService {
     enforcer: Arc<dyn Enforcer>,
     events: broadcast::Sender<SessionEvent>,
+    /// Runtime control surface (G3/G4). `None` on the plain constructors keeps the
+    /// config-push / introspection RPCs answering `Unimplemented` (back-compat);
+    /// the composition root attaches one via [`with_engine_control`] to enable
+    /// them on the on-net/dev unary path (production uses the Attach stream).
+    ///
+    /// [`with_engine_control`]: EnforcementService::with_engine_control
+    engine_control: Option<Arc<dyn EngineControl>>,
 }
 
 impl EnforcementService {
@@ -54,9 +61,16 @@ impl EnforcementService {
     pub fn new(enforcer: Arc<dyn Enforcer>, buffer: usize) -> (Self, GrpcEventSink) {
         let buffer = buffer.max(1);
         let (tx, _rx) = broadcast::channel(buffer);
-        let svc = EnforcementService { enforcer, events: tx.clone() };
+        let svc = EnforcementService { enforcer, events: tx.clone(), engine_control: None };
         let sink = GrpcEventSink { events: tx };
         (svc, sink)
+    }
+
+    /// Attach the runtime control surface so the config-push / introspection RPCs
+    /// (`Set*` / `Get*`) work on the unary path instead of returning `Unimplemented`.
+    pub fn with_engine_control(mut self, engine_control: Arc<dyn EngineControl>) -> Self {
+        self.engine_control = Some(engine_control);
+        self
     }
 
     /// Convenience constructor with [`DEFAULT_EVENT_BUFFER`].
@@ -77,7 +91,7 @@ impl EnforcementService {
         enforcer: Arc<dyn Enforcer>,
         events: broadcast::Sender<SessionEvent>,
     ) -> Self {
-        EnforcementService { enforcer, events }
+        EnforcementService { enforcer, events, engine_control: None }
     }
 
     /// Subscribe to the event fan-out (used internally by `stream_events`,
@@ -269,6 +283,90 @@ impl pb::enforcement_server::Enforcement for EnforcementService {
     ) -> Result<Response<pb::HealthReply>, Status> {
         let h = self.enforcer.health().await;
         Ok(Response::new(convert::health_to_pb(h)))
+    }
+
+    // -----------------------------------------------------------------------
+    // Config-push + introspection RPCs (reconciled superset proto, G3/G4). The
+    // engine is the Attach CLIENT in production (CGNAT), where these arrive as
+    // ControlFrames; this unary path mirrors them for on-net/dev. Each dispatches
+    // to the attached runtime controller; without one they answer Unimplemented
+    // (fail-closed — never pretend a config was applied). A rejected apply is an
+    // error Status, never a silent success.
+    // -----------------------------------------------------------------------
+
+    async fn set_enforcement(
+        &self,
+        request: Request<pb::SetEnforcementRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        let ec = self.control("SetEnforcement")?;
+        ec.set_enforcement(request.into_inner().enabled)
+            .await
+            .map(|()| Response::new(ok_ack()))
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+    }
+
+    async fn set_garden(
+        &self,
+        request: Request<pb::SetGardenRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        let ec = self.control("SetGarden")?;
+        ec.set_garden(request.into_inner().fqdns)
+            .await
+            .map(|()| Response::new(ok_ack()))
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+    }
+
+    async fn set_tier_policies(
+        &self,
+        request: Request<pb::SetTierPoliciesRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        let ec = self.control("SetTierPolicies")?;
+        ec.set_tier_policies(convert::tier_policies_from_pb(request.into_inner()))
+            .await
+            .map(|()| Response::new(ok_ack()))
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+    }
+
+    async fn set_engine_parameters(
+        &self,
+        request: Request<pb::SetEngineParametersRequest>,
+    ) -> Result<Response<pb::Ack>, Status> {
+        let ec = self.control("SetEngineParameters")?;
+        ec.set_engine_parameters(convert::engine_params_from_pb(request.into_inner()))
+            .await
+            .map(|()| Response::new(ok_ack()))
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+    }
+
+    async fn get_engine_info(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::EngineInfo>, Status> {
+        let ec = self.control("GetEngineInfo")?;
+        Ok(Response::new(convert::engine_info_to_pb(ec.engine_info().await)))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::MetricsReply>, Status> {
+        let ec = self.control("GetMetrics")?;
+        Ok(Response::new(convert::metrics_to_pb(ec.metrics_snapshot().await)))
+    }
+}
+
+/// A successful (`ok = true`) [`pb::Ack`].
+fn ok_ack() -> pb::Ack {
+    pb::Ack { ok: true, message: String::new() }
+}
+
+impl EnforcementService {
+    /// Borrow the attached [`EngineControl`], or answer `Unimplemented` naming the
+    /// RPC when none is wired (this engine build doesn't expose config-push here).
+    fn control(&self, rpc: &str) -> Result<&Arc<dyn EngineControl>, Status> {
+        self.engine_control
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented(format!("{rpc} not enabled on this engine")))
     }
 }
 
@@ -521,7 +619,11 @@ mod tests {
         let (svc, sink) = EnforcementService::with_default_buffer(MockEnforcer::ok());
         // Subscribe BEFORE emitting so the bounded channel buffers it.
         let resp = svc
-            .stream_events(Request::new(pb::StreamReq { store_id: "s".into() }))
+            .stream_events(Request::new(pb::StreamReq {
+                store_id: "s".into(),
+                resume_after_seq: 0,
+                boot_id: String::new(),
+            }))
             .await
             .unwrap();
         let mut stream = resp.into_inner();
@@ -566,5 +668,71 @@ mod tests {
             Err(broadcast::error::RecvError::Lagged(n)) => assert!(n >= 1),
             other => panic!("expected Lagged, got {other:?}"),
         }
+    }
+
+    // ---- config-push on the unary path (G4) ----
+
+    struct MockControl;
+    #[tonic::async_trait]
+    impl EngineControl for MockControl {
+        async fn set_enforcement(&self, _enabled: bool) -> PResult<()> {
+            Ok(())
+        }
+        async fn set_garden(&self, _fqdns: Vec<String>) -> PResult<()> {
+            Ok(())
+        }
+        async fn set_tier_policies(
+            &self,
+            _policies: Vec<portcullis_types::TierPolicy>,
+        ) -> PResult<()> {
+            Ok(())
+        }
+        async fn set_engine_parameters(
+            &self,
+            params: portcullis_types::EngineParameters,
+        ) -> PResult<()> {
+            params.validate()
+        }
+        async fn engine_info(&self) -> portcullis_types::EngineInfoSnapshot {
+            portcullis_types::EngineInfoSnapshot { version: "9.9.9".into(), ..Default::default() }
+        }
+        async fn metrics_snapshot(&self) -> portcullis_types::MetricsSnapshot {
+            portcullis_types::MetricsSnapshot::default()
+        }
+        async fn tier_policy(&self, _tier: &str) -> Option<portcullis_types::TierPolicy> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn config_push_unimplemented_without_controller_but_works_with_one() {
+        // Default (no controller): fail-closed Unimplemented, never a silent ok.
+        let (bare, _s) = EnforcementService::with_default_buffer(MockEnforcer::ok());
+        let r = bare
+            .set_enforcement(Request::new(pb::SetEnforcementRequest { enabled: false }))
+            .await;
+        assert_eq!(r.unwrap_err().code(), tonic::Code::Unimplemented);
+
+        // With a controller attached: applies and acks ok; GetEngineInfo reports.
+        let (svc, _s2) = EnforcementService::with_default_buffer(MockEnforcer::ok());
+        let svc = svc.with_engine_control(Arc::new(MockControl));
+        assert!(svc
+            .set_enforcement(Request::new(pb::SetEnforcementRequest { enabled: false }))
+            .await
+            .unwrap()
+            .into_inner()
+            .ok);
+        let info = svc.get_engine_info(Request::new(pb::Empty {})).await.unwrap().into_inner();
+        assert_eq!(info.version, "9.9.9");
+
+        // An out-of-bounds engine-parameter set is rejected, not silently applied.
+        let bad = pb::SetEngineParametersRequest {
+            accounting_interval_secs: 0,
+            garden_tick_secs: 0,
+            expiry_tick_secs: 999,
+            max_sessions: 0,
+            idle_timeout_secs: 0,
+        };
+        assert!(svc.set_engine_parameters(Request::new(bad)).await.is_err());
     }
 }

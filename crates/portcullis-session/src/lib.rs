@@ -41,9 +41,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use portcullis_types::{
-    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, GrantParams, HealthStatus,
-    MacAddr, Metric, MeteringSink, MetricsSink, NoopMetrics, ReconcileReport, Result, RevokeReason,
-    RulesetWriter, SessionEvent, SessionId, SessionInfo, Tier, UnknownKernelPolicy,
+    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, FlowReaper, GrantParams,
+    HealthStatus, MacAddr, Metric, MeteringSink, MetricsSink, NoopMetrics, NoopReaper, NoopShaper,
+    ReconcileReport, Result, RevokeReason, RulesetWriter, SessionEvent, SessionId, SessionInfo,
+    Shaper, Tier, UnknownKernelPolicy,
 };
 
 /// Minimum remaining TTL for the reconciler to bother re-adding a kernel-missing
@@ -77,6 +78,9 @@ pub struct Session {
     pub tier: Tier,
     pub granted_at: Instant,
     pub expires_at: Instant,
+    /// Last time a positive byte delta was observed for this session (G6). Seeded
+    /// at grant/adopt; the idle sweep de-auths sessions quiet past the threshold.
+    pub last_activity: Instant,
     pub quota_bytes: u64,
     pub rate_bps: u64,
     pub bytes_in: u64,
@@ -140,6 +144,20 @@ pub struct SessionManager {
     /// behind a mutex because it is set once at startup and read cheaply
     /// thereafter (an `Arc` clone), avoiding a hard dependency in `new`.
     metrics: Mutex<Arc<dyn MetricsSink>>,
+    /// conntrack flow reaper (invariant #9). Defaults to [`NoopReaper`]; the
+    /// composition root installs the real [`ConntrackReaper`] via [`set_reaper`]
+    /// when `reap_conntrack` is enabled. Held behind a mutex (set once at
+    /// startup, cloned cheaply on the de-auth path) — same pattern as `metrics`.
+    ///
+    /// [`ConntrackReaper`]: portcullis_types::FlowReaper
+    /// [`set_reaper`]: SessionManager::set_reaper
+    reaper: Mutex<Arc<dyn FlowReaper>>,
+    /// Per-session bandwidth shaper (G5). Defaults to [`NoopShaper`]; the
+    /// composition root installs the real `TcShaper` via [`set_shaper`] when
+    /// bandwidth shaping is enabled. Applied on grant, cleared on de-auth.
+    ///
+    /// [`set_shaper`]: SessionManager::set_shaper
+    shaper: Mutex<Arc<dyn Shaper>>,
 }
 
 impl SessionManager {
@@ -156,6 +174,65 @@ impl SessionManager {
                 last_reconcile_ok: false,
             }),
             metrics: Mutex::new(Arc::new(NoopMetrics)),
+            reaper: Mutex::new(Arc::new(NoopReaper)),
+            shaper: Mutex::new(Arc::new(NoopShaper)),
+        }
+    }
+
+    /// Install the bandwidth shaper (composition root, once at startup). Without
+    /// this, grants carry `rate_bps` but no cap is applied (NoopShaper).
+    pub fn set_shaper(&self, shaper: Arc<dyn Shaper>) {
+        *self.shaper.lock().expect("shaper mutex poisoned") = shaper;
+    }
+
+    fn shaper(&self) -> Arc<dyn Shaper> {
+        self.shaper.lock().expect("shaper mutex poisoned").clone()
+    }
+
+    /// Install the conntrack flow reaper (composition root, once at startup).
+    /// Without this the manager de-auths without reaping (NoopReaper), i.e. the
+    /// pre-invariant-#9 behaviour — safe, but established flows leak.
+    pub fn set_reaper(&self, reaper: Arc<dyn FlowReaper>) {
+        *self.reaper.lock().expect("reaper mutex poisoned") = reaper;
+    }
+
+    /// Clone the current reaper handle (cheap `Arc` clone).
+    fn reaper(&self) -> Arc<dyn FlowReaper> {
+        self.reaper.lock().expect("reaper mutex poisoned").clone()
+    }
+
+    /// Reap the established conntrack flows for `ip` (invariant #9). Called after
+    /// `del_auth` on every de-auth path. Fail-closed: a reap error is logged +
+    /// metered and swallowed — it never aborts the revoke or unblocks the gate.
+    async fn reap_flows(&self, ip: std::net::IpAddr) {
+        match self.reaper().reap_by_ip(ip).await {
+            Ok(n) => {
+                if n > 0 {
+                    self.metrics().incr(Metric::FlowsReaped);
+                    tracing::debug!(%ip, reaped = n, "reaped conntrack flows on de-auth");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%ip, error = %e, "conntrack reap failed; gate still holds (fail-closed)");
+                self.metrics().incr(Metric::ReapFailed);
+            }
+        }
+    }
+
+    /// Apply the per-session bandwidth cap (G5). Best-effort: a shaper error
+    /// degrades bandwidth control but never fails the grant or the gate.
+    async fn shape(&self, mac: MacAddr, rate_bps: u64) {
+        if let Err(e) = self.shaper().apply(mac, rate_bps).await {
+            tracing::warn!(mac = %mac, error = %e, "shaper apply failed; session proceeds uncapped");
+            self.metrics().incr(Metric::ShaperFailure);
+        }
+    }
+
+    /// Drop the per-session bandwidth cap on de-auth (idempotent, best-effort).
+    async fn unshape(&self, mac: MacAddr) {
+        if let Err(e) = self.shaper().clear(mac).await {
+            tracing::warn!(mac = %mac, error = %e, "shaper clear failed");
+            self.metrics().incr(Metric::ShaperFailure);
         }
     }
 
@@ -248,6 +325,7 @@ impl SessionManager {
             tier: params.tier,
             granted_at: now,
             expires_at: now + params.ttl,
+            last_activity: now,
             quota_bytes: params.quota_bytes,
             rate_bps: params.rate_bps,
             bytes_in: 0,
@@ -261,6 +339,11 @@ impl SessionManager {
             let mut map = self.sessions.lock().expect("sessions mutex poisoned");
             map.insert(params.mac, session);
         }
+
+        // G5: apply the per-session bandwidth cap (no-op when rate_bps == 0 or the
+        // NoopShaper is installed). After the kernel grant so a shaper hiccup can
+        // never block the gate opening.
+        self.shape(params.mac, params.rate_bps).await;
 
         self.sink
             .emit(Self::build_event(
@@ -297,6 +380,14 @@ impl SessionManager {
             tracing::warn!(mac = %mac, error = %e, "del_auth failed during revoke; in-RAM session already removed");
         }
 
+        // Invariant #9: gating the MAC only stops *new* connections — sever the
+        // client's already-established flows so a revoked client actually drops.
+        if let Some(ip) = session.ip {
+            self.reap_flows(ip).await;
+        }
+        // G5: drop the client's bandwidth cap.
+        self.unshape(mac).await;
+
         self.sink
             .emit(Self::build_event(
                 session.session_id.clone(),
@@ -308,6 +399,7 @@ impl SessionManager {
             .await;
         self.metrics().incr(match reason {
             RevokeReason::Quota => Metric::QuotaExceeded,
+            RevokeReason::IdleTimeout => Metric::IdleKill,
             RevokeReason::Admin | RevokeReason::MacChange => Metric::Revoke,
         });
 
@@ -336,6 +428,13 @@ impl SessionManager {
             if let Err(e) = self.writer.del_auth(session.mac).await {
                 tracing::warn!(mac = %session.mac, error = %e, "del_auth failed during expiry tick");
             }
+            // Invariant #9: sever any established flow so an expired client's
+            // long-lived sockets stop, not just its new connections.
+            if let Some(ip) = session.ip {
+                self.reap_flows(ip).await;
+            }
+            // G5: drop the client's bandwidth cap.
+            self.unshape(session.mac).await;
             self.sink
                 .emit(Self::build_event(
                     session.session_id.clone(),
@@ -351,6 +450,34 @@ impl SessionManager {
         expired.len()
     }
 
+    /// Idle-timeout sweep (G6). De-auths every session with no byte activity for
+    /// longer than `idle_timeout`, emitting `IDLE_TIMEOUT` with final bytes.
+    /// `idle_timeout == 0` (Duration::ZERO) disables the sweep entirely. Reaps
+    /// flows + clears shaping via the shared de-auth path. Returns the count.
+    pub async fn sweep_idle(&self, now: Instant, idle_timeout: Duration) -> usize {
+        if idle_timeout.is_zero() {
+            return 0;
+        }
+        let idle: Vec<MacAddr> = {
+            let map = self.sessions.lock().expect("sessions mutex poisoned");
+            map.iter()
+                .filter(|(_, s)| now.saturating_duration_since(s.last_activity) > idle_timeout)
+                .map(|(m, _)| *m)
+                .collect()
+        };
+        let mut n = 0;
+        for mac in idle {
+            // revoke_internal emits IDLE_TIMEOUT (via RevokeReason), reaps flows,
+            // clears shaping, and counts Metric::IdleKill. A racing removal
+            // (SessionNotFound) is benign.
+            match self.revoke_internal(mac, RevokeReason::IdleTimeout).await {
+                Ok(()) => n += 1,
+                Err(e) => tracing::debug!(mac = %mac, error = %e, "idle sweep: session already gone"),
+            }
+        }
+        n
+    }
+
     /// Time-injected counter application (TDD §7.6/§7.7). For each `(mac,
     /// Counters)` we update per-session byte totals from the absolute kernel
     /// counter (`absolute - baseline`, re-baselining on counter reset), emit an
@@ -360,7 +487,7 @@ impl SessionManager {
     pub async fn apply_counters_at(
         &self,
         snapshot: Vec<(MacAddr, Counters)>,
-        _now: Instant,
+        now: Instant,
     ) -> Result<()> {
         let mut interim: Vec<SessionEvent> = Vec::new();
         let mut quota_breached: Vec<MacAddr> = Vec::new();
@@ -374,8 +501,14 @@ impl SessionManager {
                     continue;
                 };
 
+                let prior_total = session.total();
                 session.bytes_in = delta(&mut session.baseline_in, counters.bytes_in);
                 session.bytes_out = delta(&mut session.baseline_out, counters.bytes_out);
+                // G6: any forward progress in bytes is "activity" — stamp it so the
+                // idle sweep only reaps genuinely-quiet sessions.
+                if session.total() > prior_total {
+                    session.last_activity = now;
+                }
 
                 interim.push(Self::build_event(
                     session.session_id.clone(),
@@ -449,6 +582,7 @@ impl SessionManager {
             tier: Tier::default(),
             granted_at: now,
             expires_at: now + remaining,
+            last_activity: now,
             quota_bytes: 0,
             rate_bps: 0,
             bytes_in: 0,
@@ -709,6 +843,37 @@ mod tests {
         (m, writer, sink)
     }
 
+    /// Records every IP handed to the reaper; optionally errors (to prove a reap
+    /// failure never aborts the de-auth — fail-closed, invariant #9).
+    #[derive(Default)]
+    struct RecordingReaper {
+        reaped: std::sync::Mutex<Vec<std::net::IpAddr>>,
+        fail: bool,
+    }
+    impl RecordingReaper {
+        fn failing() -> Self {
+            RecordingReaper { fail: true, ..Default::default() }
+        }
+        fn ips(&self) -> Vec<std::net::IpAddr> {
+            self.reaped.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl FlowReaper for RecordingReaper {
+        async fn reap_by_ip(&self, ip: std::net::IpAddr) -> Result<usize> {
+            self.reaped.lock().unwrap().push(ip);
+            if self.fail {
+                Err(Error::Counter("boom".into()))
+            } else {
+                Ok(1)
+            }
+        }
+    }
+
+    fn grant_params_ip(m: MacAddr, ip: &str, ttl_secs: u64) -> GrantParams {
+        GrantParams { ip: Some(ip.parse().unwrap()), ..grant_params(m, ttl_secs, 0) }
+    }
+
     // ---- tests ------------------------------------------------------------
 
     #[tokio::test]
@@ -763,6 +928,138 @@ mod tests {
         // del_auth called (belt-and-suspenders) and EXPIRED emitted.
         assert!(writer.ops().contains(&WriterOp::DelAuth(mac(3))));
         assert!(sink.kinds().contains(&EventKind::Expired));
+    }
+
+    #[tokio::test]
+    async fn revoke_reaps_flows_after_del_auth() {
+        let (m, writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(5), "10.0.0.5", 60), now).await.unwrap();
+
+        m.revoke(mac(5), RevokeReason::Admin).await.unwrap();
+        // Invariant #9: del_auth happened AND the client's IP was reaped.
+        assert!(writer.ops().contains(&WriterOp::DelAuth(mac(5))));
+        assert_eq!(reaper.ips(), vec!["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn revoke_without_recorded_ip_does_not_reap() {
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(6), 60, 0), now).await.unwrap(); // ip = None
+        m.revoke(mac(6), RevokeReason::Admin).await.unwrap();
+        assert!(reaper.ips().is_empty(), "no recorded IP -> nothing to reap");
+    }
+
+    #[tokio::test]
+    async fn reap_failure_does_not_abort_revoke() {
+        let (m, _writer, sink) = mgr();
+        m.set_reaper(Arc::new(RecordingReaper::failing()));
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(7), "10.0.0.7", 60), now).await.unwrap();
+        // The revoke still completes and emits despite the reaper erroring:
+        // a reap failure is a degradation, never a fail-open that blocks tear-down.
+        m.revoke(mac(7), RevokeReason::Admin).await.unwrap();
+        assert_eq!(m.len(), 0);
+        assert!(sink.kinds().contains(&EventKind::Revoked));
+    }
+
+    #[tokio::test]
+    async fn expiry_reaps_flows() {
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(8), "10.0.0.8", 10), now).await.unwrap();
+        m.tick_expiry(now + Duration::from_secs(10)).await;
+        assert_eq!(reaper.ips(), vec!["10.0.0.8".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[derive(Default)]
+    struct RecordingShaper {
+        applied: std::sync::Mutex<Vec<(MacAddr, u64)>>,
+        cleared: std::sync::Mutex<Vec<MacAddr>>,
+    }
+    #[async_trait]
+    impl Shaper for RecordingShaper {
+        async fn apply(&self, mac: MacAddr, rate_bps: u64) -> Result<()> {
+            self.applied.lock().unwrap().push((mac, rate_bps));
+            Ok(())
+        }
+        async fn clear(&self, mac: MacAddr) -> Result<()> {
+            self.cleared.lock().unwrap().push(mac);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_applies_and_revoke_clears_shaper() {
+        let (m, _writer, _sink) = mgr();
+        let shaper = Arc::new(RecordingShaper::default());
+        m.set_shaper(shaper.clone());
+        let now = Instant::now();
+        let p = GrantParams { rate_bps: 5_000_000, ..grant_params(mac(9), 60, 0) };
+        m.grant_at(p, now).await.unwrap();
+        assert_eq!(&*shaper.applied.lock().unwrap(), &[(mac(9), 5_000_000)]);
+
+        m.revoke(mac(9), RevokeReason::Admin).await.unwrap();
+        assert_eq!(&*shaper.cleared.lock().unwrap(), &[mac(9)]);
+    }
+
+    #[tokio::test]
+    async fn idle_sweep_kills_quiet_and_spares_active() {
+        let (m, _w, sink) = mgr();
+        let t0 = Instant::now();
+        m.grant_at(grant_params_ip(mac(11), "10.0.0.11", 3600), t0).await.unwrap();
+
+        // First snapshot establishes the baseline (no activity registered yet);
+        // the second shows forward progress -> stamps last_activity at t0+250.
+        m.apply_counters_at(vec![(mac(11), Counters { bytes_in: 10, bytes_out: 0 })], t0 + Duration::from_secs(50)).await.unwrap();
+        m.apply_counters_at(vec![(mac(11), Counters { bytes_in: 100, bytes_out: 0 })], t0 + Duration::from_secs(250)).await.unwrap();
+
+        // 150s since activity (< 300) -> spared.
+        assert_eq!(m.sweep_idle(t0 + Duration::from_secs(400), Duration::from_secs(300)).await, 0);
+        assert_eq!(m.len(), 1);
+        // 350s since activity (> 300) -> idle-killed with IDLE_TIMEOUT.
+        assert_eq!(m.sweep_idle(t0 + Duration::from_secs(600), Duration::from_secs(300)).await, 1);
+        assert_eq!(m.len(), 0);
+        assert!(sink.kinds().contains(&EventKind::IdleTimeout));
+    }
+
+    #[tokio::test]
+    async fn idle_sweep_disabled_when_zero() {
+        let (m, _w, _s) = mgr();
+        let t0 = Instant::now();
+        m.grant_at(grant_params_ip(mac(12), "10.0.0.12", 3600), t0).await.unwrap();
+        // idle_timeout = 0 disables the sweep entirely, no matter how quiet.
+        assert_eq!(m.sweep_idle(t0 + Duration::from_secs(99_999), Duration::ZERO).await, 0);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shaper_failure_does_not_fail_grant() {
+        struct FailingShaper;
+        #[async_trait]
+        impl Shaper for FailingShaper {
+            async fn apply(&self, _m: MacAddr, _r: u64) -> Result<()> {
+                Err(Error::Backend("tc down".into()))
+            }
+            async fn clear(&self, _m: MacAddr) -> Result<()> {
+                Err(Error::Backend("tc down".into()))
+            }
+        }
+        let (m, writer, _sink) = mgr();
+        m.set_shaper(Arc::new(FailingShaper));
+        // The grant still succeeds (kernel gate opened) despite the shaper erroring
+        // — shaping is best-effort, never gates. add_auth still ran.
+        let p = GrantParams { rate_bps: 1_000, ..grant_params(mac(10), 60, 0) };
+        m.grant_at(p, Instant::now()).await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(writer.ops().iter().any(|o| matches!(o, WriterOp::AddAuth(mm, _) if *mm == mac(10))));
     }
 
     #[tokio::test]

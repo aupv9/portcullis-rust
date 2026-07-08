@@ -45,6 +45,33 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true
 
+  # Linux network-namespace integration + fault-injection suite (G9, TDD §15):
+  # asserts the real `inet wifihub` ruleset verdicts + restart adoption against a
+  # live kernel. Needs root (CAP_NET_ADMIN) + nft/ip/curl/nc, so it is separate
+  # from the arch-independent gate above and its cases are `#[ignore]` (plain
+  # `cargo test` skips them). Serial: the namespaces + the :8080 port are global
+  # kernel state.
+  #
+  # `continue-on-error` while the harness is first shaken out on a real runner
+  # (it cannot be exercised on the dev macOS host) — flip to blocking once green.
+  netns:
+    name: netns integration (privileged)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install netns tooling
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 netcat-openbsd curl
+
+      - name: Build daemon + test
+        run: cargo test -p portcullis-engined --test netns --locked --no-run
+
+      - name: Run netns suite (root, serial)
+        run: sudo -E env "PATH=$PATH" cargo test -p portcullis-engined --test netns --locked -- --ignored --test-threads=1
+
 # NOTE: cross-compiling to mipsel-unknown-linux-musl (the RUTM11 target) is a
 # Rust tier-3 build (no prebuilt std) and is done with the RutOS/OpenWrt SDK
 # (`-Z build-std`), not generic CI — see deploy/README.md (TDD §5.3, §16 POC).

@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portcullis_config::Config;
+use portcullis_nft::FirewallBackend;
 use portcullis_types::{
-    CounterSource, Enforcer, Metric, MeteringSink, MetricsSink, RulesetWriter, UnknownKernelPolicy,
+    CounterSource, Enforcer, Metric, MeteringSink, MetricsSink, Provisioner, RulesetWriter,
+    UnknownKernelPolicy,
 };
 
 use crate::metrics::Metrics;
@@ -23,15 +25,19 @@ const EXPIRY_TICK: Duration = Duration::from_secs(1);
 /// Walled-garden reconcile cadence.
 const GARDEN_TICK: Duration = Duration::from_secs(30);
 
-pub async fn run(cfg: Config) -> anyhow::Result<()> {
+pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result<()> {
     // 0. Metrics recorder (§12). Created first so it can be injected into the nft
     //    writer actor (for nft_txn_errors), the session manager, and the redirect
     //    responder before any of them start.
     let metrics = Arc::new(Metrics::default());
 
-    // 1. nft backend + single-owner writer actor (§7.9). The only path to
-    //    netfilter; every mutation is serialized through this actor.
-    let backend = Box::new(portcullis_nft::NftJsonBackend::default());
+    // 1. Firewall backend + single-owner writer actor (§7.9). The only path to
+    //    netfilter; every mutation is serialized through this actor. The backend
+    //    is config-selected (`firewall_backend`, default "auto"): stock RutOS has
+    //    no nftables NAT chain support (CONFIG_NFT_NAT unset), so the auto-probe
+    //    fails there and picks ipset + iptables/ip6tables (TDD §17 option B).
+    //    Both implement the same FirewallBackend seam.
+    let (backend, garden_backend) = detect_backend(&cfg);
     let (writer_handle, _writer_join) =
         portcullis_nft::spawn_with_metrics(backend, metrics.clone());
     let writer: Arc<dyn RulesetWriter> = Arc::new(writer_handle);
@@ -63,7 +69,108 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // initial view is consistent; the periodic reconcile loop refreshes these.
     w.mgr.mark_reconcile(true, true);
 
+    // 4c. conntrack flow reaper (invariant #9, G1): removing a MAC from `@auth`
+    //     only gates NEW connections — established flows leak through the
+    //     `ct established,related accept` fast path. The reaper severs a client's
+    //     flows on de-auth. Injected into the SessionManager (fast path) and
+    //     driven by the reconcile sweep (step 7b). `reap_conntrack = false` (or a
+    //     device without `conntrack`) → NoopReaper (pre-invariant-#9 behaviour).
+    let reaper: Arc<dyn portcullis_types::FlowReaper> = if cfg.reap_conntrack {
+        Arc::new(portcullis_accounting::ConntrackReaper::default())
+    } else {
+        Arc::new(portcullis_types::NoopReaper)
+    };
+    w.mgr.set_reaper(reaper.clone());
+
+    // 4d. Bandwidth shaper (G5): per-session tc/HTB cap, scoped to a LAN egress
+    //     iface via config. Off → NoopShaper (grants carry rate_bps but no cap is
+    //     applied). The `shaper` capability is advertised (GetEngineInfo) only
+    //     when enabled, so the CP won't push a cap the engine can't honor.
+    let (shaper, shaper_caps): (Arc<dyn portcullis_types::Shaper>, Vec<String>) =
+        if cfg.shape_bandwidth && !cfg.shape_iface.trim().is_empty() {
+            tracing::info!(iface = %cfg.shape_iface, "bandwidth shaping enabled (tc/HTB)");
+            (
+                Arc::new(portcullis_accounting::TcShaper::new(cfg.shape_iface.clone())),
+                vec!["shaper".to_string()],
+            )
+        } else {
+            (Arc::new(portcullis_types::NoopShaper), Vec::new())
+        };
+    w.mgr.set_shaper(shaper);
+
+    // F2: restore the enforcement scope from the last committed CP-managed
+    // wireless config (persisted to tmpfs on confirm). Survives a daemon restart
+    // — the auth set was already adopted above (kernel-as-truth); this re-applies
+    // the gated-SSID iface set so a CP-provisioned gated SSID keeps its captive
+    // gate across the restart, before the CP reconnects. `None` = no committed
+    // config → keep the static seed. Best-effort (never blocks startup).
+    if let Some(gated) = portcullis_provision::read_committed_gated(std::path::Path::new(
+        portcullis_provision::DEFAULT_STATE_DIR,
+    )) {
+        match writer.set_gated_ifaces(gated.clone()).await {
+            Ok(()) => tracing::info!(gated_ifaces = ?gated, "restored enforcement scope from committed wireless config"),
+            Err(e) => tracing::warn!(error = %e, "boot re-scope from committed wireless config failed; using static seed"),
+        }
+    }
+
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // 4b. Hotspot provisioning subsystem (P0.5) — spawned as an ISOLATED task,
+    //     completely separate from enforcement (its own actor + tmpfs state +
+    //     shell-out runner). It renders a FIXED allowlist of UCI sections and
+    //     holds each apply under a LOCAL commit-confirm watchdog. Fail-OPEN
+    //     (rollback), the ONE exception to the engine's fail-closed rule: it
+    //     manages router config, not enforcement, and kernel-as-truth means a
+    //     provision fault never drops an authorized client. Spawned BEFORE the
+    //     control channel so its handle + status stream can be wired in.
+    let (provisioner, wireless_status_rx, provision_join) =
+        portcullis_provision::run_provision_subsystem(
+            portcullis_provision::ProcessRunner,
+            portcullis_provision::DEFAULT_STATE_DIR,
+            // The redirect-responder port opened by the per-SSID portal firewall
+            // rule so pre-auth guests can reach the captive redirect. LOCAL engine
+            // setting, not on the wire.
+            cfg.responder_port,
+        );
+    let provisioner: Arc<dyn Provisioner> = Arc::new(provisioner);
+    tasks.push(provision_join);
+    // The control channel consumes the WirelessStatus stream (fans it into
+    // outbound EngineFrames). Kept in an Option so it is moved into the channel
+    // task only when TLS is present; otherwise the subsystem still runs (watchdog
+    // rollback works without the CP) and statuses simply buffer in the mpsc.
+    let mut wireless_status_rx = Some(wireless_status_rx);
+
+    // 4e. Runtime control state (F0): the CP-pushed config store + EngineControl
+    //     controller. Built UNCONDITIONALLY (independent of CP connectivity) — it
+    //     holds local runtime state and drives the effect loops (garden/enforcement
+    //     below); the control channel (step 5) only dispatches Set*/Get* into it
+    //     when the CP is connected. Seeded from the static config until the CP
+    //     pushes; persisted to tmpfs so it survives a restart.
+    let boot_id = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}-{nanos:x}", std::process::id())
+    };
+    let seed = portcullis_types::RuntimeConfig {
+        enforcement_enabled: true,
+        garden_fqdns: cfg.garden_fqdn.clone(),
+        tier_policies: Vec::new(),
+        engine_params: portcullis_types::EngineParameters {
+            accounting_interval_secs: cfg.accounting_interval.clamp(1, 3600) as u32,
+            idle_timeout_secs: cfg.idle_timeout.min(86400) as u32,
+            ..portcullis_types::EngineParameters::default()
+        },
+    };
+    let controller = Arc::new(crate::runtime::RuntimeController::new(
+        crate::runtime::RUNTIME_STATE_PATH,
+        env!("CARGO_PKG_VERSION"),
+        boot_id,
+        metrics.clone(),
+        seed,
+        shaper_caps,
+    ));
 
     // 5. Outbound control channel over mutual TLS (§13, CGNAT design doc). The
     //    engine dials the control plane and holds a long-lived bidirectional
@@ -71,20 +178,34 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //    reconnects with backoff and sets the `cp_connected` health flag.
     match load_client_tls(&cfg) {
         Ok(Some(tls)) => {
+            // G3/G4: the control channel dispatches Set*/Get* into the F0
+            // controller and resolves tier defaults on the grant path.
+            let engine_control: Arc<dyn portcullis_types::EngineControl> = controller.clone();
             let chan_cfg = portcullis_control::ControlChannelConfig {
                 endpoint: cfg.control_endpoint.clone(),
                 tls,
                 store_id: cfg.store_id.clone(),
                 keepalive: Duration::from_secs(cfg.control_keepalive_secs.max(1)),
                 reconnect_max: Duration::from_secs(cfg.control_reconnect_max_secs.max(1)),
+                provisioner: provisioner.clone(),
+                // P-W1: lets the channel re-scope enforcement to the committed
+                // wireless config's gated-SSID ifaces (never flushes the auth set).
+                writer: writer.clone(),
+                // G3/G4: config-push + introspection dispatch target.
+                engine_control,
             };
             let enforcer = w.mgr.clone() as Arc<dyn Enforcer>;
             let events = w.event_tx.clone();
             let mgr = w.mgr.clone();
             let m = metrics.clone();
+            // Move the WirelessStatus stream into the channel task so it fans
+            // status (incl. unsolicited watchdog ROLLED_BACK) up to the CP.
+            let wireless_rx = wireless_status_rx
+                .take()
+                .expect("wireless status receiver taken once");
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
-                portcullis_control::run_control_channel(chan_cfg, enforcer, events, move |up| {
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, move |up| {
                     mgr.set_cp_connected(up);
                     if !up {
                         m.incr(Metric::CpDisconnect);
@@ -132,17 +253,56 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // 7. Accounting metering loop (§7.6): conntrack counters -> SessionManager
-    //    (which computes deltas, emits INTERIM, enforces quota).
+    //    (which computes deltas, emits INTERIM, enforces quota). The poll cadence
+    //    comes from the runtime controller's engine params and RE-ARMS on change
+    //    (G3a/G7): a CP SetEngineParameters or a SIGHUP reload retunes the interval
+    //    live by cancelling the current loop and restarting it with the new value.
     {
         let source: Arc<dyn CounterSource> = Arc::new(portcullis_accounting::ConntrackSource::new(
             portcullis_redirect::IpNeighResolver::new(),
         ));
         let metering_sink: Arc<dyn MeteringSink> = w.mgr.clone();
-        let interval = Duration::from_secs(cfg.accounting_interval.max(1));
+        let mut params_rx = controller.watch_params();
         tasks.push(tokio::spawn(async move {
-            portcullis_accounting::run_metering_loop(
-                source,
-                metering_sink,
+            loop {
+                let interval = Duration::from_secs(
+                    u64::from(params_rx.borrow_and_update().accounting_interval_secs).max(1),
+                );
+                // Run until the interval changes, then loop to re-arm. Cancelling
+                // the metering loop mid-wait is safe — it's a stateless ticker;
+                // the session layer re-baselines from the next snapshot (§7.6).
+                tokio::select! {
+                    _ = portcullis_accounting::run_metering_loop(
+                        source.clone(),
+                        metering_sink.clone(),
+                        interval,
+                        std::future::pending::<()>(),
+                    ) => {}
+                    changed = params_rx.changed() => {
+                        if changed.is_err() { break; } // controller gone -> stop
+                    }
+                }
+            }
+        }));
+    }
+
+    // 7b. conntrack reconcile sweep (invariant #9, G1): periodically reap flows
+    //     of any neighbour whose MAC is no longer in `@auth`. Backstops the
+    //     de-auth fast path (IPs the session never recorded — dual-stack, DHCP
+    //     churn) and does the COLD-START reap (the first tick fires immediately,
+    //     severing flows left over from before this daemon adopted kernel state).
+    //     Only LAN neighbours are candidates, so the router's own IPs and the
+    //     outbound control-plane flow are never reaped. Skipped when reaping off.
+    if cfg.reap_conntrack {
+        let writer = writer.clone();
+        let resolver = Arc::new(portcullis_redirect::IpNeighResolver::new());
+        let reaper = reaper.clone();
+        let interval = Duration::from_secs(cfg.reconcile_interval.max(5));
+        tasks.push(tokio::spawn(async move {
+            portcullis_accounting::run_reap_loop(
+                writer,
+                resolver,
+                reaper,
                 interval,
                 std::future::pending::<()>(),
             )
@@ -150,25 +310,87 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }));
     }
 
-    // 8. Walled-garden reconciler (§7.3): keep dnsmasq's nftset config in sync
-    //    with the configured FQDN list.
+    // 8. Walled-garden reconciler (§7.3): keep dnsmasq's garden config in sync,
+    //    using the directive family (`nftset=` vs `ipset=`) that matches the
+    //    backend (G2). The FQDN list comes from the runtime controller (G3b) so a
+    //    CP `SetGarden` takes effect live; it also reconciles every GARDEN_TICK to
+    //    repair external drift.
     {
-        let garden = portcullis_garden::GardenConfig::with_fqdns(cfg.garden_fqdn.clone());
+        let mut garden_rx = controller.watch_garden();
         tasks.push(tokio::spawn(async move {
-            portcullis_garden::run_garden_loop(GARDEN_CONF_PATH, garden, GARDEN_TICK).await;
+            let mut ticker = tokio::time::interval(GARDEN_TICK);
+            loop {
+                let fqdns = garden_rx.borrow_and_update().clone();
+                let gc = portcullis_garden::GardenConfig::with_fqdns_for(garden_backend, fqdns);
+                match portcullis_garden::reconcile(GARDEN_CONF_PATH, &gc).await {
+                    Ok(true) => tracing::info!("garden config reconciled (changed)"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "garden reconcile failed; keeping prior config")
+                    }
+                }
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    r = garden_rx.changed() => { if r.is_err() { break; } }
+                }
+            }
         }));
     }
 
-    // 9. Daemon-side expiry sweep (dual-path expiry, §7.4).
+    // 8b. Enforcement toggle (G3b/G8): a CP `SetEnforcement(false)` removes the
+    //     gating jumps (unauth traffic then falls through to fw3 — the gate stops
+    //     blocking), and `SetEnforcement(true)` restores the gated-SSID scope.
+    //     Reuses the scoped `set_gated_ifaces` path: it never flushes the auth
+    //     set and never touches fw3; the table + sets persist across a toggle, so
+    //     re-enabling is instant. Enforcement starts enabled + scoped at boot, so
+    //     we skip the initial value and act only on subsequent changes.
+    {
+        let mut enf_rx = controller.watch_enforcement();
+        let writer = writer.clone();
+        let seed_ifaces = gated_ifaces(&cfg);
+        enf_rx.borrow_and_update(); // mark the boot value seen
+        tasks.push(tokio::spawn(async move {
+            while enf_rx.changed().await.is_ok() {
+                let enabled = *enf_rx.borrow_and_update();
+                // On (re)enable, restore the currently-committed gated ifaces
+                // (CP-managed wireless) if any, else the static seed.
+                let target = if enabled {
+                    portcullis_provision::read_committed_gated(std::path::Path::new(
+                        portcullis_provision::DEFAULT_STATE_DIR,
+                    ))
+                    .unwrap_or_else(|| seed_ifaces.clone())
+                } else {
+                    Vec::new()
+                };
+                match writer.set_gated_ifaces(target).await {
+                    Ok(()) => tracing::info!(enabled, "enforcement toggle applied"),
+                    Err(e) => {
+                        tracing::warn!(enabled, error = %e, "enforcement toggle failed; prior scope kept")
+                    }
+                }
+            }
+        }));
+    }
+
+    // 9. Daemon-side expiry sweep (dual-path expiry, §7.4) + idle-timeout sweep
+    //    (G6). Both run on the same tick; the idle threshold comes from the
+    //    runtime controller's engine params (0 = disabled), so a CP
+    //    SetEngineParameters takes effect on the next tick.
     {
         let mgr = w.mgr.clone();
+        let controller = controller.clone();
         tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(EXPIRY_TICK);
             loop {
                 ticker.tick().await;
-                let expired = mgr.tick_expiry(Instant::now()).await;
+                let now = Instant::now();
+                let expired = mgr.tick_expiry(now).await;
                 if expired > 0 {
                     tracing::debug!(expired, "expiry sweep removed sessions");
+                }
+                let idle = mgr.sweep_idle(now, controller.idle_timeout()).await;
+                if idle > 0 {
+                    tracing::debug!(idle, "idle sweep removed sessions");
                 }
             }
         }));
@@ -226,6 +448,57 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tracing::info!("metrics endpoint disabled (metrics_port = 0)");
     }
 
+    // 9d. Hot-reload on SIGHUP (G7). procd sends SIGHUP on a UCI change; reload
+    //     the config file and, for a hot-reloadable diff, push the new garden +
+    //     engine params through the runtime controller — the garden reconciler,
+    //     the metering re-arm (step 7), and the idle sweep (step 9) react without
+    //     dropping a session. A restart-only change (endpoint/TLS/port/store/
+    //     backend) is logged, not partially applied.
+    #[cfg(unix)]
+    {
+        use portcullis_config::ReloadImpact;
+        use portcullis_types::EngineControl as _;
+        let controller = controller.clone();
+        let path = config_path.clone();
+        let mut current = cfg.clone();
+        tasks.push(tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot install SIGHUP handler; hot-reload disabled");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                let Some(new) = reload_config(&path) else { continue };
+                match portcullis_config::diff(&current, &new) {
+                    ReloadImpact::HotReloadable => {
+                        if new.garden_fqdn != current.garden_fqdn {
+                            let _ = controller.set_garden(new.garden_fqdn.clone()).await;
+                        }
+                        let params = portcullis_types::EngineParameters {
+                            accounting_interval_secs: new.accounting_interval.clamp(1, 3600) as u32,
+                            idle_timeout_secs: new.idle_timeout.min(86400) as u32,
+                            ..portcullis_types::EngineParameters::default()
+                        };
+                        if let Err(e) = controller.set_engine_parameters(params).await {
+                            tracing::warn!(error = %e, "SIGHUP: engine params rejected; kept prior");
+                        }
+                        tracing::info!("SIGHUP: config hot-reloaded");
+                        current = new;
+                    }
+                    ReloadImpact::RequiresRestart => {
+                        tracing::warn!(
+                            "SIGHUP: config change touches a restart-only field \
+                             (endpoint/TLS/port/store/backend); NOT applied live — restart to take effect"
+                        );
+                    }
+                }
+            }
+        }));
+    }
+
     // 10. Block until SIGTERM (procd stop) or Ctrl-C, then shut down.
     wait_for_shutdown().await;
     tracing::info!("shutdown signal received; stopping tasks");
@@ -237,11 +510,109 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Metrics endpoint listen address, bound on **loopback**: without the WireGuard
-/// overlay there is no private network to expose it on, and the endpoint is
+/// Metrics endpoint listen address, bound on **loopback**: the router has no
+/// private management network to expose it on, and the endpoint is
 /// unauthenticated (§12). Local scrape only.
 fn metrics_listen_addr(cfg: &Config) -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], cfg.metrics_port))
+}
+
+/// Select the firewall backend per `cfg.firewall_backend` (TDD §17 option A vs
+/// B): `"nft"` / `"ipset"` force one; `"auto"` (the default) probes the running
+/// kernel for nft NAT chain support and falls back to the ipset+iptables backend
+/// on stock RutOS (no CONFIG_NFT_NAT). The ipset backend's tcp:80 REDIRECT is
+/// wired to `cfg.responder_port` so it always targets the live responder.
+fn detect_backend(cfg: &Config) -> (Box<dyn FirewallBackend>, portcullis_garden::GardenBackend) {
+    detect_backend_with(cfg, "nft")
+}
+
+/// The set of interfaces enforcement gates. Today: the single configured
+/// `hotspot_iface` (empty → none, i.e. fail-OPEN inert). P-W1 chunk 4 replaces
+/// this static seed with the dynamic set fed from the committed CP-managed
+/// wireless config (each `gated=true` SSID's resulting iface), re-applied via the
+/// writer without flushing the auth set.
+fn gated_ifaces(cfg: &Config) -> Vec<String> {
+    if cfg.hotspot_iface.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![cfg.hotspot_iface.clone()]
+    }
+}
+
+/// [`detect_backend`] with an injectable `nft` program path for the probe (unit
+/// tests stand in a fake script, cf. the shaper's `fake_tc` pattern).
+fn detect_backend_with(
+    cfg: &Config,
+    nft_bin: &str,
+) -> (Box<dyn FirewallBackend>, portcullis_garden::GardenBackend) {
+    let use_nft = match cfg.firewall_backend.as_str() {
+        "nft" => true,
+        "ipset" => false,
+        // "auto" — the only other value config validation admits.
+        _ => {
+            let supported = probe_nft_nat(nft_bin);
+            tracing::info!(nft_nat_supported = supported, "firewall_backend=auto kernel probe");
+            supported
+        }
+    };
+    // P0: scope the FORWARD/PREROUTING gate to the hotspot interface so only the
+    // public SSID is gated (br-lan untouched). Empty `hotspot_iface` → the
+    // backend installs no gate at all (fail-OPEN; see the backend docs).
+    //
+    // The chosen backend also decides how dnsmasq syncs the walled garden
+    // (`nftset=` for nft sets vs `ipset=` for ipset sets, G2) — return it so the
+    // garden loop renders the matching directive family (a mismatch silently
+    // empties the garden).
+    if use_nft {
+        tracing::info!(
+            backend = "nft",
+            hotspot_iface = %cfg.hotspot_iface,
+            "firewall backend selected"
+        );
+        (
+            Box::new(portcullis_nft::NftJsonBackend::default().with_gated_ifaces(gated_ifaces(cfg))),
+            portcullis_garden::GardenBackend::Nft,
+        )
+    } else {
+        tracing::info!(
+            backend = "ipset",
+            hotspot_iface = %cfg.hotspot_iface,
+            "firewall backend selected"
+        );
+        (
+            Box::new(
+                portcullis_nft::IpsetIptablesBackend::default()
+                    .with_redirect_port(cfg.responder_port)
+                    .with_gated_ifaces(gated_ifaces(cfg)),
+            ),
+            portcullis_garden::GardenBackend::Ipset,
+        )
+    }
+}
+
+/// Probe whether the running kernel supports nftables NAT chains: add a scratch
+/// table, add a `type nat hook prerouting` chain into it (the exact step that
+/// fails ENOENT without CONFIG_NFT_NAT), then delete the table. Any failure —
+/// including a missing `nft` binary — means "no", never an error: the caller
+/// falls back to the ipset backend.
+fn probe_nft_nat(program: &str) -> bool {
+    let run = |args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !run(&["add", "table", "inet", "wifihub_probe"]) {
+        return false;
+    }
+    let nat_ok = run(&[
+        "add", "chain", "inet", "wifihub_probe", "probe", "{", "type", "nat", "hook",
+        "prerouting", "priority", "-50", ";", "}",
+    ]);
+    // Best-effort cleanup either way: the scratch table must not linger.
+    let _ = run(&["delete", "table", "inet", "wifihub_probe"]);
+    nat_ok
 }
 
 /// Load the engine's **client** identity + the pinned control-plane **server**
@@ -266,6 +637,31 @@ fn load_client_tls(cfg: &Config) -> anyhow::Result<Option<tonic::transport::Clie
 }
 
 /// Wait for SIGTERM (procd stop) or Ctrl-C.
+/// Reload + validate the config file for a SIGHUP hot-reload (G7). Any failure
+/// (unreadable, malformed, invalid) is logged and returns `None` so the running
+/// config stays in force — a bad edit never takes down a live daemon.
+fn reload_config(path: &std::path::Path) -> Option<Config> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "SIGHUP: config unreadable; keeping running config");
+            return None;
+        }
+    };
+    let parsed = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        Config::from_toml_str(&raw)
+    } else {
+        Config::from_uci_str(&raw)
+    };
+    match parsed.and_then(|c| c.validate().map(|()| c)) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "SIGHUP: config invalid; keeping running config");
+            None
+        }
+    }
+}
+
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
@@ -286,5 +682,123 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fake `nft`: logs each invocation's args and exits 0, except (when
+    /// `fail_on_chain`) any command mentioning `chain` — mimicking a kernel
+    /// without CONFIG_NFT_NAT, where only the NAT chain add fails. Same
+    /// temp-dir script pattern as the shaper tests' `fake_tc`.
+    fn fake_nft(tag: &str, fail_on_chain: bool) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portcullis-nft-probe-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("nft.log");
+        let script = dir.join("nft");
+        let fail_branch = if fail_on_chain {
+            "case \"$*\" in *chain*) exit 1;; esac\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n{fail_branch}exit 0\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), log)
+    }
+
+    fn lines(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn probe_nft_nat_passes_and_cleans_up_when_kernel_supports_nat() {
+        let (nft, log) = fake_nft("nat-ok", false);
+        assert!(probe_nft_nat(&nft));
+        let cmds = lines(&log);
+        assert_eq!(cmds[0], "add table inet wifihub_probe");
+        assert_eq!(
+            cmds[1],
+            "add chain inet wifihub_probe probe { type nat hook prerouting priority -50 ; }"
+        );
+        assert_eq!(cmds[2], "delete table inet wifihub_probe");
+    }
+
+    #[test]
+    fn probe_nft_nat_fails_without_nat_chain_support_but_still_cleans_up() {
+        let (nft, log) = fake_nft("no-nat", true);
+        assert!(!probe_nft_nat(&nft));
+        // The scratch table is deleted even after the failed chain add.
+        assert!(lines(&log)
+            .iter()
+            .any(|c| c == "delete table inet wifihub_probe"));
+    }
+
+    #[test]
+    fn probe_nft_nat_fails_closed_when_nft_binary_is_missing() {
+        assert!(!probe_nft_nat("/nonexistent/portcullis-test-nft"));
+    }
+
+    /// `detect_backend_with` selects the right adapter. Backends are opaque
+    /// (`Box<dyn FirewallBackend>`), so we distinguish them by their error
+    /// variant on a doomed `ensure_base`: the ipset backend maps a spawn/exit
+    /// failure to `Error::Backend`, the nft backend to `Error::NftTransaction`.
+    #[tokio::test]
+    async fn detect_backend_honours_forced_choice_and_auto_probe() {
+        use portcullis_types::Error;
+
+        let cfg = |backend: &str| Config {
+            store_id: "S".into(),
+            firewall_backend: backend.to_string(),
+            ..Config::default()
+        };
+        // Point both backends at a binary that always fails, so ensure_base
+        // errors and reveals which adapter was chosen — without a kernel.
+        async fn is_ipset(b: Box<dyn FirewallBackend>) -> bool {
+            matches!(b.ensure_base().await, Err(Error::Backend(_)))
+        }
+        async fn is_nft(b: Box<dyn FirewallBackend>) -> bool {
+            matches!(b.ensure_base().await, Err(Error::NftTransaction(_)))
+        }
+
+        // Forced choices never run the probe (the nft binary is absent here).
+        // detect_backend_with now also returns the matching GardenBackend (G2);
+        // assert both the adapter and the garden directive family line up.
+        use portcullis_garden::GardenBackend;
+        let missing = "/nonexistent/portcullis-test-nft";
+        let (b, gb) = detect_backend_with(&cfg("nft"), missing);
+        assert!(is_nft(b).await);
+        assert_eq!(gb, GardenBackend::Nft);
+        let (b, gb) = detect_backend_with(&cfg("ipset"), missing);
+        assert!(is_ipset(b).await);
+        assert_eq!(gb, GardenBackend::Ipset);
+
+        // auto: the probe outcome decides.
+        let (nat_ok, _log) = fake_nft("auto-yes", false);
+        let (b, gb) = detect_backend_with(&cfg("auto"), &nat_ok);
+        assert!(is_nft(b).await);
+        assert_eq!(gb, GardenBackend::Nft);
+        let (no_nat, _log) = fake_nft("auto-no", true);
+        let (b, gb) = detect_backend_with(&cfg("auto"), &no_nat);
+        assert!(is_ipset(b).await);
+        assert_eq!(gb, GardenBackend::Ipset);
+        // ...and a box with no nft at all falls back to ipset (RUTM11 today).
+        let (b, gb) = detect_backend_with(&cfg("auto"), missing);
+        assert!(is_ipset(b).await);
+        assert_eq!(gb, GardenBackend::Ipset);
     }
 }

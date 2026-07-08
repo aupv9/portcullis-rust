@@ -1,0 +1,19 @@
+[package]
+name = "portcullis-provision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Isolated hotspot-network provisioning subsystem (P0.5): renders a FIXED allowlist of UCI sections + commit-confirm state machine with a local watchdog. Fail-OPEN, never touches the inet wifihub enforcement table."
+
+[dependencies]
+portcullis-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tempfile = "3"

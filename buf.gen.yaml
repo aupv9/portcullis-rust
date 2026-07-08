@@ -1,0 +1,14 @@
+version: v2
+# Run from core/portcullis-rust: `buf generate`. Mirrors the control plane's
+# Buf setup (domain/server/buf.gen.yaml) but with Rust plugins.
+#
+# Plugin versions are pinned to the workspace's tonic/prost (tonic 0.12,
+# prost 0.13): neoeinstein-prost v0.4.x -> prost 0.13, neoeinstein-tonic
+# v0.4.x -> tonic 0.12. Bump these together when the crate bumps tonic/prost.
+# Remote plugins need network at generate time (no local protoc needed).
+clean: true
+plugins:
+  - remote: buf.build/community/neoeinstein-prost:v0.4.0
+    out: crates/portcullis-control/src/gen
+  - remote: buf.build/community/neoeinstein-tonic:v0.4.1
+    out: crates/portcullis-control/src/gen

@@ -10,8 +10,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use portcullis_types::{
-    Error, GrantParams, HealthStatus, MacAddr, Result, RevokeReason, SessionEvent, SessionId,
-    SessionInfo, Tier,
+    EngineInfoSnapshot, EngineParameters, Error, GrantParams, HealthStatus, MacAddr,
+    MetricsSnapshot, ProvisionState, Result, RevokeReason, SessionEvent, SessionId, SessionInfo,
+    SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessStatus,
 };
 
 use crate::pb;
@@ -31,20 +32,14 @@ use crate::pb;
 ///   unparseable IP is rejected (it would otherwise be silently dropped).
 /// - `ttl_seconds` -> [`Duration`] (the nft set-element timeout).
 /// - `quota_bytes == 0` means *unlimited* and is carried through verbatim.
-/// - `rate_bps` MUST be `0` in Phase 1: bandwidth shaping (`tc`/HTB) is not yet
-///   enforced, so a non-zero value is **rejected** rather than silently ignored
-///   — the control plane must not believe a rate cap is in effect when it is not
-///   (TDD §7.7; the `tc` shaper stays as the Phase-2 seam in `portcullis-accounting`).
+/// - `rate_bps == 0` means *unlimited* (no cap). A non-zero value is carried
+///   through and enforced by the tc/HTB `Shaper` on grant (G5) — the engine
+///   advertises the `shaper` capability (via `GetEngineInfo`) only when shaping
+///   is actually enabled, so the control plane won't send a cap the engine can't
+///   apply.
 pub fn grant_request_to_params(req: pb::GrantRequest) -> Result<GrantParams> {
     let mac = MacAddr::from_str(&req.client_mac)?;
     let tier = Tier::from_str(&req.tier)?;
-
-    if req.rate_bps != 0 {
-        return Err(Error::BadRequest(format!(
-            "rate_bps unsupported in Phase 1 (got {}); omit it or set 0",
-            req.rate_bps
-        )));
-    }
 
     let ip = parse_optional_ip(&req.client_ip)?;
 
@@ -58,6 +53,83 @@ pub fn grant_request_to_params(req: pb::GrantRequest) -> Result<GrantParams> {
         tier,
         session_id: SessionId::from(req.session_id),
     })
+}
+
+/// Fill a grant's unset (`0`) `ttl` / `quota` / `rate` from the named tier's
+/// policy (G3a/G5) — a grant that names a user-group tier but omits limits
+/// inherits that group's CP-pushed defaults.
+pub fn apply_tier_defaults(req: &mut pb::GrantRequest, pol: &TierPolicy) {
+    if req.ttl_seconds == 0 {
+        req.ttl_seconds = pol.ttl_secs;
+    }
+    if req.quota_bytes == 0 {
+        req.quota_bytes = pol.quota_bytes;
+    }
+    if req.rate_bps == 0 {
+        req.rate_bps = pol.rate_bps;
+    }
+}
+
+/// Wire [`pb::SetTierPoliciesRequest`] -> domain tier policies (G3a). Validation
+/// (name shape, duplicates) is done by the [`EngineControl`] impl on apply.
+///
+/// [`EngineControl`]: portcullis_types::EngineControl
+pub fn tier_policies_from_pb(req: pb::SetTierPoliciesRequest) -> Vec<TierPolicy> {
+    req.policies
+        .into_iter()
+        .map(|p| TierPolicy {
+            tier: p.tier,
+            ttl_secs: p.ttl_seconds,
+            quota_bytes: p.quota_bytes,
+            rate_bps: p.rate_bps,
+        })
+        .collect()
+}
+
+/// Wire [`pb::SetEngineParametersRequest`] -> domain [`EngineParameters`] (G3a).
+/// Per the proto, `0` means "use the engine built-in default" for every field
+/// EXCEPT `idle_timeout_secs`, where `0` means "disabled". Bounds are enforced by
+/// [`EngineParameters::validate`] on apply.
+pub fn engine_params_from_pb(req: pb::SetEngineParametersRequest) -> EngineParameters {
+    let d = EngineParameters::default();
+    let or_default = |v: u32, dflt: u32| if v == 0 { dflt } else { v };
+    EngineParameters {
+        accounting_interval_secs: or_default(req.accounting_interval_secs, d.accounting_interval_secs),
+        garden_tick_secs: or_default(req.garden_tick_secs, d.garden_tick_secs),
+        expiry_tick_secs: or_default(req.expiry_tick_secs, d.expiry_tick_secs),
+        max_sessions: or_default(req.max_sessions, d.max_sessions),
+        idle_timeout_secs: req.idle_timeout_secs, // 0 = disabled (kept verbatim)
+    }
+}
+
+/// Domain [`EngineInfoSnapshot`] -> wire [`pb::EngineInfo`] (G4). Fields this
+/// snapshot doesn't own (event seqs, wireless hash) default to 0/empty.
+pub fn engine_info_to_pb(info: EngineInfoSnapshot) -> pb::EngineInfo {
+    pb::EngineInfo {
+        version: info.version,
+        boot_id: info.boot_id,
+        capabilities: info.capabilities,
+        enforcement_enabled: info.enforcement_enabled,
+        tier_policies_hash: info.tier_policies_hash,
+        engine_params_hash: info.engine_params_hash,
+        garden_hash: info.garden_hash,
+        ..Default::default()
+    }
+}
+
+/// Domain [`MetricsSnapshot`] -> wire [`pb::MetricsReply`] (G4). Counters the
+/// snapshot doesn't carry (grant_failures, event buffer, shaper, rss) default to 0.
+pub fn metrics_to_pb(m: MetricsSnapshot) -> pb::MetricsReply {
+    pb::MetricsReply {
+        sessions_active: m.sessions_active,
+        grants_total: m.grants_total,
+        revokes_total: m.revokes_total,
+        expires_total: m.expires_total,
+        quota_kills_total: m.quota_kills_total,
+        shaper_failures_total: m.shaper_failures_total,
+        idle_kills_total: m.idle_kills_total,
+        ..Default::default()
+    }
 }
 
 /// Parse a wire MAC string into a [`MacAddr`], rejecting anything malformed.
@@ -119,6 +191,11 @@ pub fn revoke_reason_to_pb(r: RevokeReason) -> pb::RevokeReason {
         RevokeReason::Admin => pb::RevokeReason::RevokeAdmin,
         RevokeReason::Quota => pb::RevokeReason::RevokeQuota,
         RevokeReason::MacChange => pb::RevokeReason::RevokeMacChange,
+        // Idle-timeout is engine-initiated and surfaced to the CP as an
+        // `IDLE_TIMEOUT` *event* (EventKind), not a wire Revoke *reason* (the CP
+        // never issues an idle revoke). This direction is only used in tests; map
+        // to the generic Admin reason for totality.
+        RevokeReason::IdleTimeout => pb::RevokeReason::RevokeAdmin,
     }
 }
 
@@ -134,6 +211,7 @@ pub fn event_kind_to_pb(k: portcullis_types::EventKind) -> pb::EventKind {
         E::Expired => pb::EventKind::Expired,
         E::Revoked => pb::EventKind::Revoked,
         E::QuotaExceeded => pb::EventKind::QuotaExceeded,
+        E::IdleTimeout => pb::EventKind::IdleTimeout,
     }
 }
 
@@ -145,6 +223,7 @@ pub fn event_kind_from_pb(k: pb::EventKind) -> portcullis_types::EventKind {
         pb::EventKind::Expired => E::Expired,
         pb::EventKind::Revoked => E::Revoked,
         pb::EventKind::QuotaExceeded => E::QuotaExceeded,
+        pb::EventKind::IdleTimeout => E::IdleTimeout,
     }
 }
 
@@ -156,6 +235,9 @@ pub fn session_event_to_pb(ev: &SessionEvent) -> pb::SessionEvent {
         bytes_in: ev.bytes_in,
         bytes_out: ev.bytes_out,
         ts_unix: ev.ts_unix,
+        // Per-boot monotonic sequence (superset proto). Event replay/resume is
+        // not wired yet; emit 0 (= pre-replay engine, per the proto comment).
+        seq: 0,
     }
 }
 
@@ -169,6 +251,118 @@ pub fn health_to_pb(h: HealthStatus) -> pb::HealthReply {
         kernel_table_present: h.kernel_table_present,
         cp_connected: h.cp_connected,
         last_reconcile_ok: h.last_reconcile_ok,
+        // Global enforcement gate (superset proto). The on/off toggle is not
+        // wired into HealthStatus yet; report enabled (the fail-closed default —
+        // the engine enforces unless explicitly told otherwise).
+        enforcement_enabled: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provisioning lifecycle state -> wire (shared by the wireless status mapping).
+// ---------------------------------------------------------------------------
+
+fn provision_state_to_pb(s: ProvisionState) -> pb::ProvisionState {
+    match s {
+        ProvisionState::AppliedPending => pb::ProvisionState::ProvisionAppliedPending,
+        ProvisionState::Committed => pb::ProvisionState::ProvisionCommitted,
+        ProvisionState::RolledBack => pb::ProvisionState::ProvisionRolledBack,
+        ProvisionState::Failed => pb::ProvisionState::ProvisionFailed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CP-managed wireless (P-W1): pb::SetWirelessConfigRequest -> domain
+// WirelessDesiredState, and domain WirelessStatus / WirelessDesiredState -> pb.
+// Keys (PSKs) are REDACTED on the way out (the engine never echoes secrets).
+// ---------------------------------------------------------------------------
+
+/// Translate one wire [`pb::WirelessSsid`] into the domain [`SsidSpec`]
+/// (flattening the nested network/firewall submessages). Field-level validation
+/// lives in `portcullis-provision::validate_wireless`; this is a total copy.
+pub fn wireless_ssid_from_pb(s: pb::WirelessSsid) -> SsidSpec {
+    let net = s.network.unwrap_or_default();
+    let fw = s.firewall.unwrap_or_default();
+    SsidSpec {
+        slug: s.slug,
+        ssid: s.ssid,
+        radios: s.radios,
+        encryption: s.encryption,
+        key: s.key,
+        hidden: s.hidden,
+        isolate: s.isolate,
+        gated: s.gated,
+        bridge_name: net.bridge_name,
+        ipaddr: net.ipaddr,
+        netmask: net.netmask,
+        dhcp_start: net.dhcp_start,
+        dhcp_limit: net.dhcp_limit,
+        dhcp_leasetime: net.dhcp_leasetime,
+        dhcp_disabled: net.dhcp_disabled,
+        egress_zone: fw.egress_zone,
+    }
+}
+
+/// Translate a wire [`pb::SetWirelessConfigRequest`] into the domain desired-state
+/// the provision subsystem consumes.
+pub fn wireless_config_from_pb(req: pb::SetWirelessConfigRequest) -> WirelessDesiredState {
+    WirelessDesiredState {
+        config_version: req.config_version,
+        ssids: req.ssids.into_iter().map(wireless_ssid_from_pb).collect(),
+        confirm_timeout_secs: req.confirm_timeout_secs,
+    }
+}
+
+/// Map a domain [`WirelessStatus`] to the wire `EngineFrame.wireless_status`.
+/// (Status carries no secrets — only slugs/ifaces/verdicts.)
+pub fn wireless_status_to_pb(s: &WirelessStatus) -> pb::WirelessStatus {
+    pb::WirelessStatus {
+        config_version: s.config_version.clone(),
+        state: provision_state_to_pb(s.state) as i32,
+        per_ssid: s
+            .per_ssid
+            .iter()
+            .map(|r| pb::SsidResult {
+                slug: r.slug.clone(),
+                ok: r.ok,
+                message: r.message.clone(),
+                iface: r.iface.clone(),
+            })
+            .collect(),
+        message: s.message.clone(),
+    }
+}
+
+/// Map the committed domain [`WirelessDesiredState`] to the `get_wireless_config`
+/// reply. PSK keys are **REDACTED** (emptied): the engine never echoes a secret
+/// back over the wire, even to the control plane that set it.
+pub fn wireless_config_to_pb(state: &WirelessDesiredState) -> pb::WirelessConfig {
+    pb::WirelessConfig {
+        config_version: state.config_version.clone(),
+        ssids: state.ssids.iter().map(ssid_spec_to_pb_redacted).collect(),
+    }
+}
+
+fn ssid_spec_to_pb_redacted(s: &SsidSpec) -> pb::WirelessSsid {
+    pb::WirelessSsid {
+        slug: s.slug.clone(),
+        ssid: s.ssid.clone(),
+        radios: s.radios.clone(),
+        encryption: s.encryption.clone(),
+        key: String::new(), // REDACTED — never echo the PSK
+        hidden: s.hidden,
+        isolate: s.isolate,
+        gated: s.gated,
+        network: Some(pb::WirelessNetwork {
+            bridge_name: s.bridge_name.clone(),
+            ipaddr: s.ipaddr.clone(),
+            netmask: s.netmask.clone(),
+            dhcp_start: s.dhcp_start.clone(),
+            dhcp_limit: s.dhcp_limit.clone(),
+            dhcp_leasetime: s.dhcp_leasetime.clone(),
+            dhcp_disabled: s.dhcp_disabled,
+        }),
+        firewall: Some(pb::WirelessFirewall { egress_zone: s.egress_zone.clone() }),
     }
 }
 
@@ -219,12 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn grant_request_rate_bps_rejected_phase1() {
-        // Non-zero rate must be rejected, not silently ignored (Phase-1 §7.7).
+    fn grant_request_rate_bps_carried_through() {
+        // G5: a non-zero rate is now accepted and carried through to be enforced
+        // by the tc/HTB shaper (was rejected in Phase 1).
         let mut g = sample_grant();
         g.rate_bps = 2_000_000;
-        let err = grant_request_to_params(g).unwrap_err();
-        assert!(matches!(err, Error::BadRequest(_)));
+        assert_eq!(grant_request_to_params(g).unwrap().rate_bps, 2_000_000);
     }
 
     #[test]
@@ -345,6 +539,26 @@ mod tests {
     }
 
     #[test]
+    fn wireless_status_maps_provision_states() {
+        // provision_state_to_pb is exercised via the wireless status mapping.
+        let cases = [
+            (ProvisionState::AppliedPending, pb::ProvisionState::ProvisionAppliedPending),
+            (ProvisionState::Committed, pb::ProvisionState::ProvisionCommitted),
+            (ProvisionState::RolledBack, pb::ProvisionState::ProvisionRolledBack),
+            (ProvisionState::Failed, pb::ProvisionState::ProvisionFailed),
+        ];
+        for (domain, wire) in cases {
+            let s = WirelessStatus {
+                config_version: "cfg".into(),
+                state: domain,
+                per_ssid: Vec::new(),
+                message: "m".into(),
+            };
+            assert_eq!(wireless_status_to_pb(&s).state, wire as i32);
+        }
+    }
+
+    #[test]
     fn health_maps_all_flags() {
         let h = HealthStatus {
             backend_ok: true,
@@ -357,5 +571,157 @@ mod tests {
         assert!(!pb.kernel_table_present);
         assert!(pb.cp_connected);
         assert!(!pb.last_reconcile_ok);
+    }
+
+    // --- CP-managed wireless (P-W1) ----------------------------------------
+
+    fn pb_ssid(slug: &str, gated: bool, key: &str) -> pb::WirelessSsid {
+        pb::WirelessSsid {
+            slug: slug.into(),
+            ssid: format!("WifiHub {slug}"),
+            radios: vec!["radio0".into()],
+            encryption: if gated { "none".into() } else { "psk2".into() },
+            key: key.into(),
+            hidden: false,
+            isolate: true,
+            gated,
+            network: Some(pb::WirelessNetwork {
+                bridge_name: format!("br-{slug}"),
+                ipaddr: "10.0.0.1".into(),
+                netmask: "255.255.255.0".into(),
+                dhcp_start: "10".into(),
+                dhcp_limit: "200".into(),
+                dhcp_leasetime: "2h".into(),
+                dhcp_disabled: false,
+            }),
+            firewall: Some(pb::WirelessFirewall { egress_zone: "wan".into() }),
+        }
+    }
+
+    #[test]
+    fn wireless_config_from_pb_flattens_ssids() {
+        let req = pb::SetWirelessConfigRequest {
+            config_version: "cfg-1".into(),
+            ssids: vec![pb_ssid("public", true, ""), pb_ssid("home", false, "supersecret")],
+            confirm_timeout_secs: 90,
+        };
+        let st = wireless_config_from_pb(req);
+        assert_eq!(st.config_version, "cfg-1");
+        assert_eq!(st.confirm_timeout_secs, 90);
+        assert_eq!(st.ssids.len(), 2);
+        let home = st.ssids.iter().find(|s| s.slug == "home").unwrap();
+        assert_eq!(home.bridge_name, "br-home");
+        assert_eq!(home.egress_zone, "wan");
+        assert_eq!(home.key, "supersecret");
+        assert!(!home.gated);
+    }
+
+    #[test]
+    fn wireless_config_to_pb_redacts_keys() {
+        // The get_wireless reply must NEVER echo a PSK back over the wire.
+        let state = WirelessDesiredState {
+            config_version: "cfg-2".into(),
+            confirm_timeout_secs: 0,
+            ssids: vec![SsidSpec {
+                slug: "home".into(),
+                ssid: "Staff".into(),
+                radios: vec!["radio0".into()],
+                encryption: "psk2".into(),
+                key: "supersecret".into(),
+                hidden: false,
+                isolate: true,
+                gated: false,
+                bridge_name: "br-home".into(),
+                ipaddr: "10.1.0.1".into(),
+                netmask: "255.255.255.0".into(),
+                dhcp_start: "10".into(),
+                dhcp_limit: "200".into(),
+                dhcp_leasetime: "2h".into(),
+                dhcp_disabled: false,
+                egress_zone: String::new(),
+            }],
+        };
+        let pb = wireless_config_to_pb(&state);
+        assert_eq!(pb.config_version, "cfg-2");
+        assert_eq!(pb.ssids.len(), 1);
+        assert_eq!(pb.ssids[0].key, "", "PSK must be redacted in the reply");
+        // Non-secret fields are preserved.
+        assert_eq!(pb.ssids[0].encryption, "psk2");
+        assert_eq!(pb.ssids[0].network.as_ref().unwrap().bridge_name, "br-home");
+    }
+
+    #[test]
+    fn wireless_status_maps_states_and_per_ssid() {
+        let s = WirelessStatus {
+            config_version: "cfg-3".into(),
+            state: ProvisionState::Committed,
+            per_ssid: vec![portcullis_types::SsidResult {
+                slug: "public".into(),
+                ok: true,
+                message: String::new(),
+                iface: "br-public".into(),
+            }],
+            message: "confirmed".into(),
+        };
+        let pb = wireless_status_to_pb(&s);
+        assert_eq!(pb.config_version, "cfg-3");
+        assert_eq!(pb.state, pb::ProvisionState::ProvisionCommitted as i32);
+        assert_eq!(pb.per_ssid.len(), 1);
+        assert_eq!(pb.per_ssid[0].iface, "br-public");
+    }
+
+    // ---- config-push conversions (G3a) ----
+
+    #[test]
+    fn apply_tier_defaults_fills_unset_ttl_quota_and_rate() {
+        let pol = TierPolicy { tier: "vip".into(), ttl_secs: 7200, quota_bytes: 5_000, rate_bps: 999 };
+        // All three unset (0) -> filled from the tier (G3a ttl/quota, G5 rate).
+        let mut a = pb::GrantRequest { ttl_seconds: 0, quota_bytes: 0, rate_bps: 0, ..Default::default() };
+        apply_tier_defaults(&mut a, &pol);
+        assert_eq!(a.ttl_seconds, 7200);
+        assert_eq!(a.quota_bytes, 5_000);
+        assert_eq!(a.rate_bps, 999);
+        // explicit non-zero values are preserved (not overwritten by the tier).
+        let mut b =
+            pb::GrantRequest { ttl_seconds: 60, quota_bytes: 100, rate_bps: 42, ..Default::default() };
+        apply_tier_defaults(&mut b, &pol);
+        assert_eq!(b.ttl_seconds, 60);
+        assert_eq!(b.quota_bytes, 100);
+        assert_eq!(b.rate_bps, 42);
+    }
+
+    #[test]
+    fn engine_params_from_pb_maps_zero_to_default_except_idle() {
+        let d = EngineParameters::default();
+        let req = pb::SetEngineParametersRequest {
+            accounting_interval_secs: 0, // -> default
+            garden_tick_secs: 45,        // -> kept
+            expiry_tick_secs: 0,         // -> default
+            max_sessions: 0,             // -> default
+            idle_timeout_secs: 0,        // -> stays 0 (disabled), NOT default
+        };
+        let p = engine_params_from_pb(req);
+        assert_eq!(p.accounting_interval_secs, d.accounting_interval_secs);
+        assert_eq!(p.garden_tick_secs, 45);
+        assert_eq!(p.expiry_tick_secs, d.expiry_tick_secs);
+        assert_eq!(p.max_sessions, d.max_sessions);
+        assert_eq!(p.idle_timeout_secs, 0, "idle 0 = disabled, must not become a default");
+    }
+
+    #[test]
+    fn tier_policies_from_pb_maps_fields() {
+        let req = pb::SetTierPoliciesRequest {
+            policies: vec![pb::TierPolicy {
+                tier: "home".into(),
+                ttl_seconds: 3600,
+                quota_bytes: 1_000,
+                rate_bps: 2_000,
+            }],
+        };
+        let out = tier_policies_from_pb(req);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tier, "home");
+        assert_eq!(out[0].ttl_secs, 3600);
+        assert_eq!(out[0].rate_bps, 2_000);
     }
 }

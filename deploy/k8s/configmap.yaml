@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portcullis-config
+  namespace: portcullis
+data:
+  # TOML config (deny_unknown_fields, all fields required except garden_fqdn).
+  # store_id MUST be non-empty or the daemon fails validation and crash-loops.
+  # The gRPC control server binds 0.0.0.0:<port-of-control_endpoint> => :8443.
+  config.toml: |
+    store_id          = "SITE-LOCAL-01"
+    control_endpoint  = "https://cp.wifihub.internal:8443"
+    wg_interface      = "eth0"
+    hmac_key_file     = "/etc/portcullis/hmac.key"
+    responder_port    = 8080
+    accounting_interval = 15
+    default_ttl       = 1800
+    default_quota_mb  = 0
+    default_rate_kbps = 2048
+    garden_fqdn       = ["portal.wifihub.vn"]

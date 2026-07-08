@@ -1,0 +1,249 @@
+name: release-ipk
+
+# Cross-build the portcullis .ipk for every supported OpenWrt arch (NO SDK — a
+# static-musl userspace daemon with no kmod needs only a cross toolchain), then
+# publish an opkg feed to GitHub Pages and attach the .ipk files to the Release.
+#
+# Trigger: push a version tag (e.g. `v0.2.0`). `workflow_dispatch` builds too but
+# only publishes the feed (no Release) so you can smoke-test.
+#
+# Add hardware by adding a matrix row: {arch = OpenWrt opkg arch, triple = Rust
+# target, rustflags = per-arch link flags, cflags_var/cflags = per-arch C flags}.
+# Cross-linking is done by zig via cargo-zigbuild; opkg-utils (git) packages the
+# .ipk.
+#
+# The build carries the mTLS stack (rustls -> ring), so two things are load-bearing:
+#   * ring compiles C/asm objects for the C compiler zig fronts. On the soft-float
+#     MIPS targets zig defaults its C compiler to hard/double-float, so ring's
+#     objects come out hard-float and `ld.lld` rejects the ABI mismatch against the
+#     soft-float Rust objects. Fix: force the C side soft-float too, per target, via
+#     CFLAGS_<triple>=-msoft-float (matrix `cflags_var`/`cflags`). The ARM cortex-a7
+#     row is genuinely hard-float (eabihf) and MUST NOT get this flag.
+#   * Under -Z build-std the feature resolver drops indexmap 1.9.3's std feature that
+#     tower/tonic need; portcullis-engined carries a build-only `indexmap = "=1.9.3"
+#     features=["std"]` dep to re-activate it (see its Cargo.toml). Keep it.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-ipk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+            echo "version=$V" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # RUTM (MediaTek MT7621, ramips/mt7621) — the RUTM11. OpenWrt mipsel is
+          # soft-float and the Rust target is soft-float, but zig's C compiler
+          # defaults to hard/double-float → ring's C/asm links hard-float and
+          # ld.lld rejects the ABI mismatch. Force the C side soft-float too.
+          - arch: mipsel_24kc
+            triple: mipsel-unknown-linux-musl
+            rustflags: "-C strip=symbols -C link-arg=-msoft-float -Zunstable-options -Cpanic=immediate-abort"
+            cflags_var: CFLAGS_mipsel_unknown_linux_musl
+            cflags: "-msoft-float"
+          # RUT9xx / RUT2xx (Atheros ath79, big-endian MIPS). Same soft-float fix.
+          - arch: mips_24kc
+            triple: mips-unknown-linux-musl
+            rustflags: "-C strip=symbols -C link-arg=-msoft-float -Zunstable-options -Cpanic=immediate-abort"
+            cflags_var: CFLAGS_mips_unknown_linux_musl
+            cflags: "-msoft-float"
+          # RUTX (Qualcomm IPQ40xx, ARMv7 cortex-a7). Hard-float (eabihf) matches
+          # zig, so NO -msoft-float here (it would break the ABI the other way).
+          # Rust's self-contained CRT passes crtend.o/crtn.o that zig doesn't ship
+          # under those names → let zig own the CRT (`link-self-contained=no`).
+          - arch: arm_cortex-a7_neon-vfpv4
+            triple: armv7-unknown-linux-musleabihf
+            rustflags: "-C strip=symbols -C link-self-contained=no -Zunstable-options -Cpanic=immediate-abort"
+            cflags_var: ""
+            cflags: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly + rust-src (for -Z build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.triple }}
+
+      # Zig supplies the musl libc + cross-linker for every target (mipsel/mips/
+      # armv7) from ziglang.org — reliable, unlike musl.cc. cargo-zigbuild drives
+      # it as the linker; -Z build-std covers the tier-3 MIPS targets (no std).
+      # Pin 0.13.0: zig 0.16 dropped the bundled `mipsel-linux-musl` libc, so a
+      # newer zig fails the MIPS rows with "unable to find libc".
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      # Install cargo-zigbuild from crates.io with retries. We deliberately do
+      # NOT use taiki-e/install-action here: its prebuilt-binary mirror has
+      # returned HTTP 503 and failed the whole build. `cargo install` pulls from
+      # crates.io (highly available) and the source + target are rust-cached, so
+      # the retry loop makes this resilient to transient network blips.
+      - name: Install cargo-zigbuild (crates.io, retry)
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            if cargo install cargo-zigbuild --locked; then exit 0; fi
+            echo "::warning::cargo-zigbuild install attempt $i failed; retrying in 20s"
+            sleep 20
+          done
+          echo "::error::cargo-zigbuild install failed after 5 attempts"; exit 1
+
+      - name: Cross-build the engine
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          # Force the C toolchain (ring's C/asm) soft-float on the MIPS rows so
+          # ld.lld doesn't reject a hard/soft float-ABI mismatch. The env var is
+          # target-specific (CFLAGS_<triple with - -> _>); the ARM row leaves it
+          # unset (it is genuinely hard-float).
+          if [ -n "${{ matrix.cflags_var }}" ]; then
+            export ${{ matrix.cflags_var }}="${{ matrix.cflags }}"
+            echo "exported ${{ matrix.cflags_var }}=${{ matrix.cflags }}"
+          fi
+          # -Cpanic=immediate-abort (via rustflags, needs -Zunstable-options) strips
+          # std's panic-fmt machinery on top of profile panic="abort". On current
+          # nightly this replaced the old `-Z build-std-features=panic_immediate_abort`.
+          cargo +nightly zigbuild --release --locked \
+            -Z build-std=std,panic_abort \
+            --target ${{ matrix.triple }} \
+            -p portcullis-engined
+
+      - name: Compress with UPX (flash budget)
+        run: |
+          # UPX cuts the on-flash binary ~70% (static-pie mipsel/mips/arm pack
+          # cleanly); it decompresses into RAM at exec — ideal for flash-poor /
+          # RAM-rich devices like the RUT200. Measured: 3.13MB -> 0.89MB (mipsel).
+          # `upx -t` verifies the packed file decompresses (integrity, not an exec
+          # test). ⚠️ VALIDATE ON DEVICE that the packed binary actually runs on
+          # the target (RUTM11/RUT200); if procd can't exec it, drop this step.
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          upx --best --lzma "target/${{ matrix.triple }}/release/portcullis"
+          upx -t "target/${{ matrix.triple }}/release/portcullis"
+
+      - name: Package .ipk
+        run: |
+          deploy/ci/pack-ipk.sh \
+            "${{ matrix.arch }}" \
+            "target/${{ matrix.triple }}/release/portcullis" \
+            "${{ needs.meta.outputs.version }}" \
+            dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ matrix.arch }}
+          path: dist/*.ipk
+          if-no-files-found: error
+
+  # Publish a per-arch opkg feed to GitHub Pages (repo is public → routers pull
+  # over the internet). Router: add
+  #   src/gz portcullis https://<owner>.github.io/portcullis-rust/<arch>
+  #
+  # We publish to the `gh-pages` branch via peaceiris (NOT actions/deploy-pages).
+  # deploy-pages deploys through the `github-pages` deployment environment, whose
+  # branch/tag allowlist rejects tag-triggered runs (this workflow fires on `v*`
+  # tags) unless the tag is explicitly allowed — a repo setting, not fixable in
+  # the workflow. Pushing to a branch has no such gate, so it works from tags.
+  # One-time repo setting: Settings → Pages → Source = "Deploy from a branch" →
+  # `gh-pages` / (root).
+  pages:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the generated feed to the gh-pages branch
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Assemble opkg feed
+        run: |
+          set -euo pipefail
+          mkdir -p public
+          # .nojekyll: arch dirs like `mipsel_24kc` must be served verbatim (no
+          # Jekyll processing of underscore paths).
+          touch public/.nojekyll
+          echo "<h1>portcullis opkg feed</h1><ul>" > public/index.html
+          for d in dl/ipk-*; do
+            arch="${d#dl/ipk-}"
+            mkdir -p "public/$arch"
+            cp "$d"/*.ipk "public/$arch/"
+            ( cd "public/$arch"
+              : > Packages
+              for ipk in *.ipk; do
+                tmp="$(mktemp -d)"
+                # .ipk is a gzipped tar (pack-ipk.sh), not an ar/deb archive
+                tar xzOf "$ipk" ./control.tar.gz | tar xzf - -C "$tmp" ./control
+                cat "$tmp/control" >> Packages
+                echo "Filename: $ipk" >> Packages
+                echo "Size: $(stat -c%s "$ipk")" >> Packages
+                echo "SHA256sum: $(sha256sum "$ipk" | cut -d' ' -f1)" >> Packages
+                echo "MD5Sum: $(md5sum "$ipk" | cut -d' ' -f1)" >> Packages
+                echo >> Packages
+                rm -rf "$tmp"
+              done
+              gzip -9kf Packages )
+            echo "<li>$arch: <code>src/gz portcullis https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/$arch</code></li>" >> public/index.html
+          done
+          echo "</ul>" >> public/index.html
+
+      - name: Publish feed to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+          force_orphan: true # keep a single-commit branch; the feed is fully regenerated each release
+
+  release:
+    needs: [meta, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Collect .ipk
+        run: mkdir -p dist && find dl -name '*.ipk' -exec cp {} dist/ \;
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipk
+          fail_on_unmatched_files: true
+          body: |
+            portcullis ${{ needs.meta.outputs.version }} — OpenWrt `.ipk` per arch.
+
+            Install on a router (opkg resolves deps from its own feeds):
+            ```sh
+            opkg update
+            opkg install https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/portcullis_${{ needs.meta.outputs.version }}-1_<arch>.ipk
+            ```
+            Or add the Pages opkg feed (see the run's Pages deployment).

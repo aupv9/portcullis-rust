@@ -25,6 +25,16 @@ use crate::ruleset::{build_base_ruleset, SET_AUTH, TABLE_FAMILY, TABLE_NAME};
 pub struct NftJsonBackend {
     /// Path to the `nft` binary (default `"nft"`, resolved via `PATH`).
     nft_bin: String,
+    /// The interfaces enforcement is scoped to (P-W1 — the `gated=true` SSIDs).
+    /// For EACH, the base ruleset's gating rules (prerouting redirect + forward
+    /// drop) carry `iifname "<iface>"` so ONLY those ingresses are gated. Empty →
+    /// the gating rules are omitted (fail-OPEN — nothing gated, br-lan and the
+    /// whole router untouched); the table/sets/chains are still created.
+    ///
+    /// Behind a `Mutex` so [`set_gated_ifaces`](FirewallBackend::set_gated_ifaces)
+    /// can re-scope at runtime (the single writer actor serializes calls, so the
+    /// lock is uncontended; it is only ever held briefly, never across an await).
+    gated_ifaces: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for NftJsonBackend {
@@ -37,6 +47,7 @@ impl NftJsonBackend {
     pub fn new() -> Self {
         Self {
             nft_bin: "nft".to_string(),
+            gated_ifaces: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -44,7 +55,17 @@ impl NftJsonBackend {
     pub fn with_binary(nft_bin: impl Into<String>) -> Self {
         Self {
             nft_bin: nft_bin.into(),
+            gated_ifaces: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Scope enforcement to a set of gated-SSID interfaces (P-W1). Blank entries
+    /// are dropped; an empty resulting set means "not scoped" → the gating rules
+    /// are omitted from the base ruleset (fail-OPEN).
+    pub fn with_gated_ifaces(self, ifaces: Vec<String>) -> Self {
+        *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") =
+            ifaces.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        self
     }
 
     /// Feed a `nft -j` JSON command document to `nft -j -f -` on stdin and
@@ -175,7 +196,8 @@ impl NftJsonBackend {
 #[async_trait]
 impl FirewallBackend for NftJsonBackend {
     async fn ensure_base(&self) -> Result<()> {
-        self.apply_json(&build_base_ruleset()).await
+        let ifaces = self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned").clone();
+        self.apply_json(&build_base_ruleset(&ifaces)).await
     }
 
     async fn add_auth(&self, mac: MacAddr, ttl: Duration) -> Result<()> {
@@ -189,6 +211,18 @@ impl FirewallBackend for NftJsonBackend {
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         let doc = self.list_set_json(SET_AUTH).await?;
         parse_auth_set(&doc)
+    }
+
+    async fn set_gated_ifaces(&self, ifaces: Vec<String>) -> Result<()> {
+        let filtered: Vec<String> =
+            ifaces.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        // Flush the two gating chains and re-add the gate for the new set as one
+        // atomic `nft -j` transaction; the auth/garden SETS are never touched.
+        // Only update the stored set AFTER a successful apply (fail-safe: on error
+        // the kernel rolled back and our record still matches it).
+        self.apply_json(&crate::ruleset::build_rescope_ruleset(&filtered)).await?;
+        *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") = filtered;
+        Ok(())
     }
 }
 
@@ -361,5 +395,119 @@ mod tests {
         let doc = serde_json::json!({ "nftables": [ { "set": { "name": "garden4", "elem": [] } } ] });
         let got = parse_auth_set(&doc).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// A fake `nft` that captures the JSON fed to `-j -f -` on stdin into a file
+    /// and exits 0. Lets us assert the exact base-ruleset document `ensure_base`
+    /// emits, without a kernel. Same temp-dir script pattern as the other fakes.
+    fn fake_nft_capture(tag: &str) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portcullis-nftcap-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("stdin.json");
+        let script = dir.join("nft");
+        // `nft -j -f -` reads the document on stdin; capture it verbatim.
+        std::fs::write(&script, format!("#!/bin/sh\ncat > \"{}\"\nexit 0\n", out.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), out, dir)
+    }
+
+    fn captured_doc(out: &std::path::Path) -> Value {
+        let bytes = std::fs::read(out).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn rule_exprs(doc: &Value, chain: &str) -> Vec<Value> {
+        doc["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.get("add").and_then(|a| a.get("rule")))
+            .filter(|r| r["chain"] == chain)
+            .map(|r| r["expr"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ensure_base_emits_iface_scoped_gate() {
+        // P0 (nft backend): with a hotspot iface, ensure_base's document gates
+        // BOTH the prerouting redirect and the forward drop with
+        // `iifname "br-hotspot"`.
+        let (nft, out, _dir) = fake_nft_capture("scoped");
+        let backend =
+            NftJsonBackend::with_binary(&nft).with_gated_ifaces(vec!["br-hotspot".to_string()]);
+        backend.ensure_base().await.unwrap();
+        let doc = captured_doc(&out);
+
+        let has_iface = |chain: &str, has_gate: &dyn Fn(&Value) -> bool| {
+            rule_exprs(&doc, chain).iter().any(|expr| {
+                let arr = expr.as_array().unwrap();
+                has_gate(expr)
+                    && arr.iter().any(|e| {
+                        e["match"]["left"]["meta"]["key"] == "iifname"
+                            && e["match"]["right"] == "br-hotspot"
+                    })
+            })
+        };
+        assert!(
+            has_iface("prerouting", &|expr| {
+                expr.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.get("redirect").is_some())
+            }),
+            "prerouting redirect must be iifname-scoped: {doc}"
+        );
+        assert!(
+            has_iface("forward", &|expr| {
+                expr.as_array().unwrap().iter().any(|e| e.get("drop").is_some())
+            }),
+            "forward drop must be iifname-scoped: {doc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_gated_ifaces_emits_rescope_doc_without_touching_table() {
+        // P-W1 runtime re-scope: set_gated_ifaces flushes the gating chains and
+        // re-adds the gate for the NEW iface, without recreating the table/sets.
+        let (nft, out, _dir) = fake_nft_capture("rescope");
+        let backend =
+            NftJsonBackend::with_binary(&nft).with_gated_ifaces(vec!["br-a".to_string()]);
+        backend.set_gated_ifaces(vec!["br-b".to_string()]).await.unwrap();
+        let doc = captured_doc(&out);
+        let s = doc.to_string();
+        assert!(s.contains("flush"), "rescope must flush the gating chains: {doc}");
+        // Rule objects carry a `"table":"wifihub"` string; table CREATION is
+        // `"table":{...}`. Assert no table-creation command (structure, not substring).
+        assert!(!s.contains("\"table\":{"), "rescope must not recreate the table: {doc}");
+        assert!(s.contains("br-b"), "gate re-added for the new iface: {doc}");
+        assert!(!s.contains("br-a"), "old iface's gate is gone: {doc}");
+    }
+
+    #[tokio::test]
+    async fn ensure_base_omits_gate_when_iface_unset() {
+        // P0 fail-OPEN (nft backend): with no iface the base table/sets/chains
+        // are still created, but no redirect and no drop are emitted.
+        let (nft, out, _dir) = fake_nft_capture("unset");
+        let backend = NftJsonBackend::with_binary(&nft); // no iface
+        backend.ensure_base().await.unwrap();
+        let doc = captured_doc(&out);
+        let s = doc.to_string();
+
+        // Base intact.
+        assert!(s.contains("wifihub"));
+        assert!(s.contains("\"auth\""));
+        assert!(s.contains("garden4"));
+        // No gate, no iifname.
+        assert!(!s.contains("redirect"), "no redirect when unset: {doc}");
+        assert!(!s.contains("iifname"), "no iifname when unset: {doc}");
+        let has_drop = rule_exprs(&doc, "forward")
+            .iter()
+            .any(|expr| expr.as_array().unwrap().iter().any(|e| e.get("drop").is_some()));
+        assert!(!has_drop, "no forward drop when unset: {doc}");
     }
 }

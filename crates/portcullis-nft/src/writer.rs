@@ -38,6 +38,10 @@ enum Command {
         reply: oneshot::Sender<Result<()>>,
     },
     ListAuth(oneshot::Sender<Result<Vec<AuthElement>>>),
+    SetGatedIfaces {
+        ifaces: Vec<String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Cloneable handle to the writer actor. Implements [`RulesetWriter`].
@@ -80,6 +84,10 @@ impl RulesetWriter for WriterHandle {
 
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         self.call(Command::ListAuth).await
+    }
+
+    async fn set_gated_ifaces(&self, ifaces: Vec<String>) -> Result<()> {
+        self.call(|reply| Command::SetGatedIfaces { ifaces, reply }).await
     }
 }
 
@@ -147,6 +155,11 @@ impl WriterActor {
                 }
                 Command::ListAuth(reply) => {
                     let r = retry_once(|| self.backend.list_auth()).await;
+                    self.count_err(&r);
+                    let _ = reply.send(r);
+                }
+                Command::SetGatedIfaces { ifaces, reply } => {
+                    let r = retry_once(|| self.backend.set_gated_ifaces(ifaces.clone())).await;
                     self.count_err(&r);
                     let _ = reply.send(r);
                 }
@@ -320,6 +333,15 @@ mod tests {
         assert!(matches!(err, Error::NftTransaction(_)), "got {err:?}");
         // Nothing was applied: fail closed.
         assert_eq!(mock.auth_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_gated_ifaces_routes_through_actor() {
+        // Confirms the SetGatedIfaces command plumbing (handle -> actor -> backend).
+        // The MockBackend uses the FirewallBackend default (no-op Ok).
+        let mock = Arc::new(MockBackend::new());
+        let (h, _join) = spawn(Box::new(SharedMock(mock.clone())));
+        h.set_gated_ifaces(vec!["br-public".to_string()]).await.unwrap();
     }
 
     #[tokio::test]
