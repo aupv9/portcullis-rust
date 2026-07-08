@@ -32,20 +32,14 @@ use crate::pb;
 ///   unparseable IP is rejected (it would otherwise be silently dropped).
 /// - `ttl_seconds` -> [`Duration`] (the nft set-element timeout).
 /// - `quota_bytes == 0` means *unlimited* and is carried through verbatim.
-/// - `rate_bps` MUST be `0` in Phase 1: bandwidth shaping (`tc`/HTB) is not yet
-///   enforced, so a non-zero value is **rejected** rather than silently ignored
-///   — the control plane must not believe a rate cap is in effect when it is not
-///   (TDD §7.7; the `tc` shaper stays as the Phase-2 seam in `portcullis-accounting`).
+/// - `rate_bps == 0` means *unlimited* (no cap). A non-zero value is carried
+///   through and enforced by the tc/HTB `Shaper` on grant (G5) — the engine
+///   advertises the `shaper` capability (via `GetEngineInfo`) only when shaping
+///   is actually enabled, so the control plane won't send a cap the engine can't
+///   apply.
 pub fn grant_request_to_params(req: pb::GrantRequest) -> Result<GrantParams> {
     let mac = MacAddr::from_str(&req.client_mac)?;
     let tier = Tier::from_str(&req.tier)?;
-
-    if req.rate_bps != 0 {
-        return Err(Error::BadRequest(format!(
-            "rate_bps unsupported in Phase 1 (got {}); omit it or set 0",
-            req.rate_bps
-        )));
-    }
 
     let ip = parse_optional_ip(&req.client_ip)?;
 
@@ -61,16 +55,18 @@ pub fn grant_request_to_params(req: pb::GrantRequest) -> Result<GrantParams> {
     })
 }
 
-/// Fill a grant's unset (`0`) `ttl`/`quota` from the named tier's policy (G3a).
-/// `rate_bps` is deliberately left alone until G5 lifts the Phase-1 rejection in
-/// [`grant_request_to_params`] — accepting a rate cap the engine can't yet
-/// enforce would tell the control plane a cap is in effect when it isn't.
+/// Fill a grant's unset (`0`) `ttl` / `quota` / `rate` from the named tier's
+/// policy (G3a/G5) — a grant that names a user-group tier but omits limits
+/// inherits that group's CP-pushed defaults.
 pub fn apply_tier_defaults(req: &mut pb::GrantRequest, pol: &TierPolicy) {
     if req.ttl_seconds == 0 {
         req.ttl_seconds = pol.ttl_secs;
     }
     if req.quota_bytes == 0 {
         req.quota_bytes = pol.quota_bytes;
+    }
+    if req.rate_bps == 0 {
+        req.rate_bps = pol.rate_bps;
     }
 }
 
@@ -130,6 +126,8 @@ pub fn metrics_to_pb(m: MetricsSnapshot) -> pb::MetricsReply {
         revokes_total: m.revokes_total,
         expires_total: m.expires_total,
         quota_kills_total: m.quota_kills_total,
+        shaper_failures_total: m.shaper_failures_total,
+        idle_kills_total: m.idle_kills_total,
         ..Default::default()
     }
 }
@@ -193,6 +191,11 @@ pub fn revoke_reason_to_pb(r: RevokeReason) -> pb::RevokeReason {
         RevokeReason::Admin => pb::RevokeReason::RevokeAdmin,
         RevokeReason::Quota => pb::RevokeReason::RevokeQuota,
         RevokeReason::MacChange => pb::RevokeReason::RevokeMacChange,
+        // Idle-timeout is engine-initiated and surfaced to the CP as an
+        // `IDLE_TIMEOUT` *event* (EventKind), not a wire Revoke *reason* (the CP
+        // never issues an idle revoke). This direction is only used in tests; map
+        // to the generic Admin reason for totality.
+        RevokeReason::IdleTimeout => pb::RevokeReason::RevokeAdmin,
     }
 }
 
@@ -208,6 +211,7 @@ pub fn event_kind_to_pb(k: portcullis_types::EventKind) -> pb::EventKind {
         E::Expired => pb::EventKind::Expired,
         E::Revoked => pb::EventKind::Revoked,
         E::QuotaExceeded => pb::EventKind::QuotaExceeded,
+        E::IdleTimeout => pb::EventKind::IdleTimeout,
     }
 }
 
@@ -219,10 +223,7 @@ pub fn event_kind_from_pb(k: pb::EventKind) -> portcullis_types::EventKind {
         pb::EventKind::Expired => E::Expired,
         pb::EventKind::Revoked => E::Revoked,
         pb::EventKind::QuotaExceeded => E::QuotaExceeded,
-        // New wire variant (superset proto); the engine does not yet emit or
-        // map idle-timeout events. Fold onto Expired as the closest domain kind
-        // rather than panic — keeps the stream forward-compatible.
-        pb::EventKind::IdleTimeout => E::Expired,
+        pb::EventKind::IdleTimeout => E::IdleTimeout,
     }
 }
 
@@ -412,12 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn grant_request_rate_bps_rejected_phase1() {
-        // Non-zero rate must be rejected, not silently ignored (Phase-1 §7.7).
+    fn grant_request_rate_bps_carried_through() {
+        // G5: a non-zero rate is now accepted and carried through to be enforced
+        // by the tc/HTB shaper (was rejected in Phase 1).
         let mut g = sample_grant();
         g.rate_bps = 2_000_000;
-        let err = grant_request_to_params(g).unwrap_err();
-        assert!(matches!(err, Error::BadRequest(_)));
+        assert_eq!(grant_request_to_params(g).unwrap().rate_bps, 2_000_000);
     }
 
     #[test]
@@ -672,19 +673,21 @@ mod tests {
     // ---- config-push conversions (G3a) ----
 
     #[test]
-    fn apply_tier_defaults_fills_only_unset_ttl_and_quota() {
+    fn apply_tier_defaults_fills_unset_ttl_quota_and_rate() {
         let pol = TierPolicy { tier: "vip".into(), ttl_secs: 7200, quota_bytes: 5_000, rate_bps: 999 };
-        // ttl/quota unset (0) -> filled; rate deliberately untouched (G5).
-        let mut a = pb::GrantRequest { ttl_seconds: 0, quota_bytes: 0, ..Default::default() };
+        // All three unset (0) -> filled from the tier (G3a ttl/quota, G5 rate).
+        let mut a = pb::GrantRequest { ttl_seconds: 0, quota_bytes: 0, rate_bps: 0, ..Default::default() };
         apply_tier_defaults(&mut a, &pol);
         assert_eq!(a.ttl_seconds, 7200);
         assert_eq!(a.quota_bytes, 5_000);
-        assert_eq!(a.rate_bps, 0, "rate must NOT be filled from the tier until G5");
+        assert_eq!(a.rate_bps, 999);
         // explicit non-zero values are preserved (not overwritten by the tier).
-        let mut b = pb::GrantRequest { ttl_seconds: 60, quota_bytes: 100, ..Default::default() };
+        let mut b =
+            pb::GrantRequest { ttl_seconds: 60, quota_bytes: 100, rate_bps: 42, ..Default::default() };
         apply_tier_defaults(&mut b, &pol);
         assert_eq!(b.ttl_seconds, 60);
         assert_eq!(b.quota_bytes, 100);
+        assert_eq!(b.rate_bps, 42);
     }
 
     #[test]

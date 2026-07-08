@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use portcullis_types::{
@@ -36,6 +37,10 @@ pub struct RuntimeController {
     version: String,
     boot_id: String,
     metrics: Arc<Metrics>,
+    /// Capabilities beyond the always-present base set (e.g. `shaper` when
+    /// bandwidth shaping is enabled) — advertised via `GetEngineInfo` so the CP
+    /// only sends features the engine will honor.
+    extra_caps: Vec<String>,
     params_tx: watch::Sender<EngineParameters>,
     garden_tx: watch::Sender<Vec<String>>,
     enforce_tx: watch::Sender<bool>,
@@ -51,6 +56,7 @@ impl RuntimeController {
         boot_id: impl Into<String>,
         metrics: Arc<Metrics>,
         seed: RuntimeConfig,
+        extra_caps: Vec<String>,
     ) -> Self {
         let path = path.as_ref().to_path_buf();
         let state = load_state(&path).unwrap_or(seed);
@@ -63,30 +69,26 @@ impl RuntimeController {
             version: version.into(),
             boot_id: boot_id.into(),
             metrics,
+            extra_caps,
             params_tx,
             garden_tx,
             enforce_tx,
         }
     }
 
-    // The `watch_*` subscribers below are the effect side of the `set_*` handlers:
-    // a `set_*` publishes on the channel, and the corresponding loop reacts. The
-    // consumers are wired incrementally (garden + enforcement in G3b, metering
-    // interval in G7); `allow(dead_code)` is dropped as each lands. The senders
-    // themselves are already live (used in the `EngineControl` impl below).
+    // The `watch_*` subscribers are the effect side of the `set_*` handlers: a
+    // `set_*` publishes on the channel, and the corresponding loop reacts —
+    // metering interval (G7), garden reconcile + enforcement scope (G3b).
 
-    /// Subscribe to engine-parameter changes (metering/expiry tickers; G7).
-    #[allow(dead_code)]
+    /// Subscribe to engine-parameter changes (metering cadence re-arm; G7).
     pub fn watch_params(&self) -> watch::Receiver<EngineParameters> {
         self.params_tx.subscribe()
     }
     /// Subscribe to garden-FQDN changes (garden reconcile loop; G3b).
-    #[allow(dead_code)]
     pub fn watch_garden(&self) -> watch::Receiver<Vec<String>> {
         self.garden_tx.subscribe()
     }
-    /// Subscribe to enforcement-toggle changes (nft teardown/rebuild; G3b).
-    #[allow(dead_code)]
+    /// Subscribe to enforcement-toggle changes (gating scope; G3b).
     pub fn watch_enforcement(&self) -> watch::Receiver<bool> {
         self.enforce_tx.subscribe()
     }
@@ -94,6 +96,18 @@ impl RuntimeController {
     /// Snapshot the current runtime config (test/introspection helper).
     pub fn config(&self) -> RuntimeConfig {
         self.state.lock().expect("runtime state mutex poisoned").clone()
+    }
+
+    /// Current idle-timeout threshold (G6); `Duration::ZERO` = disabled. Read
+    /// each expiry tick without cloning the whole config.
+    pub fn idle_timeout(&self) -> Duration {
+        let secs = self
+            .state
+            .lock()
+            .expect("runtime state mutex poisoned")
+            .engine_params
+            .idle_timeout_secs;
+        Duration::from_secs(u64::from(secs))
     }
 
     /// Resolve a tier's grant defaults, if any (used by the grant path, G3a).
@@ -222,12 +236,16 @@ impl EngineControl for RuntimeController {
         EngineInfoSnapshot {
             version: self.version.clone(),
             boot_id: self.boot_id.clone(),
-            capabilities: vec![
-                "tier_policies".to_string(),
-                "engine_params".to_string(),
-                "garden".to_string(),
-                "enforcement_toggle".to_string(),
-            ],
+            capabilities: {
+                let mut caps = vec![
+                    "tier_policies".to_string(),
+                    "engine_params".to_string(),
+                    "garden".to_string(),
+                    "enforcement_toggle".to_string(),
+                ];
+                caps.extend(self.extra_caps.iter().cloned());
+                caps
+            },
             enforcement_enabled: s.enforcement_enabled,
             tier_policies_hash: drift_hash(&tiers_json),
             engine_params_hash: drift_hash(&params_json),
@@ -257,7 +275,29 @@ mod tests {
     }
 
     fn ctrl(path: &Path) -> RuntimeController {
-        RuntimeController::new(path, "0.0.0-test", "boot-xyz", Arc::new(Metrics::default()), RuntimeConfig::default())
+        RuntimeController::new(
+            path,
+            "0.0.0-test",
+            "boot-xyz",
+            Arc::new(Metrics::default()),
+            RuntimeConfig::default(),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn extra_capabilities_are_advertised() {
+        let c = RuntimeController::new(
+            tmp_path("caps"),
+            "0.0.0-test",
+            "boot",
+            Arc::new(Metrics::default()),
+            RuntimeConfig::default(),
+            vec!["shaper".to_string()],
+        );
+        let caps = c.engine_info().await.capabilities;
+        assert!(caps.contains(&"shaper".to_string()));
+        assert!(caps.contains(&"tier_policies".to_string()), "base caps still present");
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ pub struct Metrics {
     cp_disconnects: Counter,
     flows_reaped: Counter,
     reap_failures: Counter,
+    shaper_failures: Counter,
+    idle_kills: Counter,
     active_sessions: Counter,
 }
 
@@ -54,6 +56,8 @@ impl Metrics {
             ("portcullis_cp_disconnects_total", self.cp_disconnects.get()),
             ("portcullis_flows_reaped_total", self.flows_reaped.get()),
             ("portcullis_reap_failures_total", self.reap_failures.get()),
+            ("portcullis_shaper_failures_total", self.shaper_failures.get()),
+            ("portcullis_idle_kills_total", self.idle_kills.get()),
         ] {
             let _ = writeln!(s, "# TYPE {name} counter");
             let _ = writeln!(s, "{name} {val}");
@@ -78,6 +82,8 @@ impl Metrics {
             reap_failures_total: self.reap_failures.get(),
             nft_txn_errors_total: self.nft_txn_errors.get(),
             cp_disconnects_total: self.cp_disconnects.get(),
+            shaper_failures_total: self.shaper_failures.get(),
+            idle_kills_total: self.idle_kills.get(),
         }
     }
 }
@@ -96,6 +102,8 @@ impl MetricsSink for Metrics {
             Metric::CpDisconnect => &self.cp_disconnects,
             Metric::FlowsReaped => &self.flows_reaped,
             Metric::ReapFailed => &self.reap_failures,
+            Metric::ShaperFailure => &self.shaper_failures,
+            Metric::IdleKill => &self.idle_kills,
         };
         counter.inc();
     }
@@ -184,11 +192,13 @@ mod tests {
             Metric::CpDisconnect,
             Metric::FlowsReaped,
             Metric::ReapFailed,
+            Metric::ShaperFailure,
+            Metric::IdleKill,
         ] {
             m.incr(metric);
         }
         let out = m.render();
-        // 11 counters at 1 + the gauge line.
-        assert_eq!(out.matches(" 1\n").count(), 11, "each counter should read 1:\n{out}");
+        // 13 counters at 1 + the gauge line.
+        assert_eq!(out.matches(" 1\n").count(), 13, "each counter should read 1:\n{out}");
     }
 }

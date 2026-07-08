@@ -184,6 +184,8 @@ pub enum RevokeReason {
     Quota,
     /// Client MAC changed / re-association.
     MacChange,
+    /// No traffic within the idle-timeout window (G6).
+    IdleTimeout,
 }
 
 /// Session lifecycle event emitted engine -> control plane (TDD §7.5).
@@ -196,6 +198,7 @@ pub enum EventKind {
     Expired,
     Revoked,
     QuotaExceeded,
+    IdleTimeout,
 }
 
 impl From<RevokeReason> for EventKind {
@@ -203,6 +206,7 @@ impl From<RevokeReason> for EventKind {
         match r {
             RevokeReason::Quota => EventKind::QuotaExceeded,
             RevokeReason::Admin | RevokeReason::MacChange => EventKind::Revoked,
+            RevokeReason::IdleTimeout => EventKind::IdleTimeout,
         }
     }
 }
@@ -506,6 +510,32 @@ impl FlowReaper for NoopReaper {
     }
 }
 
+/// Apply / clear a per-client bandwidth cap (tc/HTB, G5). Implemented by
+/// `portcullis-accounting`'s `TcShaper`; injected into the SessionManager, which
+/// applies on grant and clears on revoke/expiry. `rate_bps == 0` means unlimited
+/// (clear any existing cap). Best-effort like [`FlowReaper`]: a shaper error is a
+/// degradation (bandwidth control), never a fail on the grant/gate.
+#[async_trait]
+pub trait Shaper: Send + Sync {
+    async fn apply(&self, mac: MacAddr, rate_bps: u64) -> Result<()>;
+    /// Remove any shaping for `mac` (idempotent — clearing an unshaped MAC is Ok).
+    async fn clear(&self, mac: MacAddr) -> Result<()>;
+}
+
+/// No-op shaper — the default when bandwidth shaping is disabled or in tests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopShaper;
+
+#[async_trait]
+impl Shaper for NoopShaper {
+    async fn apply(&self, _mac: MacAddr, _rate_bps: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn clear(&self, _mac: MacAddr) -> Result<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime control state (F0) — config the control plane pushes at runtime and
 // the engine holds in RAM (persisted to tmpfs, never NAND). Distinct from the
@@ -647,6 +677,8 @@ pub struct MetricsSnapshot {
     pub reap_failures_total: u64,
     pub nft_txn_errors_total: u64,
     pub cp_disconnects_total: u64,
+    pub shaper_failures_total: u64,
+    pub idle_kills_total: u64,
 }
 
 /// Control-plane-facing configuration + introspection port (G3/G4). Implemented
@@ -919,6 +951,11 @@ pub enum Metric {
     /// A conntrack reap attempt errored. The gate still holds (fail-closed); the
     /// leaked flow may persist until the next reconcile tick.
     ReapFailed,
+    /// A per-session bandwidth-shaping (tc/HTB) apply/clear errored. Best-effort:
+    /// shaping degrades, the gate is unaffected (G5).
+    ShaperFailure,
+    /// A session was torn down for idle timeout (G6).
+    IdleKill,
 }
 
 /// A point-in-time gauge exported over `/metrics` (TDD §12).

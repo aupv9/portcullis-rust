@@ -2,9 +2,14 @@
 # Per-store values (store_id, control_endpoint, keys) are filled by the fleet
 # provisioning pipeline / first-boot bootstrap (uci-defaults/99-portcullis).
 #
-# Hot-reloadable: garden_fqdn, tier defaults, accounting_interval.
+# Hot-reloadable (applied live on SIGHUP): garden_fqdn, tier defaults,
+#   accounting_interval, reap_conntrack, shape_*, idle_timeout.
 # Requires restart: control_endpoint, cp_server_ca_file, cp_server_name,
-#                   hmac_key_file, responder_port.
+#                   hmac_key_file, responder_port, firewall_backend.
+#
+# The control plane can also push tier policies / garden / enforcement toggle /
+# engine params at runtime over the mTLS control stream (these override the
+# static values below); it reads engine info + metrics for fleet drift.
 #
 # The engine DIALS control_endpoint outbound (the router is behind CGNAT), so
 # no inbound port is exposed. It presents /etc/portcullis/tls/client.{crt,key}
@@ -35,6 +40,19 @@ config portcullis 'main'
 	# bridge the provision subsystem creates (e.g. 'br-hotspot'). Set it before
 	# expecting the captive to gate anything.
 	option hotspot_iface       ''
+	# Conntrack reaping (invariant #9): sever a client's established flows on
+	# de-auth (revoke/expiry/quota/idle) so removing it actually drops it, not
+	# just its new connections. Default on; needs the `conntrack` binary.
+	option reap_conntrack      '1'
+	# Per-session bandwidth cap (tc/HTB). Off by default (device-validated). When
+	# on, shape_iface must name the LAN egress bridge; the engine then advertises
+	# the `shaper` capability so the control plane may push per-tier rate caps.
+	option shape_bandwidth     '0'
+	option shape_iface         'br-lan'
+	# Idle-timeout seconds (0 = disabled). Local seed; the control plane can
+	# override at runtime. A session with no traffic for this long is de-authed
+	# with an IDLE_TIMEOUT event.
+	option idle_timeout        '0'
 	list   garden_fqdn         'portal.wifihub.vn'
 	list   garden_fqdn         'cdn.wifihub.vn'
 	list   garden_fqdn         'otp.gateway'

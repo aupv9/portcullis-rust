@@ -25,7 +25,7 @@ const EXPIRY_TICK: Duration = Duration::from_secs(1);
 /// Walled-garden reconcile cadence.
 const GARDEN_TICK: Duration = Duration::from_secs(30);
 
-pub async fn run(cfg: Config) -> anyhow::Result<()> {
+pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result<()> {
     // 0. Metrics recorder (§12). Created first so it can be injected into the nft
     //    writer actor (for nft_txn_errors), the session manager, and the redirect
     //    responder before any of them start.
@@ -82,6 +82,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
     w.mgr.set_reaper(reaper.clone());
 
+    // 4d. Bandwidth shaper (G5): per-session tc/HTB cap, scoped to a LAN egress
+    //     iface via config. Off → NoopShaper (grants carry rate_bps but no cap is
+    //     applied). The `shaper` capability is advertised (GetEngineInfo) only
+    //     when enabled, so the CP won't push a cap the engine can't honor.
+    let (shaper, shaper_caps): (Arc<dyn portcullis_types::Shaper>, Vec<String>) =
+        if cfg.shape_bandwidth && !cfg.shape_iface.trim().is_empty() {
+            tracing::info!(iface = %cfg.shape_iface, "bandwidth shaping enabled (tc/HTB)");
+            (
+                Arc::new(portcullis_accounting::TcShaper::new(cfg.shape_iface.clone())),
+                vec!["shaper".to_string()],
+            )
+        } else {
+            (Arc::new(portcullis_types::NoopShaper), Vec::new())
+        };
+    w.mgr.set_shaper(shaper);
+
     // F2: restore the enforcement scope from the last committed CP-managed
     // wireless config (persisted to tmpfs on confirm). Survives a daemon restart
     // — the auth set was already adopted above (kernel-as-truth); this re-applies
@@ -124,40 +140,47 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // rollback works without the CP) and statuses simply buffer in the mpsc.
     let mut wireless_status_rx = Some(wireless_status_rx);
 
+    // 4e. Runtime control state (F0): the CP-pushed config store + EngineControl
+    //     controller. Built UNCONDITIONALLY (independent of CP connectivity) — it
+    //     holds local runtime state and drives the effect loops (garden/enforcement
+    //     below); the control channel (step 5) only dispatches Set*/Get* into it
+    //     when the CP is connected. Seeded from the static config until the CP
+    //     pushes; persisted to tmpfs so it survives a restart.
+    let boot_id = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}-{nanos:x}", std::process::id())
+    };
+    let seed = portcullis_types::RuntimeConfig {
+        enforcement_enabled: true,
+        garden_fqdns: cfg.garden_fqdn.clone(),
+        tier_policies: Vec::new(),
+        engine_params: portcullis_types::EngineParameters {
+            accounting_interval_secs: cfg.accounting_interval.clamp(1, 3600) as u32,
+            idle_timeout_secs: cfg.idle_timeout.min(86400) as u32,
+            ..portcullis_types::EngineParameters::default()
+        },
+    };
+    let controller = Arc::new(crate::runtime::RuntimeController::new(
+        crate::runtime::RUNTIME_STATE_PATH,
+        env!("CARGO_PKG_VERSION"),
+        boot_id,
+        metrics.clone(),
+        seed,
+        shaper_caps,
+    ));
+
     // 5. Outbound control channel over mutual TLS (§13, CGNAT design doc). The
     //    engine dials the control plane and holds a long-lived bidirectional
     //    stream: commands arrive on it, events/acks are pushed back. It
     //    reconnects with backoff and sets the `cp_connected` health flag.
     match load_client_tls(&cfg) {
         Ok(Some(tls)) => {
-            // Runtime control state (F0): the CP-pushed config store + EngineControl
-            // controller, seeded from the static config until the CP pushes, and
-            // persisted to tmpfs so it survives a restart. Dispatches the Set*/Get*
-            // frames and resolves tier defaults on the grant path (G3/G4).
-            let boot_id = {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                format!("{:x}-{nanos:x}", std::process::id())
-            };
-            let seed = portcullis_types::RuntimeConfig {
-                enforcement_enabled: true,
-                garden_fqdns: cfg.garden_fqdn.clone(),
-                tier_policies: Vec::new(),
-                engine_params: portcullis_types::EngineParameters {
-                    accounting_interval_secs: cfg.accounting_interval.clamp(1, 3600) as u32,
-                    ..portcullis_types::EngineParameters::default()
-                },
-            };
-            let engine_control: Arc<dyn portcullis_types::EngineControl> =
-                Arc::new(crate::runtime::RuntimeController::new(
-                    crate::runtime::RUNTIME_STATE_PATH,
-                    env!("CARGO_PKG_VERSION"),
-                    boot_id,
-                    metrics.clone(),
-                    seed,
-                ));
+            // G3/G4: the control channel dispatches Set*/Get* into the F0
+            // controller and resolves tier defaults on the grant path.
+            let engine_control: Arc<dyn portcullis_types::EngineControl> = controller.clone();
             let chan_cfg = portcullis_control::ControlChannelConfig {
                 endpoint: cfg.control_endpoint.clone(),
                 tls,
@@ -230,21 +253,36 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // 7. Accounting metering loop (§7.6): conntrack counters -> SessionManager
-    //    (which computes deltas, emits INTERIM, enforces quota).
+    //    (which computes deltas, emits INTERIM, enforces quota). The poll cadence
+    //    comes from the runtime controller's engine params and RE-ARMS on change
+    //    (G3a/G7): a CP SetEngineParameters or a SIGHUP reload retunes the interval
+    //    live by cancelling the current loop and restarting it with the new value.
     {
         let source: Arc<dyn CounterSource> = Arc::new(portcullis_accounting::ConntrackSource::new(
             portcullis_redirect::IpNeighResolver::new(),
         ));
         let metering_sink: Arc<dyn MeteringSink> = w.mgr.clone();
-        let interval = Duration::from_secs(cfg.accounting_interval.max(1));
+        let mut params_rx = controller.watch_params();
         tasks.push(tokio::spawn(async move {
-            portcullis_accounting::run_metering_loop(
-                source,
-                metering_sink,
-                interval,
-                std::future::pending::<()>(),
-            )
-            .await;
+            loop {
+                let interval = Duration::from_secs(
+                    u64::from(params_rx.borrow_and_update().accounting_interval_secs).max(1),
+                );
+                // Run until the interval changes, then loop to re-arm. Cancelling
+                // the metering loop mid-wait is safe — it's a stateless ticker;
+                // the session layer re-baselines from the next snapshot (§7.6).
+                tokio::select! {
+                    _ = portcullis_accounting::run_metering_loop(
+                        source.clone(),
+                        metering_sink.clone(),
+                        interval,
+                        std::future::pending::<()>(),
+                    ) => {}
+                    changed = params_rx.changed() => {
+                        if changed.is_err() { break; } // controller gone -> stop
+                    }
+                }
+            }
         }));
     }
 
@@ -272,27 +310,87 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }));
     }
 
-    // 8. Walled-garden reconciler (§7.3): keep dnsmasq's garden config in sync
-    //    with the configured FQDN list, using the directive family (`nftset=` vs
-    //    `ipset=`) that matches the selected firewall backend (G2).
+    // 8. Walled-garden reconciler (§7.3): keep dnsmasq's garden config in sync,
+    //    using the directive family (`nftset=` vs `ipset=`) that matches the
+    //    backend (G2). The FQDN list comes from the runtime controller (G3b) so a
+    //    CP `SetGarden` takes effect live; it also reconciles every GARDEN_TICK to
+    //    repair external drift.
     {
-        let garden =
-            portcullis_garden::GardenConfig::with_fqdns_for(garden_backend, cfg.garden_fqdn.clone());
+        let mut garden_rx = controller.watch_garden();
         tasks.push(tokio::spawn(async move {
-            portcullis_garden::run_garden_loop(GARDEN_CONF_PATH, garden, GARDEN_TICK).await;
+            let mut ticker = tokio::time::interval(GARDEN_TICK);
+            loop {
+                let fqdns = garden_rx.borrow_and_update().clone();
+                let gc = portcullis_garden::GardenConfig::with_fqdns_for(garden_backend, fqdns);
+                match portcullis_garden::reconcile(GARDEN_CONF_PATH, &gc).await {
+                    Ok(true) => tracing::info!("garden config reconciled (changed)"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "garden reconcile failed; keeping prior config")
+                    }
+                }
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    r = garden_rx.changed() => { if r.is_err() { break; } }
+                }
+            }
         }));
     }
 
-    // 9. Daemon-side expiry sweep (dual-path expiry, §7.4).
+    // 8b. Enforcement toggle (G3b/G8): a CP `SetEnforcement(false)` removes the
+    //     gating jumps (unauth traffic then falls through to fw3 — the gate stops
+    //     blocking), and `SetEnforcement(true)` restores the gated-SSID scope.
+    //     Reuses the scoped `set_gated_ifaces` path: it never flushes the auth
+    //     set and never touches fw3; the table + sets persist across a toggle, so
+    //     re-enabling is instant. Enforcement starts enabled + scoped at boot, so
+    //     we skip the initial value and act only on subsequent changes.
+    {
+        let mut enf_rx = controller.watch_enforcement();
+        let writer = writer.clone();
+        let seed_ifaces = gated_ifaces(&cfg);
+        enf_rx.borrow_and_update(); // mark the boot value seen
+        tasks.push(tokio::spawn(async move {
+            while enf_rx.changed().await.is_ok() {
+                let enabled = *enf_rx.borrow_and_update();
+                // On (re)enable, restore the currently-committed gated ifaces
+                // (CP-managed wireless) if any, else the static seed.
+                let target = if enabled {
+                    portcullis_provision::read_committed_gated(std::path::Path::new(
+                        portcullis_provision::DEFAULT_STATE_DIR,
+                    ))
+                    .unwrap_or_else(|| seed_ifaces.clone())
+                } else {
+                    Vec::new()
+                };
+                match writer.set_gated_ifaces(target).await {
+                    Ok(()) => tracing::info!(enabled, "enforcement toggle applied"),
+                    Err(e) => {
+                        tracing::warn!(enabled, error = %e, "enforcement toggle failed; prior scope kept")
+                    }
+                }
+            }
+        }));
+    }
+
+    // 9. Daemon-side expiry sweep (dual-path expiry, §7.4) + idle-timeout sweep
+    //    (G6). Both run on the same tick; the idle threshold comes from the
+    //    runtime controller's engine params (0 = disabled), so a CP
+    //    SetEngineParameters takes effect on the next tick.
     {
         let mgr = w.mgr.clone();
+        let controller = controller.clone();
         tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(EXPIRY_TICK);
             loop {
                 ticker.tick().await;
-                let expired = mgr.tick_expiry(Instant::now()).await;
+                let now = Instant::now();
+                let expired = mgr.tick_expiry(now).await;
                 if expired > 0 {
                     tracing::debug!(expired, "expiry sweep removed sessions");
+                }
+                let idle = mgr.sweep_idle(now, controller.idle_timeout()).await;
+                if idle > 0 {
+                    tracing::debug!(idle, "idle sweep removed sessions");
                 }
             }
         }));
@@ -348,6 +446,57 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }));
     } else {
         tracing::info!("metrics endpoint disabled (metrics_port = 0)");
+    }
+
+    // 9d. Hot-reload on SIGHUP (G7). procd sends SIGHUP on a UCI change; reload
+    //     the config file and, for a hot-reloadable diff, push the new garden +
+    //     engine params through the runtime controller — the garden reconciler,
+    //     the metering re-arm (step 7), and the idle sweep (step 9) react without
+    //     dropping a session. A restart-only change (endpoint/TLS/port/store/
+    //     backend) is logged, not partially applied.
+    #[cfg(unix)]
+    {
+        use portcullis_config::ReloadImpact;
+        use portcullis_types::EngineControl as _;
+        let controller = controller.clone();
+        let path = config_path.clone();
+        let mut current = cfg.clone();
+        tasks.push(tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot install SIGHUP handler; hot-reload disabled");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                let Some(new) = reload_config(&path) else { continue };
+                match portcullis_config::diff(&current, &new) {
+                    ReloadImpact::HotReloadable => {
+                        if new.garden_fqdn != current.garden_fqdn {
+                            let _ = controller.set_garden(new.garden_fqdn.clone()).await;
+                        }
+                        let params = portcullis_types::EngineParameters {
+                            accounting_interval_secs: new.accounting_interval.clamp(1, 3600) as u32,
+                            idle_timeout_secs: new.idle_timeout.min(86400) as u32,
+                            ..portcullis_types::EngineParameters::default()
+                        };
+                        if let Err(e) = controller.set_engine_parameters(params).await {
+                            tracing::warn!(error = %e, "SIGHUP: engine params rejected; kept prior");
+                        }
+                        tracing::info!("SIGHUP: config hot-reloaded");
+                        current = new;
+                    }
+                    ReloadImpact::RequiresRestart => {
+                        tracing::warn!(
+                            "SIGHUP: config change touches a restart-only field \
+                             (endpoint/TLS/port/store/backend); NOT applied live — restart to take effect"
+                        );
+                    }
+                }
+            }
+        }));
     }
 
     // 10. Block until SIGTERM (procd stop) or Ctrl-C, then shut down.
@@ -488,6 +637,31 @@ fn load_client_tls(cfg: &Config) -> anyhow::Result<Option<tonic::transport::Clie
 }
 
 /// Wait for SIGTERM (procd stop) or Ctrl-C.
+/// Reload + validate the config file for a SIGHUP hot-reload (G7). Any failure
+/// (unreadable, malformed, invalid) is logged and returns `None` so the running
+/// config stays in force — a bad edit never takes down a live daemon.
+fn reload_config(path: &std::path::Path) -> Option<Config> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "SIGHUP: config unreadable; keeping running config");
+            return None;
+        }
+    };
+    let parsed = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        Config::from_toml_str(&raw)
+    } else {
+        Config::from_uci_str(&raw)
+    };
+    match parsed.and_then(|c| c.validate().map(|()| c)) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "SIGHUP: config invalid; keeping running config");
+            None
+        }
+    }
+}
+
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
