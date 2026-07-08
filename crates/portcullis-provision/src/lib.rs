@@ -1,15 +1,14 @@
-//! Hotspot-network provisioning for the `portcullis` engine (P0.5) — the
-//! ISOLATED subsystem that CREATES the hotspot interface enforcement then scopes
-//! to, so one control-plane push sets up the network AND the captive.
-//!
-//! See `docs/design/hotspot-service-plan.md` §P0.5 for the authoritative design.
+//! CP-managed wireless provisioning for the `portcullis` engine (P-W1) — the
+//! ISOLATED subsystem that renders an arbitrary set of owned SSIDs from a
+//! control-plane push, so one push sets up the network(s) AND (for gated SSIDs)
+//! the captive.
 //!
 //! ## What this crate is (and is NOT)
-//! - It renders a FIXED allowlist of four owned UCI sections
-//!   (`network.br_hotspot`, `network.hotspot`, `wireless.wifi_hotspot`,
-//!   `dhcp.hotspot`) — NOT arbitrary UCI, NOT an RMS/openwisp whole-router
-//!   manager. It NEVER touches `network.lan` / br-lan, admin config, or the
-//!   enforcement `inet wifihub` table (that lives in `portcullis-nft`, untouched).
+//! - It renders ONLY sections it owns — every one named `pc_<slug>_*` and stamped
+//!   `option owner 'portcullis-wireless'` — NOT arbitrary UCI, NOT an RMS/openwisp
+//!   whole-router manager. It NEVER touches `network.lan` / br-lan, admin config,
+//!   `wan`, or the enforcement `inet wifihub` table (that lives in
+//!   `portcullis-nft`, untouched); a reserved denylist enforces this.
 //! - It applies + reloads via explicit-argv shell-out to the on-device
 //!   `uci` / `wifi` / `/etc/init.d/*` binaries — NEVER `sh -c` — behind the
 //!   [`CommandRunner`] seam so tests assert the exact argv + order.
@@ -30,8 +29,8 @@
 //! ## Shape
 //! Mirrors the nft writer actor: a cloneable [`ProvisionHandle`] (implements
 //! [`portcullis_types::Provisioner`]) sends commands over an mpsc to one owner
-//! task ([`run_provision_subsystem`]); that task emits [`ProvisionStatus`] upward
-//! on an mpsc the composition root fans into outbound `EngineFrame`s.
+//! task ([`run_provision_subsystem`]); that task emits `WirelessStatus` upward on
+//! an mpsc the composition root fans into outbound `EngineFrame`s.
 
 #![forbid(unsafe_code)]
 
@@ -42,5 +41,5 @@ pub mod uci;
 
 pub use handle::{run_provision_subsystem, ProvisionHandle};
 pub use runner::{CommandRunner, ProcessRunner};
-pub use sm::{ProvisionMachine, DEFAULT_STATE_DIR};
-pub use uci::{render_teardown, render_uci, validate, UciCmd, OWNED};
+pub use sm::{read_committed_gated, ProvisionMachine, DEFAULT_STATE_DIR};
+pub use uci::{render_wireless, validate_wireless, UciCmd};

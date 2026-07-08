@@ -11,7 +11,7 @@
 pub struct EngineFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
-    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
     pub msg: ::core::option::Option<engine_frame::Msg>,
 }
 /// Nested message and enum types in `EngineFrame`.
@@ -46,6 +46,12 @@ pub mod engine_frame {
         /// hotspot-provision lifecycle (P0.5); unsolicited on watchdog rollback
         #[prost(message, tag="10")]
         ProvisionStatus(super::ProvisionStatus),
+        /// CP-managed wireless (P-W1) lifecycle; unsolicited on watchdog rollback
+        #[prost(message, tag="11")]
+        WirelessStatus(super::WirelessStatus),
+        /// reply to ControlFrame.get_wireless_config (keys REDACTED)
+        #[prost(message, tag="12")]
+        WirelessConfig(super::WirelessConfig),
     }
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
@@ -55,7 +61,7 @@ pub mod engine_frame {
 pub struct ControlFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
-    #[prost(oneof="control_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
+    #[prost(oneof="control_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17")]
     pub msg: ::core::option::Option<control_frame::Msg>,
 }
 /// Nested message and enum types in `ControlFrame`.
@@ -91,6 +97,9 @@ pub mod control_frame {
         #[prost(message, tag="12")]
         GetMetrics(super::Empty),
         /// Hotspot network provisioning (P0.5) — isolated portcullis-provision subsystem.
+        /// DEPRECATED by the CP-managed wireless family below (P-W1): a hotspot is just
+        /// one gated SSID in SetWirelessConfig. Kept only until the CP cuts over; the
+        /// tags stay RESERVED forever (never reuse 13/14).
         ///
         /// -> CommandAck (accepted; then applied-pending)
         #[prost(message, tag="13")]
@@ -98,6 +107,17 @@ pub mod control_frame {
         /// CP confirms a pending provision -> CommandAck
         #[prost(message, tag="14")]
         ConfirmProvision(super::ConfirmProvisionRequest),
+        /// CP-managed wireless (P-W1): a full declarative desired-state of owned SSIDs.
+        ///
+        /// -> CommandAck (accepted; then applied-pending)
+        #[prost(message, tag="15")]
+        SetWirelessConfig(super::SetWirelessConfigRequest),
+        /// CP confirms a pending wireless push -> CommandAck
+        #[prost(message, tag="16")]
+        ConfirmWireless(super::ConfirmWirelessRequest),
+        /// -> EngineFrame.wireless_config (keys redacted)
+        #[prost(message, tag="17")]
+        GetWirelessConfig(super::Empty),
     }
 }
 /// Sent once by the engine as the first frame after Connect. Lets the control
@@ -366,6 +386,9 @@ pub struct EngineInfo {
     pub engine_params_hash: ::prost::alloc::string::String,
     #[prost(string, tag="9")]
     pub garden_hash: ::prost::alloc::string::String,
+    /// hash of the committed CP-managed wireless desired-state (P-W1 drift detection)
+    #[prost(string, tag="10")]
+    pub wireless_config_hash: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -485,6 +508,144 @@ pub struct ProvisionStatus {
     /// resulting iface on COMMITTED (feeds enforcement scoping)
     #[prost(string, tag="4")]
     pub bridge_name: ::prost::alloc::string::String,
+}
+// ---------------------------------------------------------------------------
+// CP-managed wireless (P-W1). Generalises hotspot provisioning: the engine owns
+// an ownership-namespaced set of UCI sections (named `pc_<slug>_*`, stamped
+// `option owner 'portcullis-wireless'`) for an ARBITRARY set of SSIDs. It NEVER
+// touches lan / br-lan / admin / wan / the `inet wifihub` table (reserved
+// denylist). A push is declarative desired-state, reconciled (set/delete diff)
+// under the SAME commit-confirm watchdog: the CP must send ConfirmWireless before
+// confirm_timeout_secs or the engine ROLLS BACK. `gated=true` SSIDs' resulting
+// ifaces are fed into portcullis enforcement (captive gate); the rest are trusted.
+// ---------------------------------------------------------------------------
+
+/// Network binding for one SSID. Day-1 mode: own-bridge + static subnet + DHCP.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessNetwork {
+    /// owned L2 iface, e.g. "br-public" (must NOT be br-lan)
+    #[prost(string, tag="1")]
+    pub bridge_name: ::prost::alloc::string::String,
+    /// gateway host addr on the subnet, e.g. "10.0.0.1"
+    #[prost(string, tag="2")]
+    pub ipaddr: ::prost::alloc::string::String,
+    /// e.g. "255.255.255.0"
+    #[prost(string, tag="3")]
+    pub netmask: ::prost::alloc::string::String,
+    /// dnsmasq pool start (host part), e.g. "10"
+    #[prost(string, tag="4")]
+    pub dhcp_start: ::prost::alloc::string::String,
+    /// pool size, e.g. "200"
+    #[prost(string, tag="5")]
+    pub dhcp_limit: ::prost::alloc::string::String,
+    /// e.g. "2h"
+    #[prost(string, tag="6")]
+    pub dhcp_leasetime: ::prost::alloc::string::String,
+    /// true = bridged, no DHCP pool (rare)
+    #[prost(bool, tag="7")]
+    pub dhcp_disabled: bool,
+}
+/// Firewall posture for one SSID's zone.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessFirewall {
+    /// zone this SSID forwards out through, e.g. "wan" (cable/4g). Must NOT be "lan".
+    #[prost(string, tag="1")]
+    pub egress_zone: ::prost::alloc::string::String,
+}
+/// One SSID the engine should own. Only owned (pc_<slug>_*) sections are written.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessSsid {
+    /// \[a-z0-9_\]{1,16}; owner-namespace key (sections pc_<slug>_*)
+    #[prost(string, tag="1")]
+    pub slug: ::prost::alloc::string::String,
+    /// advertised SSID, 1..32
+    #[prost(string, tag="2")]
+    pub ssid: ::prost::alloc::string::String,
+    /// wifi-device(s) the AP attaches to, e.g. \["radio0","radio1"\]
+    #[prost(string, repeated, tag="3")]
+    pub radios: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// "none" (open captive) | "psk2" | "sae" | "sae-mixed"
+    #[prost(string, tag="4")]
+    pub encryption: ::prost::alloc::string::String,
+    /// PSK when encryption != none — SECRET; never logged, REDACTED in status/config
+    #[prost(string, tag="5")]
+    pub key: ::prost::alloc::string::String,
+    /// hide the SSID beacon
+    #[prost(bool, tag="6")]
+    pub hidden: bool,
+    /// AP client isolation
+    #[prost(bool, tag="7")]
+    pub isolate: bool,
+    /// true = portcullis captive-gates the resulting iface
+    #[prost(bool, tag="8")]
+    pub gated: bool,
+    #[prost(message, optional, tag="9")]
+    pub network: ::core::option::Option<WirelessNetwork>,
+    #[prost(message, optional, tag="10")]
+    pub firewall: ::core::option::Option<WirelessFirewall>,
+}
+/// Full declarative desired-state of the engine's owned SSIDs. The engine diffs
+/// this against its currently-owned sections and applies the minimal set/delete.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetWirelessConfigRequest {
+    /// CP-issued; echoed in status + confirm (cursor/idempotency)
+    #[prost(string, tag="1")]
+    pub config_version: ::prost::alloc::string::String,
+    /// empty = tear down ALL owned sections
+    #[prost(message, repeated, tag="2")]
+    pub ssids: ::prost::alloc::vec::Vec<WirelessSsid>,
+    /// local watchdog window; 0 = default 90; bounds \[15, 600\]
+    #[prost(uint32, tag="3")]
+    pub confirm_timeout_secs: u32,
+}
+/// CP confirms a still-pending wireless push before the watchdog fires.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfirmWirelessRequest {
+    #[prost(string, tag="1")]
+    pub config_version: ::prost::alloc::string::String,
+}
+/// Per-SSID outcome within a WirelessStatus.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SsidResult {
+    #[prost(string, tag="1")]
+    pub slug: ::prost::alloc::string::String,
+    #[prost(bool, tag="2")]
+    pub ok: bool,
+    #[prost(string, tag="3")]
+    pub message: ::prost::alloc::string::String,
+    /// resulting L2 iface (feeds enforcement scoping when gated)
+    #[prost(string, tag="4")]
+    pub iface: ::prost::alloc::string::String,
+}
+/// engine -> control plane: lifecycle of a wireless push. Reuses ProvisionState.
+/// Unsolicited (correlation_id 0) for watchdog-driven ROLLED_BACK; correlated else.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessStatus {
+    #[prost(string, tag="1")]
+    pub config_version: ::prost::alloc::string::String,
+    /// APPLIED_PENDING | COMMITTED | ROLLED_BACK | FAILED
+    #[prost(enumeration="ProvisionState", tag="2")]
+    pub state: i32,
+    #[prost(message, repeated, tag="3")]
+    pub per_ssid: ::prost::alloc::vec::Vec<SsidResult>,
+    #[prost(string, tag="4")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Introspection reply to get_wireless_config. PSK keys are REDACTED (empty).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessConfig {
+    #[prost(string, tag="1")]
+    pub config_version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag="2")]
+    pub ssids: ::prost::alloc::vec::Vec<WirelessSsid>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]

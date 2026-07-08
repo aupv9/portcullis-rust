@@ -378,6 +378,15 @@ pub trait RulesetWriter: Send + Sync {
 
     /// List the current `auth` set elements (for restart adoption / reconcile).
     async fn list_auth(&self) -> Result<Vec<AuthElement>>;
+
+    /// Re-scope enforcement to a new set of gated-SSID interfaces at runtime
+    /// (P-W1) — re-applying only the interface-scoped gating rules, NEVER
+    /// flushing the auth set (kernel-as-truth: authorized clients are preserved).
+    /// Default is a no-op for test doubles; the writer actor overrides it to
+    /// forward the command to the [`FirewallBackend`].
+    async fn set_gated_ifaces(&self, _ifaces: Vec<String>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Sink for session lifecycle events flowing engine -> control plane (TDD §7.5).
@@ -450,81 +459,16 @@ pub trait MeteringSink: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Hotspot provisioning (P0.5). The ISOLATED `portcullis-provision` subsystem
-// (a separate crate + async task) renders a FIXED allowlist of UCI sections,
-// applies + reloads, then holds the change under a LOCAL commit-confirm
+// Provisioning lifecycle state (shared). The ISOLATED `portcullis-provision`
+// subsystem (a separate crate + async task) renders owner-namespaced UCI
+// sections, applies + reloads, then holds the change under a LOCAL commit-confirm
 // watchdog. It is deliberately fail-OPEN (rollback), the ONE exception to the
 // engine's fail-closed rule — it manages router *config*, not enforcement, and
 // kernel-as-truth means a provision fault never drops an authorized client.
-// This port lives here (not in the generated proto) so `portcullis-control`
-// and this hub crate need not depend on the prost types.
 // ---------------------------------------------------------------------------
 
-/// Desired state of the hotspot network the engine should provision — the
-/// *domain* value type, mirroring [`GrantParams`]. Distinct from the generated
-/// `pb::ProvisionHotspotRequest`: the wire message is translated into this by
-/// `portcullis-control` so the provision subsystem never touches generated code.
-///
-/// Only the four owned UCI sections are ever written (`network.br_hotspot`,
-/// `network.hotspot`, `wireless.wifi_hotspot`, `dhcp.hotspot`); `network.lan` /
-/// admin config and the `inet wifihub` enforcement table are never touched.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvisionSpec {
-    /// Control-plane-issued id, echoed in [`ProvisionStatus`] and the confirm.
-    pub provision_id: String,
-    /// `true` = provision/enable the hotspot; `false` = tear down the owned
-    /// sections (also confirm-guarded).
-    pub enabled: bool,
-    /// Public SSID advertised on the hotspot AP.
-    pub ssid: String,
-    /// wifi-device the AP attaches to, e.g. `radio0` (empty = engine default).
-    pub radio: String,
-    /// `"none"` (open captive) or a WPA mode like `"psk2"` (empty = `"none"`).
-    pub encryption: String,
-    /// PSK, required when `encryption != "none"`.
-    pub key: String,
-    /// AP client isolation.
-    pub isolate: bool,
-    /// Resulting L2 bridge iface, e.g. `br-hotspot` — the same name enforcement
-    /// scopes to via `hotspot_iface`.
-    pub bridge_name: String,
-    /// Gateway IP on the hotspot subnet, e.g. `10.0.0.1`.
-    pub ipaddr: String,
-    /// Subnet mask, e.g. `255.255.255.0`.
-    pub netmask: String,
-    /// dnsmasq pool start (host part), e.g. `10`.
-    pub dhcp_start: String,
-    /// dnsmasq pool size, e.g. `200`.
-    pub dhcp_limit: String,
-    /// dnsmasq lease time, e.g. `2h`.
-    pub dhcp_leasetime: String,
-    /// Local commit-confirm watchdog window; `0` = engine default (90 s), bounds
-    /// `[15, 600]` (enforced during validation).
-    pub confirm_timeout_secs: u32,
-}
-
-impl Default for ProvisionSpec {
-    fn default() -> Self {
-        ProvisionSpec {
-            provision_id: String::new(),
-            enabled: true,
-            ssid: String::new(),
-            radio: "radio0".to_string(),
-            encryption: "none".to_string(),
-            key: String::new(),
-            isolate: true,
-            bridge_name: "br-hotspot".to_string(),
-            ipaddr: "10.0.0.1".to_string(),
-            netmask: "255.255.255.0".to_string(),
-            dhcp_start: "10".to_string(),
-            dhcp_limit: "200".to_string(),
-            dhcp_leasetime: "2h".to_string(),
-            confirm_timeout_secs: 0,
-        }
-    }
-}
-
-/// Lifecycle state reported for a provision (mirrors `pb::ProvisionState`).
+/// Lifecycle state of a provision (mirrors `pb::ProvisionState`); reused by
+/// [`WirelessStatus`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProvisionState {
     /// Applied + reloaded; awaiting a confirm within the watchdog window.
@@ -537,16 +481,123 @@ pub enum ProvisionState {
     Failed,
 }
 
-/// A provision-lifecycle report emitted engine → control plane. The subsystem
-/// pushes these upward; `portcullis-control` maps them to `pb::ProvisionStatus`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvisionStatus {
-    pub provision_id: String,
-    pub state: ProvisionState,
-    /// Detail (error text, iface, etc.).
-    pub message: String,
-    /// Resulting bridge iface, set on `Committed` (feeds enforcement scoping).
+// ---------------------------------------------------------------------------
+// CP-managed wireless (P-W1) — the domain value types: an arbitrary set of owned
+// SSIDs the control plane can push to the engine. The wire messages
+// (`pb::WirelessSsid` etc.) are translated into these by `portcullis-control` so
+// the provision subsystem never touches generated code. Network + firewall are
+// flattened here (the pb nests them) to keep the renderer/validator simple.
+// ---------------------------------------------------------------------------
+
+/// One SSID the engine should own. Renders to owner-namespaced `pc_<slug>_*` UCI
+/// sections only; never touches lan / br-lan / admin / wan / the `inet wifihub`
+/// table (enforced by the renderer's reserved denylist).
+///
+/// `Debug` is hand-written to REDACT [`key`](Self::key) — so a stray `?spec` in a
+/// log line or a panic message can never leak the PSK (the invariant is
+/// compiler-enforced, not just a convention).
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SsidSpec {
+    /// Owner-namespace key: `[a-z0-9_]{1,16}`. Sections are named `pc_<slug>_*`.
+    pub slug: String,
+    /// Advertised SSID (1..=32 chars).
+    pub ssid: String,
+    /// wifi-device(s) the AP attaches to, e.g. `["radio0", "radio1"]`. One
+    /// `wifi-iface` section is rendered per radio. Empty => the engine default.
+    pub radios: Vec<String>,
+    /// `"none"` (open captive) or a WPA mode (`"psk2"`, `"sae"`, `"sae-mixed"`).
+    pub encryption: String,
+    /// PSK when `encryption != "none"`. SECRET — never logged; redacted upward.
+    pub key: String,
+    /// Hide the SSID beacon.
+    pub hidden: bool,
+    /// AP client isolation.
+    pub isolate: bool,
+    /// `true` = portcullis captive-gates the resulting iface; `false` = trusted.
+    pub gated: bool,
+    /// Owned L2 bridge iface, e.g. `br-public` (must NOT be `br-lan`).
     pub bridge_name: String,
+    /// Gateway host addr on the subnet, e.g. `10.0.0.1`.
+    pub ipaddr: String,
+    /// Subnet mask, e.g. `255.255.255.0`.
+    pub netmask: String,
+    /// dnsmasq pool start (host part), e.g. `10`.
+    pub dhcp_start: String,
+    /// dnsmasq pool size, e.g. `200`.
+    pub dhcp_limit: String,
+    /// dnsmasq lease time, e.g. `2h`.
+    pub dhcp_leasetime: String,
+    /// `true` = bridged, no DHCP pool rendered.
+    pub dhcp_disabled: bool,
+    /// Firewall zone this SSID forwards out through, e.g. `wan` (must NOT be
+    /// `lan`). Empty => the engine default (`wan`).
+    pub egress_zone: String,
+}
+
+impl std::fmt::Debug for SsidSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsidSpec")
+            .field("slug", &self.slug)
+            .field("ssid", &self.ssid)
+            .field("radios", &self.radios)
+            .field("encryption", &self.encryption)
+            .field("key", &redacted(&self.key))
+            .field("hidden", &self.hidden)
+            .field("isolate", &self.isolate)
+            .field("gated", &self.gated)
+            .field("bridge_name", &self.bridge_name)
+            .field("ipaddr", &self.ipaddr)
+            .field("netmask", &self.netmask)
+            .field("dhcp_start", &self.dhcp_start)
+            .field("dhcp_limit", &self.dhcp_limit)
+            .field("dhcp_leasetime", &self.dhcp_leasetime)
+            .field("dhcp_disabled", &self.dhcp_disabled)
+            .field("egress_zone", &self.egress_zone)
+            .finish()
+    }
+}
+
+/// Render a secret for `Debug`: `<none>` when empty, else `<redacted>` — never
+/// the value. Used by the hand-written `Debug` impls that carry a PSK.
+fn redacted(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<none>"
+    } else {
+        "<redacted>"
+    }
+}
+
+/// A full declarative desired-state push: the complete set of owned SSIDs. The
+/// engine diffs this against its currently-owned sections and applies the minimal
+/// set/delete. An empty `ssids` tears down ALL owned sections.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WirelessDesiredState {
+    /// Control-plane-issued version; echoed in [`WirelessStatus`] and the confirm.
+    pub config_version: String,
+    pub ssids: Vec<SsidSpec>,
+    /// Local commit-confirm watchdog window; `0` = default (90 s), bounds
+    /// `[15, 600]` (enforced during validation).
+    pub confirm_timeout_secs: u32,
+}
+
+/// Per-SSID outcome within a [`WirelessStatus`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SsidResult {
+    pub slug: String,
+    pub ok: bool,
+    pub message: String,
+    /// Resulting L2 iface (feeds enforcement scoping when the SSID is gated).
+    pub iface: String,
+}
+
+/// Lifecycle report for a wireless push (reuses [`ProvisionState`]). Pushed
+/// upward by the subsystem; `portcullis-control` maps it to `pb::WirelessStatus`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WirelessStatus {
+    pub config_version: String,
+    pub state: ProvisionState,
+    pub per_ssid: Vec<SsidResult>,
+    pub message: String,
 }
 
 /// Provision-subsystem errors (fail-OPEN: an error rolls back / leaves prior
@@ -579,25 +630,31 @@ pub enum ProvisionError {
     Io(String),
 }
 
-/// Control-plane-facing hotspot provisioning, implemented by the
+/// Control-plane-facing wireless provisioning (P-W1), implemented by the
 /// `portcullis-provision` handle and called by `portcullis-control` when a
-/// `provision_hotspot` / `confirm_provision` frame arrives. Object-safe.
-///
-/// Contract: [`provision`](Self::provision) validates the spec, snapshots the
-/// owned sections to tmpfs, applies + reloads, arms the local watchdog, and
-/// returns once the change is APPLIED_PENDING (the terminal COMMITTED /
-/// ROLLED_BACK outcome is delivered later as a [`ProvisionStatus`] on the
-/// subsystem's upward channel). [`confirm`](Self::confirm) commits a still-pending
-/// provision before its deadline.
+/// `set_wireless_config` / `confirm_wireless` / `get_wireless_config` frame
+/// arrives. Object-safe. Isolated from the [`Enforcer`]: a provision fault never
+/// affects enforcement.
 #[async_trait]
 pub trait Provisioner: Send + Sync {
-    /// Validate → snapshot → apply → reload → arm watchdog. Returns once the
-    /// change is applied and pending confirmation, or an error if validation /
-    /// apply failed (in which case nothing durable was left / it was reverted).
-    async fn provision(&self, spec: ProvisionSpec) -> std::result::Result<(), ProvisionError>;
+    /// Validate → snapshot → reconcile (set/delete diff) → reload → arm watchdog
+    /// for a full declarative wireless desired-state. Returns once APPLIED_PENDING
+    /// (the terminal COMMITTED / ROLLED_BACK outcome is delivered later as a
+    /// [`WirelessStatus`] on the subsystem's upward channel), or an error if
+    /// validation / apply failed (nothing durable was left / it was reverted).
+    async fn set_wireless(
+        &self,
+        state: WirelessDesiredState,
+    ) -> std::result::Result<(), ProvisionError>;
 
-    /// Confirm a still-pending provision by id → Committed (cancels the watchdog).
-    async fn confirm(&self, provision_id: &str) -> std::result::Result<(), ProvisionError>;
+    /// Confirm a still-pending wireless push by config version → Committed.
+    async fn confirm_wireless(
+        &self,
+        config_version: &str,
+    ) -> std::result::Result<(), ProvisionError>;
+
+    /// Return the last committed wireless desired-state (introspection / drift).
+    async fn get_wireless(&self) -> std::result::Result<WirelessDesiredState, ProvisionError>;
 }
 
 /// A `u64` counter/gauge cell that works on **every** target. 32-bit MIPS (the

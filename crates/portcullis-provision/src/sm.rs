@@ -26,10 +26,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use portcullis_types::{ProvisionError, ProvisionSpec, ProvisionState, ProvisionStatus};
+use portcullis_types::{ProvisionError, ProvisionState, SsidResult, WirelessStatus};
 
 use crate::runner::CommandRunner;
-use crate::uci::{self, UciCmd, OWNED, OWNED_CONFIGS};
+use crate::uci::{self, UciCmd, OWNED_CONFIGS};
 
 /// tmpfs directory holding the provision snapshot + pending marker. Never flash.
 pub const DEFAULT_STATE_DIR: &str = "/tmp/portcullis/provision";
@@ -100,63 +100,60 @@ impl Snapshot {
     }
 }
 
-/// The persisted pending marker (tmpfs): enough to resume the watchdog / roll
-/// back on a daemon restart that lands mid-window.
+/// The persisted pending marker for a CP-managed wireless push (tmpfs), carrying
+/// enough to resume the watchdog / roll back on a restart mid-window: the config
+/// version, the radios to reload, the section keys present after apply (so
+/// rollback deletes only what we added), the deadline, and the pre-apply snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingMarker {
-    pub provision_id: String,
-    /// The spec that was applied (so a boot-time rollback knows whether it was an
-    /// enable — restore snapshot — or a teardown — re-apply snapshot).
-    pub was_teardown: bool,
-    pub bridge_name: String,
-    /// The hotspot's wifi-device — persisted so a boot-time rollback reloads only
-    /// that radio (never the admin/control-plane radio). See [`crate::uci::effective_radio`].
-    pub radio: String,
-    /// UNIX-epoch seconds deadline (wall clock — survives a process restart,
-    /// unlike a `tokio::time::Instant`).
+pub struct WirelessMarker {
+    pub config_version: String,
+    /// Radios reloaded on rollback (union of desired + prior). Never the admin
+    /// radio unless an owned SSID sits on it (the CP owns that choice).
+    pub radios: Vec<String>,
+    /// Owned section keys present after apply (the desired set). Rollback deletes
+    /// those NOT in `snapshot.existing_sections` (i.e. the ones this apply added).
+    pub current_sections: Vec<String>,
     pub deadline_unix: i64,
     pub snapshot: Snapshot,
 }
 
-impl PendingMarker {
+impl WirelessMarker {
     fn to_text(&self) -> String {
-        // A tiny header block followed by the snapshot body.
         let mut s = String::new();
-        s.push_str(&format!("provision_id={}\n", self.provision_id));
-        s.push_str(&format!("was_teardown={}\n", self.was_teardown));
-        s.push_str(&format!("bridge_name={}\n", self.bridge_name));
-        s.push_str(&format!("radio={}\n", self.radio));
+        s.push_str(&format!("config_version={}\n", self.config_version));
+        s.push_str(&format!("radios={}\n", self.radios.join(",")));
+        s.push_str(&format!("current_sections={}\n", self.current_sections.join(",")));
         s.push_str(&format!("deadline_unix={}\n", self.deadline_unix));
         s.push_str("---\n");
         s.push_str(&self.snapshot.to_text());
         s
     }
 
-    fn from_text(text: &str) -> Option<PendingMarker> {
+    fn from_text(text: &str) -> Option<WirelessMarker> {
         let (head, body) = text.split_once("\n---\n")?;
-        let mut provision_id = None;
-        let mut was_teardown = false;
-        let mut bridge_name = String::new();
-        // Backward-compatible: a marker written before the radio field existed
-        // rolls back on the default radio rather than failing to parse.
-        let mut radio = uci::DEFAULT_RADIO.to_string();
+        let mut config_version = String::new();
+        let mut radios = Vec::new();
+        let mut current_sections = Vec::new();
         let mut deadline_unix = None;
         for line in head.lines() {
             let (k, v) = line.split_once('=')?;
             match k {
-                "provision_id" => provision_id = Some(v.to_string()),
-                "was_teardown" => was_teardown = v == "true",
-                "bridge_name" => bridge_name = v.to_string(),
-                "radio" => radio = v.to_string(),
+                "config_version" => config_version = v.to_string(),
+                "radios" => {
+                    radios = v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                }
+                "current_sections" => {
+                    current_sections =
+                        v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                }
                 "deadline_unix" => deadline_unix = v.parse().ok(),
                 _ => {}
             }
         }
-        Some(PendingMarker {
-            provision_id: provision_id?,
-            was_teardown,
-            bridge_name,
-            radio,
+        Some(WirelessMarker {
+            config_version,
+            radios,
+            current_sections,
             deadline_unix: deadline_unix?,
             snapshot: Snapshot::from_text(body),
         })
@@ -177,17 +174,28 @@ pub struct ProvisionMachine<R: CommandRunner> {
     responder_port: u16,
 }
 
-/// The path of the pending marker inside the state dir.
-fn marker_path(dir: &Path) -> PathBuf {
-    dir.join("pending.marker")
+/// The path of the CP-managed wireless pending marker.
+fn wireless_marker_path(dir: &Path) -> PathBuf {
+    dir.join("wireless.marker")
 }
 
-/// Test-only accessor for the marker path (used by the handle actor tests to
-/// assert the marker is created/cleared at the right points).
-#[doc(hidden)]
-pub fn marker_path_for_test(dir: &Path) -> PathBuf {
-    marker_path(dir)
+/// The path of the persisted committed gated-SSID iface list (F2): the enforcement
+/// scope to restore on a daemon restart before the control plane reconnects.
+fn committed_gated_path(dir: &Path) -> PathBuf {
+    dir.join("committed.gated")
 }
+
+/// Read the committed gated-SSID ifaces persisted by
+/// [`ProvisionMachine::write_committed_gated`] (F2). `None` = no committed
+/// wireless config on this box (the caller keeps its static seed); `Some(list)` =
+/// the committed set (possibly empty, i.e. a committed teardown → no gated ifaces).
+/// tmpfs-only, so this survives a daemon restart but not a reboot (correct: after
+/// a reboot `uci`'s committed config is the truth and the CP re-syncs).
+pub fn read_committed_gated(state_dir: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(committed_gated_path(state_dir)).ok()?;
+    Some(text.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
 
 impl<R: CommandRunner> ProvisionMachine<R> {
     pub fn new(runner: R, state_dir: impl Into<PathBuf>, responder_port: u16) -> Self {
@@ -204,18 +212,15 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         self.responder_port
     }
 
-    /// Capture the prior state of ONLY the owned sections into a [`Snapshot`].
-    ///
-    /// Runs `uci show <config>` for each owned config and keeps only the lines
-    /// whose section is one of the four owned ones — so a snapshot can never
-    /// capture (and thus a rollback can never rewrite) a non-owned section, even
-    /// if the filter were fed the whole `uci show`.
-    pub async fn snapshot(&self) -> Result<Snapshot, ProvisionError> {
+    // --- CP-managed wireless (P-W1) ---------------------------------------
+
+    /// Capture the prior state of ONLY owner-namespaced wireless sections
+    /// (`pc_*`, see [`uci::is_owned_wireless_section`]) into a [`Snapshot`]. Same
+    /// guardrail as [`Self::snapshot`]: a non-owned section can never enter the
+    /// snapshot, so a rollback can never rewrite lan / wan / admin.
+    pub async fn snapshot_wireless(&self) -> Result<Snapshot, ProvisionError> {
         let mut snap = Snapshot::default();
         for cfg in OWNED_CONFIGS {
-            // `uci show network` prints `network.<sec>=<type>` and
-            // `network.<sec>.<opt>='<val>'` lines. A show of a config with no
-            // matching sections still succeeds (empty output).
             let out = self.runner.run(UCI, &["show", cfg]).await?;
             let text = String::from_utf8_lossy(&out);
             for line in text.lines() {
@@ -224,12 +229,12 @@ impl<R: CommandRunner> ProvisionMachine<R> {
                     continue;
                 }
                 let Some((key, raw_val)) = line.split_once('=') else { continue };
-                if !is_owned_key(key) {
-                    continue; // guardrail: only owned sections enter the snapshot
+                if !uci::is_owned_wireless_section(key) {
+                    continue; // guardrail: only owned wireless sections enter
                 }
                 let val = unquote(raw_val);
-                // A bare section decl line has key == the section key itself.
-                if OWNED.contains(&key) && !snap.existing_sections.iter().any(|s| s == key) {
+                // A section decl line has exactly one `.` (`config.section`).
+                if key.matches('.').count() == 1 && !snap.existing_sections.iter().any(|s| s == key) {
                     snap.existing_sections.push(key.to_string());
                 }
                 snap.prior.insert(key.to_string(), val);
@@ -238,24 +243,14 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         Ok(snap)
     }
 
-    /// Apply a batch of [`UciCmd`]s, then `uci commit` the owned configs, then
-    /// reload IN ORDER: network → firewall → wifi `<radio>` → dnsmasq.
-    /// Panic-guarded by the caller (the actor task) — an error here never takes
-    /// down enforcement.
-    ///
-    /// `radio` is the hotspot's wifi-device (from [`uci::effective_radio`]): only
-    /// THAT radio is reloaded, so the admin/control-plane radio on a dual-band
-    /// router never bounces (which would sever the engine↔CP link and defeat the
-    /// commit-confirm). See [`Self::commit_and_reload`].
-    ///
-    /// A `delete` on apply is best-effort (a missing section on teardown is not
-    /// an error): those are tolerated. A failed `set` / `commit` / reload is a
-    /// hard error → the caller rolls back.
-    pub async fn apply(
+    /// Apply a wireless batch, `uci commit`, then reload with a MULTI-radio wifi
+    /// step (`wifi reload <r>` for each affected radio — never a bare `wifi
+    /// reload`). Same delete-tolerance semantics as [`Self::apply`].
+    pub async fn apply_wireless(
         &self,
         cmds: &[UciCmd],
         allow_missing_delete: bool,
-        radio: &str,
+        radios: &[String],
     ) -> Result<(), ProvisionError> {
         for cmd in cmds {
             let argv = cmd.argv();
@@ -271,82 +266,63 @@ impl<R: CommandRunner> ProvisionMachine<R> {
                 }
             }
         }
-        self.commit_and_reload(radio).await
+        self.commit_and_reload_multi(radios).await
     }
 
-    /// `uci commit` per owned config (in order) then the reload sequence. Shared
-    /// by apply + rollback so both go through the same ordered path.
-    ///
-    /// `radio` scopes the wifi reload to the hotspot's device: `wifi reload
-    /// <radio>` reloads ONLY that radio. We deliberately do NOT run bare `wifi
-    /// reload` (all radios): on a dual-band router the hotspot AP lives on one
-    /// radio while the admin + control-plane WiFi lives on the other — bouncing
-    /// every radio would drop the engine↔control-plane link, so the CP could
-    /// never send the confirm and every provision would roll back.
-    async fn commit_and_reload(&self, radio: &str) -> Result<(), ProvisionError> {
-        // Commit each owned config SEPARATELY: busybox `uci commit` accepts at
-        // most ONE <config> arg — a single `uci commit network wireless dhcp
-        // firewall` exits 255 with a usage error on RutOS. Order preserved
-        // (firewall last: its zone references the hotspot interface).
+    /// `uci commit` per owned config then the reload sequence, scoping the wifi
+    /// step to EACH radio in `radios` (never bare `wifi reload`). Shared by
+    /// [`Self::apply_wireless`] + [`Self::rollback_to`].
+    async fn commit_and_reload_multi(&self, radios: &[String]) -> Result<(), ProvisionError> {
         for cfg in OWNED_CONFIGS {
             self.runner.run(UCI, &["commit", cfg]).await?;
         }
-
-        // Reload ORDER matters (design doc): network before firewall (the zone
-        // references the just-created interface) before wifi before dnsmasq — or
-        // the zone binds a not-yet-up interface / the AP attaches to a not-yet-up
-        // bridge / dnsmasq binds a not-yet-configured interface. The wifi step is
-        // scoped to `<radio>` (see above).
         self.runner.run(INIT_NETWORK, &["reload"]).await?;
         self.runner.run(INIT_FIREWALL, &["reload"]).await?;
-        self.runner.run(WIFI, &["reload", radio]).await?;
+        for r in radios {
+            self.runner.run(WIFI, &["reload", r]).await?;
+        }
         self.runner.run(INIT_DNSMASQ, &["restart"]).await?;
         Ok(())
     }
 
-    /// Roll back to `snapshot`: delete owned sections we ADDED (not in
-    /// `existing_sections`), re-create + restore the prior option values of
-    /// sections that existed, then commit + reload. Fail-OPEN's safety net.
-    ///
-    /// `radio` is the hotspot's radio (the one whose vif is being removed); only
-    /// it is reloaded, so the admin radio stays untouched during rollback too.
-    pub async fn rollback(&self, snapshot: &Snapshot, radio: &str) -> Result<(), ProvisionError> {
-        // 1. Delete any owned section that did NOT exist before apply (we made it).
-        for sec in OWNED {
+    /// Roll back to `snapshot`: delete the owned sections present now
+    /// (`current_sections`) that did NOT exist pre-apply (we added them), restore
+    /// the prior option values (re-creates sections this apply deleted, reverts
+    /// modified ones), then commit + multi-radio reload. Fail-OPEN's safety net.
+    pub async fn rollback_to(
+        &self,
+        snapshot: &Snapshot,
+        current_sections: &[String],
+        radios: &[String],
+    ) -> Result<(), ProvisionError> {
+        for sec in current_sections {
             if !snapshot.existing_sections.iter().any(|s| s == sec) {
                 let _ = self.runner.run(UCI, &["delete", sec]).await; // best-effort
             }
         }
-        // 2. Restore prior sections: re-declare the section (its `key=type` line)
-        //    and re-apply every prior option value. Deterministic order (BTreeMap
-        //    in the snapshot) keeps section decls before their options because a
-        //    bare section key sorts before `key.opt` keys.
         for (key, val) in &snapshot.prior {
             let set = format!("{key}={val}");
             let _ = self.runner.run(UCI, &["set", &set]).await; // best-effort restore
         }
-        // 3. Commit + reload so the restored config takes effect.
-        self.commit_and_reload(radio)
+        self.commit_and_reload_multi(radios)
             .await
             .map_err(|e| ProvisionError::Rollback(e.to_string()))
     }
 
-    // --- tmpfs marker persistence -----------------------------------------
-
-    /// Persist the pending marker to tmpfs.
-    pub async fn write_marker(&self, marker: &PendingMarker) -> Result<(), ProvisionError> {
+    /// Persist the wireless pending marker to tmpfs.
+    pub async fn write_wireless_marker(&self, marker: &WirelessMarker) -> Result<(), ProvisionError> {
         tokio::fs::create_dir_all(&self.state_dir)
             .await
             .map_err(|e| ProvisionError::Io(format!("create {}: {e}", self.state_dir.display())))?;
-        let path = marker_path(&self.state_dir);
+        let path = wireless_marker_path(&self.state_dir);
         tokio::fs::write(&path, marker.to_text().as_bytes())
             .await
             .map_err(|e| ProvisionError::Io(format!("write {}: {e}", path.display())))
     }
 
-    /// Remove the pending marker (on commit or after a rollback resolves it).
-    pub async fn clear_marker(&self) -> Result<(), ProvisionError> {
-        let path = marker_path(&self.state_dir);
+    /// Remove the wireless pending marker (on commit or after a rollback resolves).
+    pub async fn clear_wireless_marker(&self) -> Result<(), ProvisionError> {
+        let path = wireless_marker_path(&self.state_dir);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -354,47 +330,28 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         }
     }
 
-    /// Read the pending marker if one exists (crash-recovery reconcile).
-    pub async fn read_marker(&self) -> Result<Option<PendingMarker>, ProvisionError> {
-        let path = marker_path(&self.state_dir);
+    /// Read the wireless pending marker if one exists (crash-recovery reconcile).
+    pub async fn read_wireless_marker(&self) -> Result<Option<WirelessMarker>, ProvisionError> {
+        let path = wireless_marker_path(&self.state_dir);
         match tokio::fs::read_to_string(&path).await {
-            Ok(text) => Ok(PendingMarker::from_text(&text)),
+            Ok(text) => Ok(WirelessMarker::from_text(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(ProvisionError::Io(format!("read {}: {e}", path.display()))),
         }
     }
-}
 
-/// The reload argv the design doc mandates, in order, for a hotspot on `radio`.
-/// Exposed for order-assertion tests. `(program, args)` in reload order:
-/// network reload → firewall reload → **wifi reload `<radio>`** → dnsmasq restart
-/// (firewall AFTER network — its zone references the interface; the wifi step is
-/// SCOPED to `<radio>` so the admin/control-plane radio never bounces). This is
-/// the single source of truth [`ProvisionMachine::commit_and_reload`] follows.
-pub fn reload_sequence(radio: &str) -> Vec<(&'static str, Vec<String>)> {
-    vec![
-        (INIT_NETWORK, vec!["reload".to_string()]),
-        (INIT_FIREWALL, vec!["reload".to_string()]),
-        (WIFI, vec!["reload".to_string(), radio.to_string()]),
-        (INIT_DNSMASQ, vec!["restart".to_string()]),
-    ]
-}
-
-/// Build the `ProvisionStatus` for a state transition.
-pub fn status(id: &str, state: ProvisionState, message: impl Into<String>, bridge: &str) -> ProvisionStatus {
-    ProvisionStatus {
-        provision_id: id.to_string(),
-        state,
-        message: message.into(),
-        bridge_name: bridge.to_string(),
+    /// Persist the committed gated-SSID bridge ifaces (comma-joined) to tmpfs (F2)
+    /// so a daemon restart can re-scope enforcement before the CP reconnects. An
+    /// empty list writes an empty file (a committed teardown → no gated ifaces).
+    pub async fn write_committed_gated(&self, ifaces: &[String]) -> Result<(), ProvisionError> {
+        tokio::fs::create_dir_all(&self.state_dir)
+            .await
+            .map_err(|e| ProvisionError::Io(format!("create {}: {e}", self.state_dir.display())))?;
+        let path = committed_gated_path(&self.state_dir);
+        tokio::fs::write(&path, ifaces.join(",").as_bytes())
+            .await
+            .map_err(|e| ProvisionError::Io(format!("write {}: {e}", path.display())))
     }
-}
-
-/// Whether a `uci show` key belongs to one of the four owned sections.
-fn is_owned_key(key: &str) -> bool {
-    OWNED
-        .iter()
-        .any(|owned| key == *owned || key.starts_with(&format!("{owned}.")))
 }
 
 /// Strip a single layer of UCI single/double quotes from a `uci show` value.
@@ -411,9 +368,53 @@ fn unquote(v: &str) -> String {
     v.to_string()
 }
 
-/// Convert an effective timeout (seconds) into a `Duration` for the watchdog.
-pub fn confirm_window(spec: &ProvisionSpec) -> Duration {
-    Duration::from_secs(u64::from(uci::effective_confirm_timeout(spec)))
+/// Convert a raw confirm-timeout (seconds, `0` = default) into a `Duration` for
+/// the watchdog.
+pub fn confirm_window_secs(secs: u32) -> Duration {
+    Duration::from_secs(u64::from(uci::effective_confirm_timeout_secs(secs)))
+}
+
+/// The reload argv sequence for a MULTI-radio wireless apply (order: network →
+/// firewall → `wifi reload <r>` per radio → dnsmasq). Order-assertion tests use
+/// this; [`ProvisionMachine::commit_and_reload_multi`] follows the same order.
+pub fn reload_sequence_multi(radios: &[String]) -> Vec<(&'static str, Vec<String>)> {
+    let mut v = vec![
+        (INIT_NETWORK, vec!["reload".to_string()]),
+        (INIT_FIREWALL, vec!["reload".to_string()]),
+    ];
+    for r in radios {
+        v.push((WIFI, vec!["reload".to_string(), r.clone()]));
+    }
+    v.push((INIT_DNSMASQ, vec!["restart".to_string()]));
+    v
+}
+
+/// Build a [`WirelessStatus`] for a state transition.
+pub fn wireless_status(
+    config_version: &str,
+    state: ProvisionState,
+    per_ssid: Vec<SsidResult>,
+    message: impl Into<String>,
+) -> WirelessStatus {
+    WirelessStatus {
+        config_version: config_version.to_string(),
+        state,
+        per_ssid,
+        message: message.into(),
+    }
+}
+
+/// The wifi-device radios referenced by an owned wireless snapshot (the
+/// `wireless.pc_*_ap*.device` values) — unioned with the desired radios so a
+/// rollback / removal reloads the radio a since-deleted SSID used to sit on.
+pub fn snapshot_radios(snapshot: &Snapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in &snapshot.prior {
+        if k.starts_with("wireless.pc_") && k.ends_with(".device") && !out.contains(v) {
+            out.push(v.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -421,212 +422,8 @@ mod tests {
     use super::*;
     use crate::runner::RecordingRunner;
 
-    fn spec() -> ProvisionSpec {
-        ProvisionSpec {
-            provision_id: "prov-1".into(),
-            enabled: true,
-            ssid: "Guest".into(),
-            radio: "radio0".into(),
-            encryption: "none".into(),
-            key: String::new(),
-            isolate: true,
-            bridge_name: "br-hotspot".into(),
-            ipaddr: "10.0.0.1".into(),
-            netmask: "255.255.255.0".into(),
-            dhcp_start: "10".into(),
-            dhcp_limit: "200".into(),
-            dhcp_leasetime: "2h".into(),
-            confirm_timeout_secs: 90,
-        }
-    }
-
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
-    }
-
-    #[tokio::test]
-    async fn apply_commits_owned_configs_and_reloads_in_order() {
-        let dir = temp_dir();
-        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
-        // The default spec's radio is radio0 → the wifi step reloads ONLY radio0.
-        m.apply(&uci::render_uci(&spec(), 8080), false, "radio0").await.unwrap();
-
-        let flat = m.runner().flat();
-        // The last EIGHT invocations are: four per-config commits (busybox `uci
-        // commit` takes one config each), then the four-step reload IN ORDER
-        // (network → firewall → wifi <radio> → dnsmasq).
-        let tail: Vec<(String, String)> = flat.iter().rev().take(8).rev().cloned().collect();
-        assert_eq!(
-            tail,
-            vec![
-                ("uci".to_string(), "commit network".to_string()),
-                ("uci".to_string(), "commit wireless".to_string()),
-                ("uci".to_string(), "commit dhcp".to_string()),
-                ("uci".to_string(), "commit firewall".to_string()),
-                ("/etc/init.d/network".to_string(), "reload".to_string()),
-                ("/etc/init.d/firewall".to_string(), "reload".to_string()),
-                // Scoped to the hotspot radio — NOT bare `wifi reload` (all radios).
-                ("/sbin/wifi".to_string(), "reload radio0".to_string()),
-                ("/etc/init.d/dnsmasq".to_string(), "restart".to_string()),
-            ]
-        );
-        // firewall reload comes AFTER network reload (zone references the iface).
-        let net = flat.iter().position(|(p, a)| p == "/etc/init.d/network" && a == "reload").unwrap();
-        let fw = flat.iter().position(|(p, a)| p == "/etc/init.d/firewall" && a == "reload").unwrap();
-        assert!(net < fw, "network reload must precede firewall reload");
-        // No bare `wifi reload` (all radios) — always scoped to a radio.
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
-        // No `sh` ever spawned.
-        assert!(flat.iter().all(|(p, _)| p != "sh" && p != "/bin/sh"));
-    }
-
-    #[tokio::test]
-    async fn wifi_reload_targets_the_hotspot_radio_only() {
-        // A hotspot on radio1 (e.g. 5 GHz) must reload ONLY radio1 — the admin/
-        // control-plane radio (radio0) must never appear in a wifi reload.
-        let dir = temp_dir();
-        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
-        m.apply(&[], false, "radio1").await.unwrap();
-        let flat = m.runner().flat();
-        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio1".to_string())));
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload radio0"));
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
-    }
-
-    #[test]
-    fn reload_sequence_scopes_wifi_to_radio() {
-        // radio1 hotspot.
-        let seq = reload_sequence("radio1");
-        assert_eq!(
-            seq,
-            vec![
-                ("/etc/init.d/network", vec!["reload".to_string()]),
-                ("/etc/init.d/firewall", vec!["reload".to_string()]),
-                ("/sbin/wifi", vec!["reload".to_string(), "radio1".to_string()]),
-                ("/etc/init.d/dnsmasq", vec!["restart".to_string()]),
-            ]
-        );
-        // default radio0.
-        let seq0 = reload_sequence("radio0");
-        assert_eq!(seq0[2], ("/sbin/wifi", vec!["reload".to_string(), "radio0".to_string()]));
-    }
-
-    #[tokio::test]
-    async fn snapshot_captures_only_owned_sections() {
-        let dir = temp_dir();
-        // Fake `uci show <cfg>` returns non-owned sections (br-lan, the wan/lan fw
-        // zones) alongside a prior hotspot iface + a prior hotspot fw rule.
-        let runner = RecordingRunner::with_responder(|prog, args| {
-            if prog == "uci" && args.first() == Some(&"show") {
-                let cfg = args.get(1).copied().unwrap_or("");
-                let body = match cfg {
-                    "network" => "network.lan=interface\nnetwork.lan.proto='static'\nnetwork.hotspot=interface\nnetwork.hotspot.ipaddr='10.9.9.1'\n",
-                    "dhcp" => "dhcp.lan=dhcp\n",
-                    "firewall" => "firewall.wan=zone\nfirewall.wan.masq='1'\nfirewall.lan=zone\nfirewall.hotspot_dns=rule\nfirewall.hotspot_dns.dest_port='53'\n",
-                    _ => "",
-                };
-                Ok(body.as_bytes().to_vec())
-            } else {
-                Ok(Vec::new())
-            }
-        });
-        let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let snap = m.snapshot().await.unwrap();
-
-        // br-lan / dhcp.lan / firewall.wan / firewall.lan must NOT be captured;
-        // the prior hotspot iface + hotspot fw rule MUST.
-        assert!(snap.prior.contains_key("network.hotspot"));
-        assert_eq!(snap.prior.get("network.hotspot.ipaddr").map(String::as_str), Some("10.9.9.1"));
-        assert!(snap.prior.contains_key("firewall.hotspot_dns"));
-        assert_eq!(snap.prior.get("firewall.hotspot_dns.dest_port").map(String::as_str), Some("53"));
-        assert!(!snap.prior.keys().any(|k| k.starts_with("network.lan")));
-        assert!(!snap.prior.keys().any(|k| k.starts_with("dhcp.lan")));
-        assert!(!snap.prior.keys().any(|k| k.starts_with("firewall.wan")));
-        assert!(!snap.prior.keys().any(|k| k.starts_with("firewall.lan")));
-        let mut existing = snap.existing_sections.clone();
-        existing.sort();
-        assert_eq!(existing, vec!["firewall.hotspot_dns".to_string(), "network.hotspot".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn rollback_deletes_added_sections_and_restores_prior_then_reloads() {
-        let dir = temp_dir();
-        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
-        // Snapshot: network.hotspot existed before (restore it); the other eight
-        // owned sections did not (they must be deleted on rollback).
-        let mut snap = Snapshot {
-            existing_sections: vec!["network.hotspot".to_string()],
-            ..Default::default()
-        };
-        snap.prior.insert("network.hotspot".to_string(), "interface".to_string());
-        snap.prior.insert("network.hotspot.ipaddr".to_string(), "10.9.9.1".to_string());
-
-        m.rollback(&snap, "radio0").await.unwrap();
-        let flat = m.runner().flat();
-
-        // Deletes the sections we added (NOT network.hotspot, which existed) —
-        // including the firewall zone/forwarding/rules.
-        assert!(flat.contains(&("uci".to_string(), "delete network.br_hotspot".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete wireless.wifi_hotspot".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete dhcp.hotspot".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete firewall.hotspot".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete firewall.hotspot_fwd".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete firewall.hotspot_dhcp".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete firewall.hotspot_dns".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "delete firewall.hotspot_portal".to_string())));
-        assert!(!flat.contains(&("uci".to_string(), "delete network.hotspot".to_string())));
-        // Restores the prior option value.
-        assert!(flat.contains(&("uci".to_string(), "set network.hotspot.ipaddr=10.9.9.1".to_string())));
-        // And ends with per-config commits (incl. firewall) + reload — wifi step
-        // scoped to the hotspot radio only (never bare `wifi reload`).
-        assert!(flat.contains(&("uci".to_string(), "commit network".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "commit firewall".to_string())));
-        assert!(flat.contains(&("/etc/init.d/firewall".to_string(), "reload".to_string())));
-        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
-        assert!(flat.contains(&("/etc/init.d/dnsmasq".to_string(), "restart".to_string())));
-    }
-
-    #[tokio::test]
-    async fn apply_error_propagates_for_rollback() {
-        let dir = temp_dir();
-        // Make `network reload` fail — the classic "apply severed connectivity"
-        // case the watchdog exists for.
-        let runner = RecordingRunner::with_responder(|prog, args| {
-            if prog == "/etc/init.d/network" && args == ["reload"] {
-                Err(ProvisionError::Apply("network reload failed".into()))
-            } else {
-                Ok(Vec::new())
-            }
-        });
-        let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let err = m.apply(&uci::render_uci(&spec(), 8080), false, "radio0").await.unwrap_err();
-        assert!(matches!(err, ProvisionError::Apply(_)));
-    }
-
-    #[tokio::test]
-    async fn marker_roundtrips_through_tmpfs() {
-        let dir = temp_dir();
-        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
-        let mut snap = Snapshot {
-            existing_sections: vec!["network.hotspot".into()],
-            ..Default::default()
-        };
-        snap.prior.insert("network.hotspot.ipaddr".into(), "10.9.9.1".into());
-        let marker = PendingMarker {
-            provision_id: "prov-1".into(),
-            was_teardown: false,
-            bridge_name: "br-hotspot".into(),
-            radio: "radio1".into(),
-            deadline_unix: 1_700_000_000,
-            snapshot: snap,
-        };
-        assert!(m.read_marker().await.unwrap().is_none());
-        m.write_marker(&marker).await.unwrap();
-        let read = m.read_marker().await.unwrap().unwrap();
-        assert_eq!(read, marker);
-        m.clear_marker().await.unwrap();
-        assert!(m.read_marker().await.unwrap().is_none());
     }
 
     #[test]
@@ -649,13 +446,111 @@ mod tests {
         assert_eq!(unquote("interface"), "interface");
     }
 
+    // --- CP-managed wireless (P-W1) ----------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_wireless_captures_only_pc_sections() {
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args.first() == Some(&"show") {
+                let cfg = args.get(1).copied().unwrap_or("");
+                let body = match cfg {
+                    "network" => "network.lan=interface\nnetwork.pc_public_if=interface\nnetwork.pc_public_if.ipaddr='10.0.0.1'\n",
+                    "wireless" => "wireless.wifi_admin=wifi-iface\nwireless.pc_public_ap0=wifi-iface\nwireless.pc_public_ap0.device='radio0'\n",
+                    _ => "",
+                };
+                Ok(body.as_bytes().to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let snap = m.snapshot_wireless().await.unwrap();
+        // pc_* captured; lan / admin NOT.
+        assert!(snap.prior.contains_key("network.pc_public_if"));
+        assert_eq!(snap.prior.get("network.pc_public_if.ipaddr").map(String::as_str), Some("10.0.0.1"));
+        assert!(snap.prior.contains_key("wireless.pc_public_ap0"));
+        assert!(!snap.prior.keys().any(|k| k.starts_with("network.lan")));
+        assert!(!snap.prior.keys().any(|k| k.starts_with("wireless.wifi_admin")));
+        // section decls recorded
+        assert!(snap.existing_sections.iter().any(|s| s == "network.pc_public_if"));
+        assert!(snap.existing_sections.iter().any(|s| s == "wireless.pc_public_ap0"));
+        // radios extracted for the reload set
+        assert_eq!(snapshot_radios(&snap), vec!["radio0".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn apply_wireless_reloads_each_radio_scoped() {
+        let dir = temp_dir();
+        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
+        m.apply_wireless(&[], false, &["radio0".to_string(), "radio1".to_string()]).await.unwrap();
+        let flat = m.runner().flat();
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio1".to_string())));
+        // NEVER a bare `wifi reload` (all radios).
+        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
+        // network reload precedes firewall reload.
+        let net = flat.iter().position(|(p, a)| p == "/etc/init.d/network" && a == "reload").unwrap();
+        let fw = flat.iter().position(|(p, a)| p == "/etc/init.d/firewall" && a == "reload").unwrap();
+        assert!(net < fw);
+    }
+
+    #[tokio::test]
+    async fn rollback_to_deletes_added_and_restores_prior() {
+        let dir = temp_dir();
+        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
+        // Pre-existing: pc_home_if (restore). After apply, current = pc_public_* + pc_home_if.
+        let mut snap = Snapshot {
+            existing_sections: vec!["network.pc_home_if".to_string()],
+            ..Default::default()
+        };
+        snap.prior.insert("network.pc_home_if".to_string(), "interface".to_string());
+        snap.prior.insert("network.pc_home_if.ipaddr".to_string(), "10.1.0.1".to_string());
+        let current = vec![
+            "network.pc_public_dev".to_string(),
+            "network.pc_public_if".to_string(),
+            "network.pc_home_if".to_string(),
+        ];
+        m.rollback_to(&snap, &current, &["radio0".to_string()]).await.unwrap();
+        let flat = m.runner().flat();
+        // Added sections deleted; the pre-existing one is NOT deleted, its value restored.
+        assert!(flat.contains(&("uci".to_string(), "delete network.pc_public_dev".to_string())));
+        assert!(flat.contains(&("uci".to_string(), "delete network.pc_public_if".to_string())));
+        assert!(!flat.contains(&("uci".to_string(), "delete network.pc_home_if".to_string())));
+        assert!(flat.contains(&("uci".to_string(), "set network.pc_home_if.ipaddr=10.1.0.1".to_string())));
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
+    }
+
+    #[tokio::test]
+    async fn wireless_marker_roundtrips_through_tmpfs() {
+        let dir = temp_dir();
+        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
+        let mut snap = Snapshot {
+            existing_sections: vec!["network.pc_home_if".into()],
+            ..Default::default()
+        };
+        snap.prior.insert("network.pc_home_if.ipaddr".into(), "10.1.0.1".into());
+        let marker = WirelessMarker {
+            config_version: "cfg-7".into(),
+            radios: vec!["radio0".into(), "radio1".into()],
+            current_sections: vec!["network.pc_public_if".into(), "network.pc_public_dev".into()],
+            deadline_unix: 1_700_000_000,
+            snapshot: snap,
+        };
+        assert!(m.read_wireless_marker().await.unwrap().is_none());
+        m.write_wireless_marker(&marker).await.unwrap();
+        assert_eq!(m.read_wireless_marker().await.unwrap().unwrap(), marker);
+        m.clear_wireless_marker().await.unwrap();
+        assert!(m.read_wireless_marker().await.unwrap().is_none());
+    }
+
     #[test]
-    fn is_owned_key_guards_the_allowlist() {
-        assert!(is_owned_key("network.hotspot"));
-        assert!(is_owned_key("network.hotspot.ipaddr"));
-        assert!(is_owned_key("dhcp.hotspot.start"));
-        assert!(!is_owned_key("network.lan"));
-        assert!(!is_owned_key("network.lan.proto"));
-        assert!(!is_owned_key("firewall.zone"));
+    fn reload_sequence_multi_scopes_each_radio() {
+        let seq = reload_sequence_multi(&["radio0".to_string(), "radio1".to_string()]);
+        assert_eq!(seq[0].0, "/etc/init.d/network");
+        assert_eq!(seq[1].0, "/etc/init.d/firewall");
+        assert_eq!(seq[2], ("/sbin/wifi", vec!["reload".to_string(), "radio0".to_string()]));
+        assert_eq!(seq[3], ("/sbin/wifi", vec!["reload".to_string(), "radio1".to_string()]));
+        assert_eq!(seq[4].0, "/etc/init.d/dnsmasq");
     }
 }

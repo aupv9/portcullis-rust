@@ -61,13 +61,17 @@ pub struct IpsetIptablesBackend {
     /// Port the tcp:80 REDIRECT sends to — MUST equal the responder's listen
     /// port so the hijacked request reaches the portcullis responder.
     redirect_port: u16,
-    /// The hotspot interface enforcement is scoped to (P0). `Some("br-hotspot")`
-    /// → the FORWARD/PREROUTING jumps carry `-i <iface>` so ONLY that ingress is
-    /// gated (br-lan untouched). `None`/empty → the jumps are NOT installed at
-    /// all (fail-OPEN — nothing to gate; NEVER blanket-block the whole router).
-    /// The `wifihub_fwd`/`wifihub_pre` chains + auth/garden sets are still
-    /// created either way (kernel-as-truth adoption keeps working).
-    hotspot_iface: Option<String>,
+    /// The interfaces enforcement is scoped to (P-W1 — the `gated=true` SSIDs).
+    /// For EACH, the FORWARD/PREROUTING jumps carry `-i <iface>` so ONLY those
+    /// ingresses are gated (br-lan untouched). Empty → NO jump is installed at all
+    /// (fail-OPEN — nothing to gate; NEVER blanket-block the whole router). The
+    /// `wifihub_fwd`/`wifihub_pre` chains + auth/garden sets are still created
+    /// either way (kernel-as-truth adoption keeps working).
+    ///
+    /// Behind a `Mutex` so [`set_gated_ifaces`](FirewallBackend::set_gated_ifaces)
+    /// can re-scope at runtime (the single writer actor serializes calls; the lock
+    /// is held only briefly, never across an await).
+    gated_ifaces: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for IpsetIptablesBackend {
@@ -79,7 +83,7 @@ impl Default for IpsetIptablesBackend {
                 ("ip6tables".to_string(), IPSET_G6.to_string()),
             ],
             redirect_port: REDIRECT_PORT,
-            hotspot_iface: None,
+            gated_ifaces: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -92,16 +96,12 @@ impl IpsetIptablesBackend {
         self
     }
 
-    /// Scope enforcement to the hotspot interface (P0). An empty string means
-    /// "not scoped" → the interface-scoped FORWARD/PREROUTING jumps are omitted
-    /// (fail-OPEN). Pass the daemon's configured `hotspot_iface`.
-    pub fn with_hotspot_iface(mut self, iface: impl Into<String>) -> Self {
-        let iface = iface.into();
-        self.hotspot_iface = if iface.trim().is_empty() {
-            None
-        } else {
-            Some(iface)
-        };
+    /// Scope enforcement to a set of gated-SSID interfaces (P-W1). Blank entries
+    /// are dropped; an empty resulting set means "not scoped" → the FORWARD/
+    /// PREROUTING jumps are omitted (fail-OPEN).
+    pub fn with_gated_ifaces(self, ifaces: Vec<String>) -> Self {
+        *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") =
+            ifaces.into_iter().filter(|s| !s.trim().is_empty()).collect();
         self
     }
 
@@ -119,7 +119,7 @@ impl IpsetIptablesBackend {
                 (ip6tables_bin.into(), IPSET_G6.to_string()),
             ],
             redirect_port: REDIRECT_PORT,
-            hotspot_iface: None,
+            gated_ifaces: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -186,10 +186,10 @@ impl IpsetIptablesBackend {
     /// ensure a single jump into it from `hook` at position 1. `table` is
     /// `"nat"` or `"filter"`. Idempotent; safe to re-run.
     ///
-    /// P0 interface scoping: when `iface` is `Some(name)` the jump carries
-    /// `-i <name>` so ONLY ingress from the hotspot SSID is gated (br-lan and
-    /// every other interface fall straight through to fw3). When `iface` is
-    /// `None` the jump is **not installed at all** (fail-OPEN — nothing to gate;
+    /// Interface scoping (P-W1): for EACH gated iface the jump carries
+    /// `-i <iface>` so ONLY ingress from that gated SSID reaches the chain
+    /// (br-lan and every other interface fall straight through to fw3). When
+    /// `ifaces` is empty NO jump is installed at all (fail-OPEN — nothing to gate;
     /// NEVER blanket-block the whole router). The chain itself is always created
     /// and populated so kernel-as-truth adoption keeps working.
     async fn ensure_chain(
@@ -198,7 +198,7 @@ impl IpsetIptablesBackend {
         chain: &str,
         hook: &str,
         rules: &[Vec<&str>],
-        iface: Option<&str>,
+        ifaces: &[String],
     ) -> Result<()> {
         // Create the chain if missing (ignore "already exists"), then flush so
         // the rule set below is authoritative. Flushing touches only our own
@@ -212,19 +212,19 @@ impl IpsetIptablesBackend {
             Self::run(ipt, &args).await?;
         }
 
-        // Ensure exactly one interface-scoped jump hook -> chain, inserted ahead
-        // of fw3 (pos 1). The chain is fully populated (drop-terminated) before
-        // the jump is added, so first-boot never has a fail-open window.
+        // Ensure one interface-scoped jump hook -> chain PER gated iface, inserted
+        // ahead of fw3 (pos 1). The chain is fully populated (drop-terminated)
+        // before any jump is added, so first-boot never has a fail-open window.
         //
-        // With no hotspot_iface configured we deliberately install NO jump: the
-        // gating chain exists (adoption works) but nothing reaches it, so the
-        // whole router — including br-lan — is untouched (the P0 fail-OPEN case).
-        let Some(iface) = iface else {
-            return Ok(());
-        };
-        let check = ["-t", table, "-C", hook, "-i", iface, "-j", chain];
-        if !Self::run_ok(ipt, &check).await {
-            Self::run(ipt, &["-t", table, "-I", hook, "1", "-i", iface, "-j", chain]).await?;
+        // With no gated ifaces we deliberately install NO jump: the gating chain
+        // exists (adoption works) but nothing reaches it, so the whole router —
+        // including br-lan — is untouched (the fail-OPEN case).
+        for iface in ifaces {
+            let iface = iface.as_str();
+            let check = ["-t", table, "-C", hook, "-i", iface, "-j", chain];
+            if !Self::run_ok(ipt, &check).await {
+                Self::run(ipt, &["-t", table, "-I", hook, "1", "-i", iface, "-j", chain]).await?;
+            }
         }
         Ok(())
     }
@@ -255,15 +255,16 @@ impl FirewallBackend for IpsetIptablesBackend {
         //    set differs. The FORWARD/PREROUTING jumps into these chains are
         //    scoped to `hotspot_iface` (P0); with no iface configured they are
         //    not installed at all (fail-OPEN — see below).
-        let iface = self.hotspot_iface.as_deref();
-        if iface.is_none() {
+        let ifaces = self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned").clone();
+        if ifaces.is_empty() {
             tracing::warn!(
                 target: "portcullis_nft",
-                "no hotspot_iface configured: enforcement is INERT — the wifihub_fwd/wifihub_pre \
+                "no gated ifaces configured: enforcement is INERT — the wifihub_fwd/wifihub_pre \
                  chains + sets are created but NOT jumped from FORWARD/PREROUTING (nothing gated; \
-                 br-lan and the whole router are untouched). Set hotspot_iface to gate the SSID."
+                 br-lan and the whole router are untouched). Gate at least one SSID iface to enforce."
             );
         }
+        let ifaces = ifaces.as_slice();
         let port = self.redirect_port.to_string();
         for (ipt, gset) in &self.tables {
             // nat prerouting: exempt authed + garden, else redirect :80 -> :8080.
@@ -274,7 +275,7 @@ impl FirewallBackend for IpsetIptablesBackend {
                     "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", &port,
                 ],
             ];
-            Self::ensure_chain(ipt, "nat", CHAIN_NAT, "PREROUTING", &nat_rules, iface).await?;
+            Self::ensure_chain(ipt, "nat", CHAIN_NAT, "PREROUTING", &nat_rules, ifaces).await?;
 
             // filter forward: pre-filter that only DROPs unauth non-garden new
             // traffic; everything else RETURNs and falls through to fw3.
@@ -286,7 +287,7 @@ impl FirewallBackend for IpsetIptablesBackend {
                 vec!["-m", "set", "--match-set", gset, "dst", "-j", "RETURN"],
                 vec!["-j", "DROP"],
             ];
-            Self::ensure_chain(ipt, "filter", CHAIN_FWD, "FORWARD", &fwd_rules, iface).await?;
+            Self::ensure_chain(ipt, "filter", CHAIN_FWD, "FORWARD", &fwd_rules, ifaces).await?;
         }
         Ok(())
     }
@@ -312,6 +313,44 @@ impl FirewallBackend for IpsetIptablesBackend {
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         let out = Self::run_stdout(&self.ipset_bin, &["list", IPSET_AUTH]).await?;
         Ok(parse_ipset_list(&out))
+    }
+
+    async fn set_gated_ifaces(&self, ifaces: Vec<String>) -> Result<()> {
+        let filtered: Vec<String> =
+            ifaces.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        let old = self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned").clone();
+
+        // Re-scope by touching ONLY the FORWARD/PREROUTING jumps — never the
+        // chains' static rules, never the sets. The chains already exist and are
+        // drop-terminated (ensure_base ran at boot), so:
+        //  - a SURVIVING iface (in both old & new) keeps its jump installed the
+        //    whole time — NO fail-open window (unlike flushing the chain);
+        //  - a DE-scoped iface (old \ new) loses its jump → stops being gated;
+        //  - a NEWLY-gated iface (new \ old) gets a jump into the already-populated
+        //    chain → gated immediately, no window.
+        // Remove de-scoped jumps first (best-effort; a missing jump is fine).
+        for iface in old.iter().filter(|o| !filtered.contains(o)) {
+            for (ipt, _g) in &self.tables {
+                let _ = Self::run_ok(ipt, &["-t", "nat", "-D", "PREROUTING", "-i", iface, "-j", CHAIN_NAT]).await;
+                let _ = Self::run_ok(ipt, &["-t", "filter", "-D", "FORWARD", "-i", iface, "-j", CHAIN_FWD]).await;
+            }
+        }
+        // Add newly-gated jumps (idempotent: `-C` guard before `-I` at pos 1).
+        for iface in filtered.iter().filter(|f| !old.contains(f)) {
+            for (ipt, _g) in &self.tables {
+                if !Self::run_ok(ipt, &["-t", "nat", "-C", "PREROUTING", "-i", iface, "-j", CHAIN_NAT]).await {
+                    Self::run(ipt, &["-t", "nat", "-I", "PREROUTING", "1", "-i", iface, "-j", CHAIN_NAT]).await?;
+                }
+                if !Self::run_ok(ipt, &["-t", "filter", "-C", "FORWARD", "-i", iface, "-j", CHAIN_FWD]).await {
+                    Self::run(ipt, &["-t", "filter", "-I", "FORWARD", "1", "-i", iface, "-j", CHAIN_FWD]).await?;
+                }
+            }
+        }
+        // Publish the new set only AFTER the jump changes applied cleanly, so the
+        // in-RAM record always matches the kernel (fail-safe on a mid-apply error:
+        // the record stays on `old`).
+        *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") = filtered;
+        Ok(())
     }
 }
 
@@ -439,7 +478,7 @@ zz:zz:zz:zz:zz:zz timeout 5
         let (ipset, _id) = fake_ipset("scope-set");
         let (ipt, ilog, _iid) = fake_iptables("scope-set");
         let backend = IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt)
-            .with_hotspot_iface("br-hotspot");
+            .with_gated_ifaces(vec!["br-hotspot".to_string()]);
         backend.ensure_base().await.unwrap();
 
         let jumps = jump_inserts(&ilog);
@@ -463,6 +502,50 @@ zz:zz:zz:zz:zz:zz timeout 5
     }
 
     #[tokio::test]
+    async fn ensure_base_installs_one_jump_per_gated_iface() {
+        // P-W1: two gated ifaces → one FORWARD + one PREROUTING jump PER iface
+        // PER family = 2 ifaces * 2 hooks * 2 families = 8 jumps, each `-i <iface>`.
+        let (ipset, _id) = fake_ipset("multi-set");
+        let (ipt, ilog, _iid) = fake_iptables("multi-set");
+        let backend = IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt)
+            .with_gated_ifaces(vec!["br-public".to_string(), "br-guest".to_string()]);
+        backend.ensure_base().await.unwrap();
+
+        let jumps = jump_inserts(&ilog);
+        // FORWARD jumps: 2 ifaces * 2 families.
+        let fwd: Vec<&String> = jumps.iter().filter(|l| l.contains(CHAIN_FWD)).collect();
+        let pre: Vec<&String> = jumps.iter().filter(|l| l.contains(CHAIN_NAT)).collect();
+        assert_eq!(fwd.len(), 4, "one FORWARD jump per iface per family: {jumps:?}");
+        assert_eq!(pre.len(), 4, "one PREROUTING jump per iface per family: {jumps:?}");
+        // Each gated iface appears in a scoped FORWARD jump.
+        assert!(fwd.iter().any(|l| l.contains("-i br-public -j wifihub_fwd")));
+        assert!(fwd.iter().any(|l| l.contains("-i br-guest -j wifihub_fwd")));
+        assert!(pre.iter().any(|l| l.contains("-i br-public -j wifihub_pre")));
+        assert!(pre.iter().any(|l| l.contains("-i br-guest -j wifihub_pre")));
+    }
+
+    #[tokio::test]
+    async fn set_gated_ifaces_removes_old_jumps_and_adds_new() {
+        // P-W1 runtime re-scope: from br-a to br-b — the old iface's jumps are
+        // deleted (both hooks, both families) and the new iface's jumps installed.
+        let (ipset, _id) = fake_ipset("rescope");
+        let (ipt, ilog, _iid) = fake_iptables("rescope");
+        let backend = IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt)
+            .with_gated_ifaces(vec!["br-a".to_string()]);
+        backend.set_gated_ifaces(vec!["br-b".to_string()]).await.unwrap();
+
+        let all = lines(&ilog);
+        // Old iface's jumps removed (best-effort -D, both hooks).
+        assert!(all.iter().any(|l| l.contains("-D PREROUTING -i br-a -j wifihub_pre")));
+        assert!(all.iter().any(|l| l.contains("-D FORWARD -i br-a -j wifihub_fwd")));
+        // New iface's jumps installed; the old iface is never re-added.
+        let jumps = jump_inserts(&ilog);
+        assert!(jumps.iter().any(|l| l.contains("-i br-b -j wifihub_fwd")));
+        assert!(jumps.iter().any(|l| l.contains("-i br-b -j wifihub_pre")));
+        assert!(!jumps.iter().any(|l| l.contains("-i br-a")));
+    }
+
+    #[tokio::test]
     async fn ensure_base_omits_jumps_when_iface_unset_but_builds_chains() {
         // P0 fail-OPEN: with NO hotspot_iface, install NO FORWARD/PREROUTING
         // jump (never blanket-block the whole router) — but the chains + their
@@ -470,8 +553,8 @@ zz:zz:zz:zz:zz:zz timeout 5
         let (ipset, _id) = fake_ipset("scope-unset");
         let (ipt, ilog, _iid) = fake_iptables("scope-unset");
         // Default backend has no iface; be explicit that empty == unset too.
-        let backend =
-            IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt).with_hotspot_iface("");
+        let backend = IpsetIptablesBackend::with_bins(&ipset, &ipt, &ipt)
+            .with_gated_ifaces(vec!["".to_string()]);
         backend.ensure_base().await.unwrap();
 
         // No jump was inserted at all.

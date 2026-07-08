@@ -2,7 +2,7 @@
 //! [`Provisioner`]) that sends commands over an mpsc to a single owner task
 //! ([`run_provision_subsystem`]), mirroring the nft writer-actor shape. The task
 //! owns the [`ProvisionMachine`] + the commit-confirm watchdog and emits
-//! [`ProvisionStatus`] upward on a bounded channel that `portcullis-control` fans
+//! `WirelessStatus` upward on a bounded channel that `portcullis-control` fans
 //! into outbound `EngineFrame`s.
 //!
 //! ## Isolation (guardrail)
@@ -19,12 +19,14 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use portcullis_types::{ProvisionError, ProvisionSpec, ProvisionState, ProvisionStatus, Provisioner};
+use portcullis_types::{
+    ProvisionError, ProvisionState, Provisioner, SsidResult, WirelessDesiredState, WirelessStatus,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::runner::CommandRunner;
-use crate::sm::{self, PendingMarker, ProvisionMachine, Snapshot};
+use crate::sm::{self, ProvisionMachine, Snapshot, WirelessMarker};
 use crate::uci;
 
 /// Bound on the command channel — provision commands are rare (a handful of CP
@@ -35,13 +37,16 @@ const STATUS_BUFFER: usize = 16;
 
 /// A command sent to the provision actor, carrying its reply channel.
 enum Command {
-    Provision {
-        spec: Box<ProvisionSpec>,
+    Set {
+        state: Box<WirelessDesiredState>,
         reply: oneshot::Sender<Result<(), ProvisionError>>,
     },
     Confirm {
-        provision_id: String,
+        config_version: String,
         reply: oneshot::Sender<Result<(), ProvisionError>>,
+    },
+    Get {
+        reply: oneshot::Sender<Result<WirelessDesiredState, ProvisionError>>,
     },
 }
 
@@ -65,284 +70,365 @@ impl ProvisionHandle {
             .await
             .map_err(|_| ProvisionError::Unavailable("provision actor dropped reply".into()))?
     }
+
+    /// The `get_wireless` variant of [`call`](Self::call): its reply carries a
+    /// [`WirelessDesiredState`], not `()`.
+    async fn call_get_wireless(&self) -> Result<WirelessDesiredState, ProvisionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Get { reply: reply_tx })
+            .await
+            .map_err(|_| ProvisionError::Unavailable("provision actor is gone".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ProvisionError::Unavailable("provision actor dropped reply".into()))?
+    }
 }
 
 #[async_trait]
 impl Provisioner for ProvisionHandle {
-    async fn provision(&self, spec: ProvisionSpec) -> Result<(), ProvisionError> {
-        self.call(|reply| Command::Provision { spec: Box::new(spec), reply }).await
+    async fn set_wireless(&self, state: WirelessDesiredState) -> Result<(), ProvisionError> {
+        self.call(|reply| Command::Set { state: Box::new(state), reply }).await
     }
 
-    async fn confirm(&self, provision_id: &str) -> Result<(), ProvisionError> {
-        let id = provision_id.to_string();
-        self.call(|reply| Command::Confirm { provision_id: id, reply }).await
+    async fn confirm_wireless(&self, config_version: &str) -> Result<(), ProvisionError> {
+        let v = config_version.to_string();
+        self.call(|reply| Command::Confirm { config_version: v, reply }).await
+    }
+
+    async fn get_wireless(&self) -> Result<WirelessDesiredState, ProvisionError> {
+        self.call_get_wireless().await
     }
 }
 
-/// The pending commit-confirm state held by the actor while a provision awaits
-/// confirmation.
-struct Pending {
-    provision_id: String,
-    bridge_name: String,
-    was_teardown: bool,
-    /// The hotspot's wifi-device — the watchdog rollback reloads ONLY this radio,
-    /// so the admin/control-plane radio never bounces.
-    radio: String,
-    /// Watchdog deadline (monotonic).
+/// The pending commit-confirm state for a CP-managed wireless push (P-W1):
+/// carries the multi-radio reload set, the owned sections present after apply
+/// (for the rollback delete), the per-SSID results (echoed in status), and the
+/// desired state (cached as last-committed on confirm).
+struct WirelessPending {
+    config_version: String,
+    radios: Vec<String>,
+    current_sections: Vec<String>,
+    per_ssid: Vec<SsidResult>,
     deadline: Instant,
-    /// The pre-apply snapshot to restore on rollback.
     snapshot: Snapshot,
+    desired: WirelessDesiredState,
 }
 
 /// Spawn the provision subsystem. Returns:
 /// - a cloneable [`ProvisionHandle`] to pass into the control channel;
-/// - an mpsc [`Receiver`](mpsc::Receiver) of [`ProvisionStatus`] the composition
-///   root fans into outbound `EngineFrame`s (unsolicited on watchdog rollback);
+/// - an mpsc [`Receiver`](mpsc::Receiver) of [`WirelessStatus`] (P-W1), fanned by
+///   the composition root into outbound `EngineFrame`s (unsolicited on watchdog
+///   rollback);
 /// - the actor's [`JoinHandle`](tokio::task::JoinHandle) (abort on shutdown).
 ///
 /// `state_dir` is the tmpfs directory ([`sm::DEFAULT_STATE_DIR`] on-device).
 /// `responder_port` is the portcullis :8080 redirect responder port
-/// ([`portcullis_config::Config::responder_port`]) — opened by the
-/// `firewall.hotspot_portal` rule so pre-auth guests can reach the captive
-/// redirect. On startup the actor reconciles any leftover pending marker (crash
-/// recovery) before serving commands.
+/// ([`portcullis_config::Config::responder_port`]) — opened by the portal
+/// firewall rule so pre-auth guests can reach the captive redirect. On startup
+/// the actor reconciles any leftover wireless marker before serving commands.
 pub fn run_provision_subsystem<R>(
     runner: R,
     state_dir: impl Into<std::path::PathBuf>,
     responder_port: u16,
-) -> (
-    ProvisionHandle,
-    mpsc::Receiver<ProvisionStatus>,
-    tokio::task::JoinHandle<()>,
-)
+) -> (ProvisionHandle, mpsc::Receiver<WirelessStatus>, tokio::task::JoinHandle<()>)
 where
     R: CommandRunner + 'static,
 {
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
-    let (status_tx, status_rx) = mpsc::channel(STATUS_BUFFER);
+    let (wireless_status_tx, wireless_status_rx) = mpsc::channel(STATUS_BUFFER);
     let machine = ProvisionMachine::new(runner, state_dir, responder_port);
-    let actor = ProvisionActor { machine, cmd_rx, status_tx, pending: None };
+    let actor = ProvisionActor {
+        machine,
+        cmd_rx,
+        wireless_status_tx,
+        pending_wireless: None,
+        last_committed: None,
+    };
     let join = tokio::spawn(actor.run());
-    (ProvisionHandle { tx: cmd_tx }, status_rx, join)
+    (ProvisionHandle { tx: cmd_tx }, wireless_status_rx, join)
 }
 
 /// The single-owner actor.
 struct ProvisionActor<R: CommandRunner> {
     machine: ProvisionMachine<R>,
     cmd_rx: mpsc::Receiver<Command>,
-    status_tx: mpsc::Sender<ProvisionStatus>,
-    pending: Option<Pending>,
+    wireless_status_tx: mpsc::Sender<WirelessStatus>,
+    pending_wireless: Option<WirelessPending>,
+    /// Last COMMITTED wireless desired-state (served by `get_wireless`).
+    last_committed: Option<WirelessDesiredState>,
 }
 
 impl<R: CommandRunner> ProvisionActor<R> {
     async fn run(mut self) {
-        // Crash-recovery reconcile: an unconfirmed provision from a previous
-        // process incarnation. If its deadline has already passed, roll back
-        // NOW; otherwise resume the watchdog for the remaining window.
-        self.reconcile_on_start().await;
+        // Crash-recovery reconcile: an unconfirmed wireless push from a previous
+        // process incarnation. Past deadline → roll back NOW; still within the
+        // window → resume the watchdog for the remainder.
+        self.reconcile_wireless_on_start().await;
 
         loop {
-            // Compute the current watchdog sleep (if a provision is pending).
-            let sleep = self.pending.as_ref().map(|p| tokio::time::sleep_until(p.deadline));
+            // Watchdog sleep: armed only while a push is pending confirmation.
+            let wl_sleep =
+                self.pending_wireless.as_ref().map(|p| tokio::time::sleep_until(p.deadline));
 
             tokio::select! {
                 cmd = self.cmd_rx.recv() => match cmd {
-                    Some(Command::Provision { spec, reply }) => {
-                        let r = self.handle_provision(*spec).await;
+                    Some(Command::Set { state, reply }) => {
+                        let r = self.handle_set_wireless(*state).await;
                         let _ = reply.send(r);
                     }
-                    Some(Command::Confirm { provision_id, reply }) => {
-                        let r = self.handle_confirm(&provision_id).await;
+                    Some(Command::Confirm { config_version, reply }) => {
+                        let r = self.handle_confirm_wireless(&config_version).await;
                         let _ = reply.send(r);
+                    }
+                    Some(Command::Get { reply }) => {
+                        let _ = reply.send(Ok(self.last_committed.clone().unwrap_or_default()));
                     }
                     None => break, // all handles dropped -> shut down
                 },
-                // Only armed when a provision is pending.
-                _ = maybe_sleep(sleep) => {
-                    self.handle_watchdog_fire().await;
+                // Only armed when a push is pending confirmation.
+                _ = maybe_sleep(wl_sleep) => {
+                    self.handle_wireless_watchdog_fire().await;
                 }
             }
         }
     }
 
-    /// Validate → snapshot → apply → arm watchdog. Returns once APPLIED_PENDING.
-    async fn handle_provision(&mut self, spec: ProvisionSpec) -> Result<(), ProvisionError> {
-        // Validate FIRST — nothing is written for a bad spec (fail-OPEN reject).
-        uci::validate(&spec)?;
+    // --- CP-managed wireless (P-W1) ---------------------------------------
 
-        // If a provision is already pending, treat the new one as superseding:
-        // we cannot honour two watchdogs. Reject rather than silently clobber the
-        // in-flight rollback safety net.
-        if let Some(p) = &self.pending {
-            return Err(ProvisionError::Invalid(format!(
-                "a provision ({}) is already pending confirmation; confirm or await its watchdog first",
-                p.provision_id
-            )));
+    /// Per-SSID results (one `ok` row per desired SSID; `iface` = its bridge,
+    /// which feeds enforcement scoping when the SSID is gated).
+    fn ssid_results(state: &WirelessDesiredState) -> Vec<SsidResult> {
+        state
+            .ssids
+            .iter()
+            .map(|s| SsidResult {
+                slug: s.slug.clone(),
+                ok: true,
+                message: String::new(),
+                iface: s.bridge_name.clone(),
+            })
+            .collect()
+    }
+
+    /// Validate → snapshot → reconcile (delete pre-existing owned sections, then
+    /// set the desired) → apply + multi-radio reload → arm watchdog. Returns once
+    /// APPLIED_PENDING (COMMITTED / ROLLED_BACK arrives later as a status).
+    async fn handle_set_wireless(
+        &mut self,
+        state: WirelessDesiredState,
+    ) -> Result<(), ProvisionError> {
+        // Validate FIRST — a bad desired-state writes nothing (fail-OPEN reject).
+        uci::validate_wireless(&state)?;
+
+        // One pending push at a time — can't honour two watchdogs / rollback
+        // safety nets at once.
+        if self.pending_wireless.is_some() {
+            return Err(ProvisionError::Invalid(
+                "a wireless push is already pending confirmation; confirm or await its watchdog first".into(),
+            ));
         }
 
-        // The hotspot's radio: the SAME value render_uci uses for the wifi-iface
-        // device. Only this radio is reloaded (apply + any rollback), so a
-        // dual-band router's admin/control-plane radio never bounces.
-        let radio = uci::effective_radio(&spec).to_string();
+        // Snapshot the CURRENT owned wireless state (pre-apply).
+        let snapshot = self.machine.snapshot_wireless().await?;
 
-        // Snapshot the owned sections BEFORE touching anything.
-        let snapshot = self.machine.snapshot().await?;
-
-        // Render the batch: enable => set batch (opening the portal firewall rule
-        // on the local responder port); teardown => delete batch (deletes tolerate
-        // a missing section).
-        let (cmds, allow_missing_delete) = if spec.enabled {
-            (uci::render_uci(&spec, self.machine.responder_port()), false)
-        } else {
-            (uci::render_teardown(), true)
-        };
-
-        // Apply + commit + reload. On ANY failure, roll back immediately and
-        // report FAILED — never leave a half-applied config on a CGNAT router.
-        if let Err(e) = self.machine.apply(&cmds, allow_missing_delete, &radio).await {
-            tracing::warn!(provision_id = %spec.provision_id, error = %e, "apply failed; rolling back");
-            if let Err(re) = self.machine.rollback(&snapshot, &radio).await {
-                tracing::error!(provision_id = %spec.provision_id, error = %re, "rollback after failed apply ALSO failed");
+        // Reload set = desired radios ∪ prior radios (so a removed SSID's radio
+        // reloads too). Never empty (fall back to the default radio).
+        let mut radios: Vec<String> = Vec::new();
+        for ssid in &state.ssids {
+            for r in uci::effective_radios(ssid) {
+                if !radios.iter().any(|x| x == r) {
+                    radios.push(r.to_string());
+                }
             }
-            let _ = self.machine.clear_marker().await;
-            self.emit(sm::status(&spec.provision_id, ProvisionState::Failed, e.to_string(), &spec.bridge_name)).await;
+        }
+        for r in sm::snapshot_radios(&snapshot) {
+            if !radios.contains(&r) {
+                radios.push(r);
+            }
+        }
+        if radios.is_empty() {
+            radios.push(uci::DEFAULT_RADIO.to_string());
+        }
+
+        // Declarative reconcile: delete EVERY pre-existing owned section, then set
+        // the desired ones. Delete-then-set avoids stale options / orphan `ap{i}`
+        // sections lingering when an SSID shrinks its radio set or drops an option.
+        let sets = uci::render_wireless(&state, self.machine.responder_port());
+        let current_sections = uci::section_decls(&sets);
+        let mut batch = uci::render_deletes(&snapshot.existing_sections);
+        batch.extend(sets);
+
+        // Apply + commit + multi-radio reload. On ANY failure, roll back and
+        // report FAILED — never leave a half-applied config on a CGNAT router.
+        if let Err(e) = self.machine.apply_wireless(&batch, true, &radios).await {
+            tracing::warn!(config_version = %state.config_version, error = %e, "wireless apply failed; rolling back");
+            if let Err(re) = self.machine.rollback_to(&snapshot, &current_sections, &radios).await {
+                tracing::error!(config_version = %state.config_version, error = %re, "wireless rollback after failed apply ALSO failed");
+            }
+            let _ = self.machine.clear_wireless_marker().await;
+            self.emit_wireless(sm::wireless_status(
+                &state.config_version,
+                ProvisionState::Failed,
+                Self::ssid_results(&state),
+                e.to_string(),
+            ))
+            .await;
             return Err(e);
         }
 
-        // Arm the LOCAL watchdog + persist the pending marker (tmpfs) so a restart
+        // Arm the LOCAL watchdog + persist the marker (tmpfs) so a restart
         // mid-window still honours the confirm/rollback.
-        let window = sm::confirm_window(&spec);
+        let window = sm::confirm_window_secs(state.confirm_timeout_secs);
         let deadline = Instant::now() + window;
         let deadline_unix = unix_now() + window.as_secs() as i64;
-
-        let marker = PendingMarker {
-            provision_id: spec.provision_id.clone(),
-            was_teardown: !spec.enabled,
-            bridge_name: spec.bridge_name.clone(),
-            radio: radio.clone(),
+        let marker = WirelessMarker {
+            config_version: state.config_version.clone(),
+            radios: radios.clone(),
+            current_sections: current_sections.clone(),
             deadline_unix,
             snapshot: snapshot.clone(),
         };
-        if let Err(e) = self.machine.write_marker(&marker).await {
-            // Marker persistence is best-effort for crash recovery only — the
-            // in-RAM watchdog still fires. Log and continue (do NOT fail the
-            // apply, which already succeeded).
-            tracing::warn!(provision_id = %spec.provision_id, error = %e, "could not persist pending marker (crash-recovery only)");
+        if let Err(e) = self.machine.write_wireless_marker(&marker).await {
+            tracing::warn!(config_version = %state.config_version, error = %e, "could not persist wireless marker (crash-recovery only)");
         }
 
-        self.pending = Some(Pending {
-            provision_id: spec.provision_id.clone(),
-            bridge_name: spec.bridge_name.clone(),
-            was_teardown: !spec.enabled,
-            radio,
-            deadline,
-            snapshot,
-        });
-
+        let per_ssid = Self::ssid_results(&state);
         tracing::info!(
-            provision_id = %spec.provision_id,
+            config_version = %state.config_version,
             window_secs = window.as_secs(),
-            teardown = !spec.enabled,
-            "provision applied; awaiting confirm (commit-confirm armed)"
+            ssids = state.ssids.len(),
+            "wireless applied; awaiting confirm (commit-confirm armed)"
         );
-        self.emit(sm::status(
-            &spec.provision_id,
+        self.emit_wireless(sm::wireless_status(
+            &state.config_version,
             ProvisionState::AppliedPending,
+            per_ssid.clone(),
             "applied; awaiting confirm",
-            &spec.bridge_name,
         ))
         .await;
+        self.pending_wireless = Some(WirelessPending {
+            config_version: state.config_version.clone(),
+            radios,
+            current_sections,
+            per_ssid,
+            deadline,
+            snapshot,
+            desired: state,
+        });
         Ok(())
     }
 
-    /// A confirm before the deadline commits the pending provision.
-    async fn handle_confirm(&mut self, provision_id: &str) -> Result<(), ProvisionError> {
-        match &self.pending {
-            Some(p) if p.provision_id == provision_id => {
-                let bridge = p.bridge_name.clone();
-                self.pending = None; // cancels the watchdog (sleep no longer armed)
-                let _ = self.machine.clear_marker().await;
-                tracing::info!(provision_id, "provision confirmed; committed permanently");
-                self.emit(sm::status(provision_id, ProvisionState::Committed, "confirmed", &bridge)).await;
+    /// A confirm before the deadline commits the pending wireless push and caches
+    /// it as the last-committed desired-state.
+    async fn handle_confirm_wireless(&mut self, config_version: &str) -> Result<(), ProvisionError> {
+        match self.pending_wireless.take() {
+            Some(p) if p.config_version == config_version => {
+                let _ = self.machine.clear_wireless_marker().await;
+                // Persist the committed gated-SSID ifaces (F2) so a daemon restart
+                // re-scopes enforcement before the CP reconnects. Best-effort.
+                let gated: Vec<String> = p
+                    .desired
+                    .ssids
+                    .iter()
+                    .filter(|s| s.gated)
+                    .map(|s| s.bridge_name.clone())
+                    .collect();
+                if let Err(e) = self.machine.write_committed_gated(&gated).await {
+                    tracing::warn!(error = %e, "could not persist committed gated ifaces (boot re-scope only)");
+                }
+                self.last_committed = Some(p.desired);
+                tracing::info!(config_version, "wireless push confirmed; committed permanently");
+                self.emit_wireless(sm::wireless_status(
+                    config_version,
+                    ProvisionState::Committed,
+                    p.per_ssid,
+                    "confirmed",
+                ))
+                .await;
                 Ok(())
             }
-            _ => Err(ProvisionError::NoPending(provision_id.to_string())),
+            // Not ours: put it back (take() removed it) and report no-pending.
+            other => {
+                self.pending_wireless = other;
+                Err(ProvisionError::NoPending(config_version.to_string()))
+            }
         }
     }
 
-    /// The watchdog fired without a confirm → roll back to the snapshot and emit
-    /// an UNSOLICITED RolledBack status.
-    async fn handle_watchdog_fire(&mut self) {
-        let Some(p) = self.pending.take() else { return };
+    /// Watchdog fired without a confirm → roll back to the snapshot and emit an
+    /// UNSOLICITED RolledBack status.
+    async fn handle_wireless_watchdog_fire(&mut self) {
+        let Some(p) = self.pending_wireless.take() else { return };
         tracing::warn!(
-            provision_id = %p.provision_id,
-            "commit-confirm watchdog fired without confirm; rolling back (CGNAT has no inbound rescue)"
+            config_version = %p.config_version,
+            "wireless commit-confirm watchdog fired without confirm; rolling back (CGNAT has no inbound rescue)"
         );
-        let (state, msg) = match self.machine.rollback(&p.snapshot, &p.radio).await {
+        let (state, msg) = match self.machine.rollback_to(&p.snapshot, &p.current_sections, &p.radios).await {
             Ok(()) => (ProvisionState::RolledBack, "watchdog expired; rolled back to snapshot".to_string()),
             Err(e) => {
-                tracing::error!(provision_id = %p.provision_id, error = %e, "watchdog rollback FAILED");
+                tracing::error!(config_version = %p.config_version, error = %e, "wireless watchdog rollback FAILED");
                 (ProvisionState::Failed, format!("watchdog rollback failed: {e}"))
             }
         };
-        let _ = self.machine.clear_marker().await;
-        // Report against the intent: a teardown that rolled back is back to the
-        // prior (enabled) bridge; an enable that rolled back has no bridge.
-        let bridge = if p.was_teardown { p.bridge_name.as_str() } else { "" };
-        self.emit(sm::status(&p.provision_id, state, msg, bridge)).await;
+        let _ = self.machine.clear_wireless_marker().await;
+        self.emit_wireless(sm::wireless_status(&p.config_version, state, p.per_ssid, msg)).await;
     }
 
-    /// On startup, honour a leftover pending marker from a crashed/restarted
-    /// process: past its deadline → roll back now; still within the window →
-    /// resume the watchdog for the remaining time.
-    async fn reconcile_on_start(&mut self) {
-        let marker = match self.machine.read_marker().await {
+    /// Honour a leftover wireless marker at startup: past deadline → roll back
+    /// now; still within the window → resume the watchdog for the remainder.
+    async fn reconcile_wireless_on_start(&mut self) {
+        let marker = match self.machine.read_wireless_marker().await {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(e) => {
-                tracing::warn!(error = %e, "could not read pending provision marker on start");
+                tracing::warn!(error = %e, "could not read wireless marker on start");
                 return;
             }
         };
-
         let now_unix = unix_now();
         if marker.deadline_unix <= now_unix {
-            // Deadline already passed while we were down → roll back on boot.
             tracing::warn!(
-                provision_id = %marker.provision_id,
-                "unconfirmed provision past its deadline at startup; rolling back"
+                config_version = %marker.config_version,
+                "unconfirmed wireless push past its deadline at startup; rolling back"
             );
-            let (state, msg) = match self.machine.rollback(&marker.snapshot, &marker.radio).await {
+            let (state, msg) = match self
+                .machine
+                .rollback_to(&marker.snapshot, &marker.current_sections, &marker.radios)
+                .await
+            {
                 Ok(()) => (ProvisionState::RolledBack, "rolled back on startup (deadline passed)".to_string()),
                 Err(e) => (ProvisionState::Failed, format!("startup rollback failed: {e}")),
             };
-            let _ = self.machine.clear_marker().await;
-            let bridge = if marker.was_teardown { marker.bridge_name.as_str() } else { "" };
-            self.emit(sm::status(&marker.provision_id, state, msg, bridge)).await;
+            let _ = self.machine.clear_wireless_marker().await;
+            self.emit_wireless(sm::wireless_status(&marker.config_version, state, Vec::new(), msg)).await;
         } else {
-            // Still within the window → resume the watchdog for the remainder.
             let remaining = Duration::from_secs((marker.deadline_unix - now_unix).max(0) as u64);
             tracing::info!(
-                provision_id = %marker.provision_id,
+                config_version = %marker.config_version,
                 remaining_secs = remaining.as_secs(),
-                "resuming commit-confirm watchdog for pending provision after restart"
+                "resuming wireless commit-confirm watchdog after restart"
             );
-            self.pending = Some(Pending {
-                provision_id: marker.provision_id,
-                bridge_name: marker.bridge_name,
-                was_teardown: marker.was_teardown,
-                radio: marker.radio,
+            self.pending_wireless = Some(WirelessPending {
+                config_version: marker.config_version,
+                radios: marker.radios,
+                current_sections: marker.current_sections,
+                per_ssid: Vec::new(),
                 deadline: Instant::now() + remaining,
                 snapshot: marker.snapshot,
+                // The desired state isn't persisted in the marker; a resumed push
+                // that then confirms records an empty last-committed (the CP
+                // re-pushes if it needs introspection). The rollback path (the
+                // common resume outcome) doesn't need it.
+                desired: WirelessDesiredState::default(),
             });
         }
     }
 
-    /// Emit a status upward. A full/closed channel is not fatal (the CP re-reads
-    /// state on reconnect); we drop and warn rather than block the actor.
-    async fn emit(&self, status: ProvisionStatus) {
-        if self.status_tx.send(status).await.is_err() {
-            tracing::debug!("provision status channel closed; status dropped");
+    /// Emit a wireless status upward (see [`Self::emit`]).
+    async fn emit_wireless(&self, status: WirelessStatus) {
+        if self.wireless_status_tx.send(status).await.is_err() {
+            tracing::debug!("wireless status channel closed; status dropped");
         }
     }
 }
@@ -369,29 +455,38 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
     use crate::runner::RecordingRunner;
-    use crate::sm::marker_path_for_test;
+    // --- CP-managed wireless (P-W1) ----------------------------------------
 
-    fn spec(id: &str, timeout: u32) -> ProvisionSpec {
-        ProvisionSpec {
-            provision_id: id.into(),
-            enabled: true,
-            ssid: "Guest".into(),
-            radio: "radio0".into(),
-            encryption: "none".into(),
-            key: String::new(),
+    fn wssid(slug: &str, gated: bool, subnet3: u8) -> portcullis_types::SsidSpec {
+        portcullis_types::SsidSpec {
+            slug: slug.into(),
+            ssid: format!("WifiHub {slug}"),
+            radios: vec!["radio0".into()],
+            encryption: if gated { "none".into() } else { "psk2".into() },
+            key: if gated { String::new() } else { "supersecret".into() },
+            hidden: false,
             isolate: true,
-            bridge_name: "br-hotspot".into(),
-            ipaddr: "10.0.0.1".into(),
+            gated,
+            bridge_name: format!("br-{slug}"),
+            ipaddr: format!("10.0.{subnet3}.1"),
             netmask: "255.255.255.0".into(),
             dhcp_start: "10".into(),
             dhcp_limit: "200".into(),
             dhcp_leasetime: "2h".into(),
-            confirm_timeout_secs: timeout,
+            dhcp_disabled: false,
+            egress_zone: String::new(),
         }
     }
 
-    /// Drain any statuses currently queued (non-blocking).
-    fn drain(rx: &mut mpsc::Receiver<ProvisionStatus>) -> Vec<ProvisionStatus> {
+    fn wstate(version: &str, timeout: u32) -> WirelessDesiredState {
+        WirelessDesiredState {
+            config_version: version.into(),
+            confirm_timeout_secs: timeout,
+            ssids: vec![wssid("public", true, 0), wssid("home", false, 1)],
+        }
+    }
+
+    fn wdrain(rx: &mut mpsc::Receiver<WirelessStatus>) -> Vec<WirelessStatus> {
         let mut out = Vec::new();
         while let Ok(s) = rx.try_recv() {
             out.push(s);
@@ -400,174 +495,149 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn apply_then_confirm_reaches_committed() {
+    async fn wireless_set_then_confirm_commits() {
         let dir = tempfile::tempdir().unwrap();
-        let (handle, mut status_rx, join) =
+        let (handle, mut wrx, join) =
             run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
 
-        handle.provision(spec("prov-1", 90)).await.unwrap();
-        // AppliedPending emitted, marker persisted.
-        let s = status_rx.recv().await.unwrap();
+        handle.set_wireless(wstate("cfg-1", 90)).await.unwrap();
+        let s = wrx.recv().await.unwrap();
         assert_eq!(s.state, ProvisionState::AppliedPending);
-        assert!(marker_path_for_test(dir.path()).exists());
+        assert_eq!(s.config_version, "cfg-1");
+        // per-SSID ifaces reported (fed to enforcement scoping when gated).
+        assert!(s.per_ssid.iter().any(|r| r.slug == "public" && r.iface == "br-public"));
 
-        handle.confirm("prov-1").await.unwrap();
-        let s = status_rx.recv().await.unwrap();
+        handle.confirm_wireless("cfg-1").await.unwrap();
+        let s = wrx.recv().await.unwrap();
         assert_eq!(s.state, ProvisionState::Committed);
-        assert_eq!(s.bridge_name, "br-hotspot");
-        // Marker cleared on commit.
-        assert!(!marker_path_for_test(dir.path()).exists());
+
+        // get_wireless now returns the committed desired-state.
+        let got = handle.get_wireless().await.unwrap();
+        assert_eq!(got.config_version, "cfg-1");
+        assert_eq!(got.ssids.len(), 2);
 
         drop(handle);
         let _ = join.await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn apply_then_timeout_rolls_back() {
+    async fn wireless_set_then_watchdog_rolls_back() {
         let dir = tempfile::tempdir().unwrap();
-        let (handle, mut status_rx, join) =
+        let (handle, mut wrx, join) =
             run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
 
-        handle.provision(spec("prov-2", 30)).await.unwrap();
-        let s = status_rx.recv().await.unwrap();
-        assert_eq!(s.state, ProvisionState::AppliedPending);
+        handle.set_wireless(wstate("cfg-2", 30)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
 
-        // Advance past the 30s window without confirming -> watchdog fires.
         tokio::time::advance(Duration::from_secs(31)).await;
-        let s = status_rx.recv().await.unwrap();
-        assert_eq!(s.state, ProvisionState::RolledBack);
-        // Marker cleared after rollback.
-        assert!(!marker_path_for_test(dir.path()).exists());
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::RolledBack);
 
         drop(handle);
         let _ = join.await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn zero_timeout_uses_default_window() {
+    async fn wireless_supersede_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let (handle, mut status_rx, join) =
+        let (handle, mut wrx, join) =
             run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
-        handle.provision(spec("prov-d", 0)).await.unwrap();
-        assert_eq!(status_rx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-        // Just before the 90s default: still pending.
-        tokio::time::advance(Duration::from_secs(89)).await;
-        assert!(drain(&mut status_rx).is_empty());
-        // Past it: rolled back.
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert_eq!(status_rx.recv().await.unwrap().state, ProvisionState::RolledBack);
-        drop(handle);
-        let _ = join.await;
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn invalid_spec_is_rejected_without_applying() {
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, mut status_rx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
-        let mut bad = spec("prov-x", 90);
-        bad.bridge_name = "br-lan".into(); // out of allowlist
-        let err = handle.provision(bad).await.unwrap_err();
+        handle.set_wireless(wstate("cfg-a", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+        // A second push while one is pending is rejected (can't hold two watchdogs).
+        let err = handle.set_wireless(wstate("cfg-b", 90)).await.unwrap_err();
         assert!(matches!(err, ProvisionError::Invalid(_)));
-        // Nothing applied, no marker, no status.
-        assert!(!marker_path_for_test(dir.path()).exists());
-        assert!(drain(&mut status_rx).is_empty());
+
         drop(handle);
         let _ = join.await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn confirm_unknown_id_errors() {
+    async fn wireless_invalid_state_applies_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let (handle, _rx, join) =
+        let (handle, mut wrx, join) =
             run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
-        let err = handle.confirm("nope").await.unwrap_err();
+
+        let mut bad = wstate("cfg-bad", 90);
+        bad.ssids[0].bridge_name = "br-lan".into(); // reserved -> reject
+        let err = handle.set_wireless(bad).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Invalid(_)));
+        // Nothing applied, no status.
+        assert!(wdrain(&mut wrx).is_empty());
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_set_applies_expected_uci_batch_and_scoped_reload() {
+        // End-to-end (actor + machine + RecordingRunner): a wireless push renders
+        // the owned `pc_<slug>_*` sections, commits every owned config, and reloads
+        // network → firewall → `wifi <radio>` (scoped) → dnsmasq. No bare `wifi
+        // reload`, no `sh`. This is the host-runnable stand-in for the netns test.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = RecordingRunner::new();
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
+
+        handle.set_wireless(wstate("cfg-e2e", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+
+        let flat = runner.flat();
+        let has = |p: &str, a: &str| flat.iter().any(|(pp, aa)| pp == p && aa == a);
+        // Owned sections for BOTH ssids are rendered (pc_<slug>_*).
+        assert!(has("uci", "set wireless.pc_public_ap0=wifi-iface"), "{flat:?}");
+        assert!(has("uci", "set network.pc_home_dev=device"), "{flat:?}");
+        assert!(has("uci", "set firewall.pc_public_portal=rule"), "gated SSID gets a portal rule");
+        // Per-config commits + ordered reload; wifi scoped to radio0, never bare.
+        assert!(has("uci", "commit network"));
+        assert!(has("uci", "commit firewall"));
+        assert!(has("/etc/init.d/network", "reload"));
+        assert!(has("/sbin/wifi", "reload radio0"));
+        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
+        assert!(flat.iter().all(|(p, _)| p != "sh" && p != "/bin/sh"));
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_confirm_unknown_version_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+
+        handle.set_wireless(wstate("cfg-real", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+        // A confirm for a DIFFERENT version does not resolve the pending push.
+        let err = handle.confirm_wireless("cfg-wrong").await.unwrap_err();
         assert!(matches!(err, ProvisionError::NoPending(_)));
+        // The real one still confirms.
+        handle.confirm_wireless("cfg-real").await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+
         drop(handle);
         let _ = join.await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn teardown_path_applies_deletes_and_confirms() {
+    async fn confirm_persists_committed_gated_ifaces_for_boot_rescope() {
+        // F2: on COMMIT, the gated-SSID bridge ifaces are persisted to tmpfs so a
+        // daemon restart (compose reads `read_committed_gated`) re-scopes
+        // enforcement before the CP reconnects.
         let dir = tempfile::tempdir().unwrap();
-        let (handle, mut status_rx, join) =
+        let (handle, mut wrx, join) =
             run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
-        let mut td = spec("prov-td", 60);
-        td.enabled = false;
-        handle.provision(td).await.unwrap();
-        assert_eq!(status_rx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-        handle.confirm("prov-td").await.unwrap();
-        assert_eq!(status_rx.recv().await.unwrap().state, ProvisionState::Committed);
-        drop(handle);
-        let _ = join.await;
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn crash_recovery_rolls_back_expired_marker_on_start() {
-        // Pre-seed a marker whose deadline is already in the past (and whose
-        // hotspot was on radio1), then start the subsystem: it must roll back on
-        // boot, emit RolledBack, and reload ONLY radio1 (the persisted radio).
-        let dir = tempfile::tempdir().unwrap();
-        {
-            // Write an expired marker via a throwaway machine.
-            let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
-            let mut snap = Snapshot {
-                existing_sections: vec!["network.hotspot".into()],
-                ..Default::default()
-            };
-            snap.prior.insert("network.hotspot.ipaddr".into(), "10.9.9.1".into());
-            let marker = PendingMarker {
-                provision_id: "old-prov".into(),
-                was_teardown: false,
-                bridge_name: "br-hotspot".into(),
-                radio: "radio1".into(),
-                deadline_unix: 1, // long in the past
-                snapshot: snap,
-            };
-            m.write_marker(&marker).await.unwrap();
-        }
+        handle.set_wireless(wstate("cfg-f2", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+        handle.confirm_wireless("cfg-f2").await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
 
-        // A cloned RecordingRunner shares its call log (Arc), so we can inspect
-        // what the subsystem's actor ran after moving one clone into it.
-        let runner = RecordingRunner::new();
-        let (handle, mut status_rx, join) =
-            run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
-        // Startup reconcile emits a RolledBack for the stale provision.
-        let s = status_rx.recv().await.unwrap();
-        assert_eq!(s.state, ProvisionState::RolledBack);
-        assert_eq!(s.provision_id, "old-prov");
-        assert!(!marker_path_for_test(dir.path()).exists());
-        // The boot-time rollback reloaded ONLY radio1 (the persisted radio), never
-        // the admin radio0 nor bare `wifi reload`.
-        let flat = runner.flat();
-        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio1".to_string())));
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload radio0"));
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
-        drop(handle);
-        let _ = join.await;
-    }
+        // wstate = [public (gated), home (not gated)] → only br-public is gated.
+        let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
+        assert_eq!(gated, vec!["br-public".to_string()]);
 
-    #[tokio::test(start_paused = true)]
-    async fn watchdog_rollback_reloads_only_the_hotspot_radio() {
-        // Provision a hotspot on radio1, let the watchdog fire, and confirm the
-        // rollback bounced ONLY radio1 (never radio0, the admin/CP radio).
-        let dir = tempfile::tempdir().unwrap();
-        let runner = RecordingRunner::new();
-        let (handle, mut status_rx, join) =
-            run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
-        let mut s = spec("prov-r1", 30);
-        s.radio = "radio1".into();
-        handle.provision(s).await.unwrap();
-        assert_eq!(status_rx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-        // Both the apply and the (imminent) rollback must target radio1 only.
-        assert!(runner.flat().contains(&("/sbin/wifi".to_string(), "reload radio1".to_string())));
-
-        tokio::time::advance(Duration::from_secs(31)).await;
-        assert_eq!(status_rx.recv().await.unwrap().state, ProvisionState::RolledBack);
-        let flat = runner.flat();
-        // radio0 (admin/CP radio) was never bounced; no bare `wifi reload`.
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload radio0"));
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
         drop(handle);
         let _ = join.await;
     }

@@ -25,12 +25,16 @@ use crate::ruleset::{build_base_ruleset, SET_AUTH, TABLE_FAMILY, TABLE_NAME};
 pub struct NftJsonBackend {
     /// Path to the `nft` binary (default `"nft"`, resolved via `PATH`).
     nft_bin: String,
-    /// The hotspot interface enforcement is scoped to (P0). `Some("br-hotspot")`
-    /// → the base ruleset's gating rules (prerouting redirect + forward drop)
-    /// carry `iifname "<iface>"` so ONLY that ingress is gated. `None`/empty →
-    /// those two rules are omitted (fail-OPEN — nothing gated, br-lan and the
+    /// The interfaces enforcement is scoped to (P-W1 — the `gated=true` SSIDs).
+    /// For EACH, the base ruleset's gating rules (prerouting redirect + forward
+    /// drop) carry `iifname "<iface>"` so ONLY those ingresses are gated. Empty →
+    /// the gating rules are omitted (fail-OPEN — nothing gated, br-lan and the
     /// whole router untouched); the table/sets/chains are still created.
-    hotspot_iface: Option<String>,
+    ///
+    /// Behind a `Mutex` so [`set_gated_ifaces`](FirewallBackend::set_gated_ifaces)
+    /// can re-scope at runtime (the single writer actor serializes calls, so the
+    /// lock is uncontended; it is only ever held briefly, never across an await).
+    gated_ifaces: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for NftJsonBackend {
@@ -43,7 +47,7 @@ impl NftJsonBackend {
     pub fn new() -> Self {
         Self {
             nft_bin: "nft".to_string(),
-            hotspot_iface: None,
+            gated_ifaces: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -51,20 +55,16 @@ impl NftJsonBackend {
     pub fn with_binary(nft_bin: impl Into<String>) -> Self {
         Self {
             nft_bin: nft_bin.into(),
-            hotspot_iface: None,
+            gated_ifaces: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    /// Scope enforcement to the hotspot interface (P0). An empty string means
-    /// "not scoped" → the gating rules are omitted from the base ruleset
-    /// (fail-OPEN). Pass the daemon's configured `hotspot_iface`.
-    pub fn with_hotspot_iface(mut self, iface: impl Into<String>) -> Self {
-        let iface = iface.into();
-        self.hotspot_iface = if iface.trim().is_empty() {
-            None
-        } else {
-            Some(iface)
-        };
+    /// Scope enforcement to a set of gated-SSID interfaces (P-W1). Blank entries
+    /// are dropped; an empty resulting set means "not scoped" → the gating rules
+    /// are omitted from the base ruleset (fail-OPEN).
+    pub fn with_gated_ifaces(self, ifaces: Vec<String>) -> Self {
+        *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") =
+            ifaces.into_iter().filter(|s| !s.trim().is_empty()).collect();
         self
     }
 
@@ -196,8 +196,8 @@ impl NftJsonBackend {
 #[async_trait]
 impl FirewallBackend for NftJsonBackend {
     async fn ensure_base(&self) -> Result<()> {
-        self.apply_json(&build_base_ruleset(self.hotspot_iface.as_deref()))
-            .await
+        let ifaces = self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned").clone();
+        self.apply_json(&build_base_ruleset(&ifaces)).await
     }
 
     async fn add_auth(&self, mac: MacAddr, ttl: Duration) -> Result<()> {
@@ -211,6 +211,18 @@ impl FirewallBackend for NftJsonBackend {
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         let doc = self.list_set_json(SET_AUTH).await?;
         parse_auth_set(&doc)
+    }
+
+    async fn set_gated_ifaces(&self, ifaces: Vec<String>) -> Result<()> {
+        let filtered: Vec<String> =
+            ifaces.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        // Flush the two gating chains and re-add the gate for the new set as one
+        // atomic `nft -j` transaction; the auth/garden SETS are never touched.
+        // Only update the stored set AFTER a successful apply (fail-safe: on error
+        // the kernel rolled back and our record still matches it).
+        self.apply_json(&crate::ruleset::build_rescope_ruleset(&filtered)).await?;
+        *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") = filtered;
+        Ok(())
     }
 }
 
@@ -426,7 +438,8 @@ mod tests {
         // BOTH the prerouting redirect and the forward drop with
         // `iifname "br-hotspot"`.
         let (nft, out, _dir) = fake_nft_capture("scoped");
-        let backend = NftJsonBackend::with_binary(&nft).with_hotspot_iface("br-hotspot");
+        let backend =
+            NftJsonBackend::with_binary(&nft).with_gated_ifaces(vec!["br-hotspot".to_string()]);
         backend.ensure_base().await.unwrap();
         let doc = captured_doc(&out);
 
@@ -455,6 +468,24 @@ mod tests {
             }),
             "forward drop must be iifname-scoped: {doc}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_gated_ifaces_emits_rescope_doc_without_touching_table() {
+        // P-W1 runtime re-scope: set_gated_ifaces flushes the gating chains and
+        // re-adds the gate for the NEW iface, without recreating the table/sets.
+        let (nft, out, _dir) = fake_nft_capture("rescope");
+        let backend =
+            NftJsonBackend::with_binary(&nft).with_gated_ifaces(vec!["br-a".to_string()]);
+        backend.set_gated_ifaces(vec!["br-b".to_string()]).await.unwrap();
+        let doc = captured_doc(&out);
+        let s = doc.to_string();
+        assert!(s.contains("flush"), "rescope must flush the gating chains: {doc}");
+        // Rule objects carry a `"table":"wifihub"` string; table CREATION is
+        // `"table":{...}`. Assert no table-creation command (structure, not substring).
+        assert!(!s.contains("\"table\":{"), "rescope must not recreate the table: {doc}");
+        assert!(s.contains("br-b"), "gate re-added for the new iface: {doc}");
+        assert!(!s.contains("br-a"), "old iface's gate is gone: {doc}");
     }
 
     #[tokio::test]

@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::SinkExt;
-use portcullis_types::{Enforcer, ProvisionStatus, Provisioner, SessionEvent};
+use portcullis_types::{
+    Enforcer, ProvisionState, Provisioner, RulesetWriter, SessionEvent, WirelessStatus,
+};
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
 use tonic::Request;
@@ -56,12 +58,18 @@ pub struct ControlChannelConfig {
     pub keepalive: Duration,
     /// Cap on the reconnect backoff.
     pub reconnect_max: Duration,
-    /// Hotspot provisioning subsystem (P0.5). `provision_hotspot` /
-    /// `confirm_provision` frames are dispatched here; its upward
-    /// [`ProvisionStatus`] stream (see [`run`]'s `provision_status`) is fanned
+    /// CP-managed wireless subsystem (P-W1). `set_wireless_config` /
+    /// `confirm_wireless` / `get_wireless_config` frames are dispatched here; its
+    /// upward `WirelessStatus` stream (see [`run`]'s `wireless_status`) is fanned
     /// into outbound `EngineFrame`s. Isolated from the [`Enforcer`]: a provision
     /// fault cannot affect enforcement.
     pub provisioner: Arc<dyn Provisioner>,
+    /// Enforcement writer (P-W1). On a terminal `WirelessStatus` (COMMITTED /
+    /// ROLLED_BACK) the channel re-scopes enforcement to the gated-SSID ifaces of
+    /// the now-committed wireless config, via [`RulesetWriter::set_gated_ifaces`]
+    /// (which re-applies only the scoped gating rules — never flushing the auth
+    /// set). Best-effort: a re-scope failure leaves the prior scope live.
+    pub writer: Arc<dyn RulesetWriter>,
 }
 
 /// Run the control channel until `events` is closed (engine shutting down).
@@ -70,16 +78,16 @@ pub struct ControlChannelConfig {
 /// connect/disconnect so the composition root can drive the `cp_connected`
 /// health flag and the disconnect metric.
 ///
-/// `provision_status` is the provision subsystem's upward mpsc: [`ProvisionStatus`]
+/// `wireless_status` is the provision subsystem's upward mpsc: [`WirelessStatus`]
 /// frames (including the UNSOLICITED watchdog-driven `ROLLED_BACK`) are fanned
 /// into outbound `EngineFrame`s. Held across reconnects like the event receiver
 /// — a status emitted while disconnected buffers in the mpsc; the control plane
-/// re-reads provision state on reconnect regardless.
+/// re-reads wireless state on reconnect regardless.
 pub async fn run<F>(
     cfg: ControlChannelConfig,
     enforcer: Arc<dyn Enforcer>,
     events: broadcast::Sender<SessionEvent>,
-    mut provision_status: mpsc::Receiver<ProvisionStatus>,
+    mut wireless_status: mpsc::Receiver<WirelessStatus>,
     cp_state: F,
 ) where
     F: Fn(bool) + Send + Sync,
@@ -95,7 +103,16 @@ pub async fn run<F>(
         // a disconnect (and count the metric) after an actual up->down
         // transition — not on every failed dial.
         let mut established = false;
-        match connect_once(&cfg, &enforcer, &mut rx, &mut provision_status, &cp_state, &mut established).await {
+        match connect_once(
+            &cfg,
+            &enforcer,
+            &mut rx,
+            &mut wireless_status,
+            &cp_state,
+            &mut established,
+        )
+        .await
+        {
             Ok(()) => tracing::info!("control channel closed; reconnecting"),
             Err(e) => tracing::warn!(error = %e, "control channel error; reconnecting"),
         }
@@ -125,7 +142,7 @@ async fn connect_once<F>(
     cfg: &ControlChannelConfig,
     enforcer: &Arc<dyn Enforcer>,
     rx: &mut broadcast::Receiver<SessionEvent>,
-    provision_status: &mut mpsc::Receiver<ProvisionStatus>,
+    wireless_status: &mut mpsc::Receiver<WirelessStatus>,
     cp_state: &F,
     established: &mut bool,
 ) -> portcullis_types::Result<()>
@@ -180,23 +197,26 @@ where
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()), // shutdown
             },
-            ps = provision_status.recv() => match ps {
+            ws = wireless_status.recv() => match ws {
                 Some(s) => {
+                    // On a TERMINAL outcome (committed, or watchdog-rolled-back to
+                    // the prior committed config), re-scope enforcement to the
+                    // gated-SSID ifaces of the now-live config BEFORE fanning the
+                    // status up — so a newly-gated SSID starts being captive-gated,
+                    // and a de-gated one stops. Best-effort (never breaks the
+                    // channel; the auth set is preserved regardless).
+                    if matches!(s.state, ProvisionState::Committed | ProvisionState::RolledBack) {
+                        rescope_enforcement(cfg).await;
+                    }
                     // Unsolicited (correlation_id 0): the CP correlates by
-                    // provision_id, and a watchdog rollback has no request to echo.
-                    let f = frame(0, engine_frame::Msg::ProvisionStatus(convert::provision_status_to_pb(&s)));
+                    // config_version; a watchdog rollback has no request to echo.
+                    let f = frame(0, engine_frame::Msg::WirelessStatus(convert::wireless_status_to_pb(&s)));
                     if out_tx.send(f).await.is_err() {
                         return Ok(());
                     }
                 }
-                // The provision subsystem shut down; keep the control channel up
-                // (enforcement is independent) — just stop forwarding statuses.
                 None => {
-                    tracing::debug!("provision status channel closed; stopping status fan-out");
-                    // Fall through: replace the closed receiver behaviour by
-                    // simply not selecting it again would require restructuring;
-                    // a closed mpsc recv() returns None immediately forever, which
-                    // would busy-loop. Guard by awaiting pending instead.
+                    tracing::debug!("wireless status channel closed; stopping wireless fan-out");
                     std::future::pending::<()>().await;
                 }
             },
@@ -264,27 +284,17 @@ async fn handle_control_frame(
             let h = convert::health_to_pb(enforcer.health().await);
             vec![frame(cid, engine_frame::Msg::Health(h))]
         }
-        // Hotspot provisioning (P0.5) — routed to the ISOLATED Provisioner, never
-        // the Enforcer. `provision` returns once APPLIED_PENDING (or an error if
-        // validation/apply failed and nothing durable was left); the terminal
-        // COMMITTED / ROLLED_BACK outcome arrives later as an UNSOLICITED
-        // ProvisionStatus over the status fan-out. We answer the request itself
-        // with a CommandAck: ok = accepted/applied-pending, err = ack_err (never
-        // a silent accept, never a panic that could reach enforcement).
-        control_frame::Msg::ProvisionHotspot(p) => {
-            let spec = convert::provision_request_to_spec(p);
-            let ack = match provisioner.provision(spec).await {
-                Ok(()) => ok_ack(),
-                Err(e) => ack_err(portcullis_types::Error::Other(e.to_string())),
-            };
-            vec![frame(cid, engine_frame::Msg::Ack(ack))]
-        }
-        control_frame::Msg::ConfirmProvision(c) => {
-            let ack = match provisioner.confirm(&c.provision_id).await {
-                Ok(()) => ok_ack(),
-                Err(e) => ack_err(portcullis_types::Error::Other(e.to_string())),
-            };
-            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        // Hotspot provisioning (P0.5) — DEPRECATED and REMOVED from the engine
+        // (migrated to SetWirelessConfig). The proto tags stay reserved; the
+        // engine rejects these frames so a not-yet-migrated control plane learns
+        // to switch over (rejecting CommandAck — never a silent accept).
+        control_frame::Msg::ProvisionHotspot(_) | control_frame::Msg::ConfirmProvision(_) => {
+            vec![frame(
+                cid,
+                engine_frame::Msg::Ack(ack_err(portcullis_types::Error::BadRequest(
+                    "hotspot provisioning is deprecated; use set_wireless_config".into(),
+                ))),
+            )]
         }
         // Config-push + introspection variants from the reconciled superset proto
         // (SetTierPolicies/SetGarden/SetEnforcement/SetEngineParameters and the
@@ -305,6 +315,64 @@ async fn handle_control_frame(
                 ))),
             )]
         }
+        // CP-managed wireless (P-W1) — routed to the ISOLATED Provisioner, never
+        // the Enforcer (same isolation as hotspot provisioning). set/confirm are
+        // answered with a CommandAck (ok = accepted/applied-pending); the terminal
+        // COMMITTED / ROLLED_BACK outcome arrives later as an UNSOLICITED
+        // WirelessStatus over the wireless fan-out. get returns a WirelessConfig
+        // (with PSK keys REDACTED — the engine never echoes secrets).
+        control_frame::Msg::SetWirelessConfig(w) => {
+            let state = convert::wireless_config_from_pb(w);
+            let ack = match provisioner.set_wireless(state).await {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(portcullis_types::Error::Other(e.to_string())),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        control_frame::Msg::ConfirmWireless(c) => {
+            let ack = match provisioner.confirm_wireless(&c.config_version).await {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(portcullis_types::Error::Other(e.to_string())),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        control_frame::Msg::GetWirelessConfig(_) => match provisioner.get_wireless().await {
+            Ok(state) => vec![frame(
+                cid,
+                engine_frame::Msg::WirelessConfig(convert::wireless_config_to_pb(&state)),
+            )],
+            Err(e) => vec![frame(
+                cid,
+                engine_frame::Msg::Ack(ack_err(portcullis_types::Error::Other(e.to_string()))),
+            )],
+        },
+    }
+}
+
+/// Re-scope enforcement to the gated-SSID ifaces of the currently-committed
+/// wireless config. Reads the committed desired-state from the isolated
+/// [`Provisioner`] (its `get_wireless`), collects the bridge ifaces of the
+/// `gated == true` SSIDs, and feeds them to [`RulesetWriter::set_gated_ifaces`]
+/// (which re-applies only the scoped gating rules, never flushing the auth set).
+/// Best-effort: any failure is logged and the prior enforcement scope stays live
+/// (fail-safe — authorized clients are never dropped).
+async fn rescope_enforcement(cfg: &ControlChannelConfig) {
+    let state = match cfg.provisioner.get_wireless().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "rescope: get_wireless failed; enforcement scope unchanged");
+            return;
+        }
+    };
+    let ifaces: Vec<String> = state
+        .ssids
+        .iter()
+        .filter(|s| s.gated)
+        .map(|s| s.bridge_name.clone())
+        .collect();
+    tracing::info!(gated_ifaces = ?ifaces, "re-scoping enforcement to committed wireless config");
+    if let Err(e) = cfg.writer.set_gated_ifaces(ifaces).await {
+        tracing::warn!(error = %e, "rescope: set_gated_ifaces failed; enforcement scope unchanged");
     }
 }
 
@@ -455,37 +523,47 @@ mod tests {
         }
     }
 
-    /// Records provision/confirm calls; never applies anything. `fail` makes
-    /// both operations error (to exercise the ack-err path).
+    /// A wireless provisioner double; `fail` makes every op error (ack-err path).
     struct MockProvisioner {
         fail: bool,
-        provisions: AtomicUsize,
-        confirms: AtomicUsize,
     }
     impl MockProvisioner {
         fn ok() -> Arc<Self> {
-            Arc::new(MockProvisioner { fail: false, provisions: AtomicUsize::new(0), confirms: AtomicUsize::new(0) })
+            Arc::new(MockProvisioner { fail: false })
         }
         fn failing() -> Arc<Self> {
-            Arc::new(MockProvisioner { fail: true, provisions: AtomicUsize::new(0), confirms: AtomicUsize::new(0) })
+            Arc::new(MockProvisioner { fail: true })
         }
     }
 
     #[tonic::async_trait]
     impl portcullis_types::Provisioner for MockProvisioner {
-        async fn provision(&self, _spec: portcullis_types::ProvisionSpec) -> Result<(), portcullis_types::ProvisionError> {
-            self.provisions.fetch_add(1, Ordering::SeqCst);
+        async fn set_wireless(
+            &self,
+            _state: portcullis_types::WirelessDesiredState,
+        ) -> Result<(), portcullis_types::ProvisionError> {
             if self.fail {
-                return Err(portcullis_types::ProvisionError::Invalid("bad spec".into()));
+                return Err(portcullis_types::ProvisionError::Invalid("bad wireless".into()));
             }
             Ok(())
         }
-        async fn confirm(&self, _id: &str) -> Result<(), portcullis_types::ProvisionError> {
-            self.confirms.fetch_add(1, Ordering::SeqCst);
+        async fn confirm_wireless(
+            &self,
+            _v: &str,
+        ) -> Result<(), portcullis_types::ProvisionError> {
             if self.fail {
                 return Err(portcullis_types::ProvisionError::NoPending("x".into()));
             }
             Ok(())
+        }
+        async fn get_wireless(
+            &self,
+        ) -> Result<portcullis_types::WirelessDesiredState, portcullis_types::ProvisionError> {
+            Ok(portcullis_types::WirelessDesiredState {
+                config_version: "cfg-live".into(),
+                ssids: Vec::new(),
+                confirm_timeout_secs: 0,
+            })
         }
     }
 
@@ -621,91 +699,24 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    fn provision_ctrl(cid: u64, id: &str) -> pb::ControlFrame {
-        pb::ControlFrame {
-            correlation_id: cid,
-            msg: Some(control_frame::Msg::ProvisionHotspot(pb::ProvisionHotspotRequest {
-                provision_id: id.into(),
-                ssid: "Guest".into(),
-                radio: "radio0".into(),
-                encryption: "none".into(),
-                key: String::new(),
-                isolate: true,
-                bridge_name: "br-hotspot".into(),
-                ipaddr: "10.0.0.1".into(),
-                netmask: "255.255.255.0".into(),
-                dhcp_start: "10".into(),
-                dhcp_limit: "200".into(),
-                dhcp_leasetime: "2h".into(),
-                confirm_timeout_secs: 90,
-                enabled: true,
-            })),
-        }
-    }
-
     #[tokio::test]
-    async fn provision_frame_acks_ok_and_routes_to_provisioner() {
-        let p = MockProvisioner::ok();
-        let out = handle_control_frame(
-            provision_ctrl(11, "prov-1"),
-            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
-            &(p.clone() as Arc<dyn Provisioner>),
-        )
-        .await;
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].correlation_id, 11);
-        assert!(ack_of(&out[0]).ok);
-        assert_eq!(p.provisions.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn provision_frame_failure_acks_error_not_silent_accept() {
-        let out = handle_control_frame(
-            provision_ctrl(1, "prov-x"),
-            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
-            &(MockProvisioner::failing() as Arc<dyn Provisioner>),
-        )
-        .await;
-        let ack = ack_of(&out[0]);
-        assert!(!ack.ok);
-        assert!(!ack.message.is_empty());
-    }
-
-    #[tokio::test]
-    async fn confirm_frame_acks_ok_and_routes_to_provisioner() {
-        let p = MockProvisioner::ok();
-        let ctrl = pb::ControlFrame {
-            correlation_id: 12,
-            msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest {
-                provision_id: "prov-1".into(),
-            })),
+    async fn deprecated_provision_frames_are_rejected() {
+        // Hotspot provisioning was removed from the engine (migrated to
+        // set_wireless_config); the proto tags stay reserved but the engine
+        // rejects these frames so a not-yet-migrated CP learns to switch over.
+        let hotspot = pb::ControlFrame {
+            correlation_id: 4,
+            msg: Some(control_frame::Msg::ProvisionHotspot(pb::ProvisionHotspotRequest::default())),
         };
-        let out = handle_control_frame(
-            ctrl,
-            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
-            &(p.clone() as Arc<dyn Provisioner>),
-        )
-        .await;
-        assert_eq!(out[0].correlation_id, 12);
-        assert!(ack_of(&out[0]).ok);
-        assert_eq!(p.confirms.load(Ordering::SeqCst), 1);
-    }
+        let out = handle_control_frame(hotspot, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        assert!(!ack_of(&out[0]).ok, "ProvisionHotspot must be rejected (deprecated)");
 
-    #[tokio::test]
-    async fn confirm_unknown_provision_acks_error() {
-        let ctrl = pb::ControlFrame {
-            correlation_id: 3,
-            msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest {
-                provision_id: "nope".into(),
-            })),
+        let confirm = pb::ControlFrame {
+            correlation_id: 5,
+            msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest::default())),
         };
-        let out = handle_control_frame(
-            ctrl,
-            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
-            &(MockProvisioner::failing() as Arc<dyn Provisioner>),
-        )
-        .await;
-        assert!(!ack_of(&out[0]).ok);
+        let out = handle_control_frame(confirm, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        assert!(!ack_of(&out[0]).ok, "ConfirmProvision must be rejected (deprecated)");
     }
 
     #[tokio::test]
@@ -730,5 +741,66 @@ mod tests {
     #[test]
     fn seed_differs_per_store() {
         assert_ne!(seed_from("SITE-1"), seed_from("SITE-2"));
+    }
+
+    // --- CP-managed wireless (P-W1) ----------------------------------------
+
+    #[tokio::test]
+    async fn set_wireless_frame_acks_ok() {
+        let ctrl = pb::ControlFrame {
+            correlation_id: 9,
+            msg: Some(control_frame::Msg::SetWirelessConfig(pb::SetWirelessConfigRequest {
+                config_version: "cfg-1".into(),
+                ssids: Vec::new(),
+                confirm_timeout_secs: 0,
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(MockProvisioner::ok() as Arc<dyn Provisioner>),
+        )
+        .await;
+        assert_eq!(out[0].correlation_id, 9);
+        assert!(ack_of(&out[0]).ok);
+    }
+
+    #[tokio::test]
+    async fn set_wireless_frame_acks_error_on_reject() {
+        let ctrl = pb::ControlFrame {
+            correlation_id: 1,
+            msg: Some(control_frame::Msg::SetWirelessConfig(pb::SetWirelessConfigRequest {
+                config_version: "cfg-x".into(),
+                ssids: Vec::new(),
+                confirm_timeout_secs: 0,
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(MockProvisioner::failing() as Arc<dyn Provisioner>),
+        )
+        .await;
+        assert!(!ack_of(&out[0]).ok, "a rejected wireless push must ack error, never silent-accept");
+    }
+
+    #[tokio::test]
+    async fn get_wireless_frame_returns_config_reply() {
+        let ctrl = pb::ControlFrame {
+            correlation_id: 5,
+            msg: Some(control_frame::Msg::GetWirelessConfig(pb::Empty {})),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &(MockProvisioner::ok() as Arc<dyn Provisioner>),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].correlation_id, 5);
+        match &out[0].msg {
+            Some(engine_frame::Msg::WirelessConfig(c)) => assert_eq!(c.config_version, "cfg-live"),
+            other => panic!("expected WirelessConfig, got {other:?}"),
+        }
     }
 }

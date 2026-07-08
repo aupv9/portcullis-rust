@@ -1,46 +1,20 @@
-//! Pure, testable UCI rendering + validation for the hotspot provision
-//! subsystem (P0.5). No I/O, no async — every function here is a unit test away
-//! from the reference desired-state UCI in `docs/design/hotspot-service-plan.md`.
+//! Pure, testable UCI rendering + validation for the CP-managed wireless
+//! provision subsystem (P-W1). No I/O, no async — every function here is a unit
+//! test away from the reference desired-state UCI.
 //!
-//! ## The hard allowlist (load-bearing)
+//! ## Ownership namespace (load-bearing)
 //!
-//! The subsystem may read/write ONLY these NINE fixed section keys:
-//!
-//! | key                       | UCI config | type        | purpose                       |
-//! |---------------------------|------------|-------------|-------------------------------|
-//! | `network.br_hotspot`      | `network`  | `device`    | the bridge                    |
-//! | `network.hotspot`         | `network`  | `interface` | subnet on the bridge          |
-//! | `wireless.wifi_hotspot`   | `wireless` | `wifi-iface`| the public AP                 |
-//! | `dhcp.hotspot`            | `dhcp`     | `dhcp`      | guest DHCP pool               |
-//! | `firewall.hotspot`        | `firewall` | `zone`      | the hotspot zone (secure)     |
-//! | `firewall.hotspot_fwd`    | `firewall` | `forwarding`| hotspot → wan (NAT breakout)  |
-//! | `firewall.hotspot_dhcp`   | `firewall` | `rule`      | allow guest DHCP (udp/67)     |
-//! | `firewall.hotspot_dns`    | `firewall` | `rule`      | allow guest DNS (tcp+udp/53)  |
-//! | `firewall.hotspot_portal` | `firewall` | `rule`      | allow the redirect responder  |
-//!
-//! It NEVER touches `network.lan` / br-lan, admin config, the existing
-//! `firewall.lan` / `firewall.wan` / anonymous fw zones, or the enforcement
-//! `inet wifihub` table. [`validate`] rejects any spec that would; [`OWNED`] is
-//! the single source of truth for what "owned" means (used by the snapshot
-//! filter too, so a snapshot can never capture a non-owned section).
+//! The subsystem may read/write ONLY sections it owns: every section is named
+//! `pc_<slug>_*` and stamped `option owner 'portcullis-wireless'`. It NEVER
+//! touches `network.lan` / br-lan, admin config, the existing `firewall.lan` /
+//! `firewall.wan` zones, or the enforcement `inet wifihub` table — enforced by
+//! [`validate_wireless`]'s reserved denylist ([`RESERVED_SLUGS`] /
+//! [`RESERVED_BRIDGES`] / [`RESERVED_EGRESS`]) plus the `pc_` name prefix.
+//! [`is_owned_wireless_section`] is the single source of truth for "owned" (used
+//! by the snapshot filter too, so a snapshot can never capture a non-owned
+//! section).
 
-use portcullis_types::{ProvisionError, ProvisionSpec};
-
-/// The nine owned UCI sections — the entire config surface this subsystem may
-/// touch, as `<config>.<section>` keys. The snapshot filter and the apply batch
-/// are both derived from this list so they can never diverge. All are NAMED
-/// sections (not anonymous), so every `uci set` is idempotent.
-pub const OWNED: [&str; 9] = [
-    "network.br_hotspot",
-    "network.hotspot",
-    "wireless.wifi_hotspot",
-    "dhcp.hotspot",
-    "firewall.hotspot",
-    "firewall.hotspot_fwd",
-    "firewall.hotspot_dhcp",
-    "firewall.hotspot_dns",
-    "firewall.hotspot_portal",
-];
+use portcullis_types::{ProvisionError, SsidSpec, WirelessDesiredState};
 
 /// The UCI `config`s (top-level files) the reload touches. Commit order:
 /// `uci commit network wireless dhcp firewall` (firewall last — its zone
@@ -91,271 +65,383 @@ impl UciCmd {
     }
 }
 
-/// The engine's default wifi-device when a spec leaves `radio` empty.
+/// The engine's default wifi-device when an SSID leaves `radios` empty.
 pub const DEFAULT_RADIO: &str = "radio0";
 
-/// The effective wifi-device for a spec: `spec.radio`, or [`DEFAULT_RADIO`] when
-/// empty. This is the SINGLE source of truth for the radio: [`render_uci`] uses
-/// it for `wireless.wifi_hotspot.device`, and the reload path uses it to reload
-/// ONLY the hotspot's radio (`wifi reload <radio>`) — never `wifi reload` (all
-/// radios), which would bounce the admin/control-plane radio on a dual-band
-/// router and sever the engine↔CP link mid-commit-confirm.
-pub fn effective_radio(spec: &ProvisionSpec) -> &str {
-    if spec.radio.is_empty() {
-        DEFAULT_RADIO
+
+// ===========================================================================
+// CP-managed wireless (P-W1): arbitrary owned SSIDs.
+//
+// Ownership boundary moves from a FIXED name allowlist (hotspot) to an
+// ownership NAMESPACE: every section this path writes is named `pc_<slug>_*` and
+// stamped `option owner 'portcullis-wireless'`. The engine may modify/delete
+// ONLY these; a reserved denylist ([`RESERVED_SLUGS`]/[`RESERVED_BRIDGES`]/
+// [`RESERVED_EGRESS`]) keeps a spec from ever aliasing lan / br-lan / admin /
+// wan / the `inet wifihub` table. Both [`render_wireless`] and the snapshot
+// filter derive names from the same helpers so they cannot diverge.
+// ===========================================================================
+
+/// The owner tag stamped on every CP-managed wireless section. Distinct from the
+/// hotspot subsystem's `portcullis-hotspot` so the two never alias during
+/// migration; sections are ALSO name-namespaced with [`WIRELESS_SECTION_PREFIX`].
+pub const WIRELESS_OWNER: &str = "portcullis-wireless";
+/// Name prefix on every owned wireless section (the ownership marker in the name).
+pub const WIRELESS_SECTION_PREFIX: &str = "pc_";
+/// Max SSID `wifi-iface`s the engine will place on one radio (mt76 VIF headroom;
+/// the admin SSID already consumes one).
+pub const MAX_SSIDS_PER_RADIO: usize = 8;
+/// Max radios one SSID may span (teardown deletes `pc_<slug>_ap0..apN`).
+pub const MAX_RADIOS_PER_SSID: usize = 4;
+/// Slugs the CP may not use (would confuse with core networks / the hotspot path).
+pub const RESERVED_SLUGS: [&str; 6] = ["lan", "wan", "wan6", "admin", "loopback", "hotspot"];
+/// Egress zones an SSID may not forward into (forwarding to lan bypasses the gate).
+pub const RESERVED_EGRESS: [&str; 1] = ["lan"];
+/// Bridge ifaces the CP may not claim.
+pub const RESERVED_BRIDGES: [&str; 1] = ["br-lan"];
+
+/// The effective radios for an SSID: its list, or `[DEFAULT_RADIO]` when empty.
+pub fn effective_radios(spec: &SsidSpec) -> Vec<&str> {
+    if spec.radios.is_empty() {
+        vec![DEFAULT_RADIO]
     } else {
-        spec.radio.as_str()
+        spec.radios.iter().map(String::as_str).collect()
     }
 }
 
-/// The effective confirm-timeout window for a spec: its value, or the default
-/// when `0`. Assumes [`validate`] already bounded it.
-pub fn effective_confirm_timeout(spec: &ProvisionSpec) -> u32 {
-    if spec.confirm_timeout_secs == 0 {
+/// The effective confirm window for a raw `secs`: its value, or the default at 0.
+pub fn effective_confirm_timeout_secs(secs: u32) -> u32 {
+    if secs == 0 {
         DEFAULT_CONFIRM_TIMEOUT_SECS
     } else {
-        spec.confirm_timeout_secs
+        secs
     }
 }
 
-/// Validate a [`ProvisionSpec`] before ANY apply (fail-OPEN: reject up front so
-/// nothing is ever written for a bad spec).
-///
-/// Checks:
-/// - `provision_id` non-empty (it keys the watchdog + confirm).
-/// - `confirm_timeout_secs` is `0` (=> default) or within `[15, 600]`.
-/// - the resulting names are the *fixed* allowlist names — a caller cannot
-///   redirect us at `network.lan` etc.: `bridge_name` must be `br-hotspot`.
-/// - `ssid` present + sane length; a non-`none` encryption requires a key.
-/// - `ipaddr` / `netmask` parse as dotted-quad IPv4 (gateway must not be the
-///   network/broadcast address); `dhcp_start` / `dhcp_limit` are numeric and in
-///   range; `dhcp_leasetime` looks like `<n>[smhd]` or `infinite`.
-///
-/// Enable vs teardown: a teardown (`enabled == false`) only needs a
-/// `provision_id` + a valid timeout + the fixed bridge name; the network
-/// parameters are irrelevant (the sections are being deleted).
-pub fn validate(spec: &ProvisionSpec) -> Result<(), ProvisionError> {
+/// Whether a `config.section` key names an owned wireless section. Used by the
+/// snapshot filter so it can only ever capture our own sections.
+pub fn is_owned_wireless_section(key: &str) -> bool {
+    key.split_once('.')
+        .map(|(_, sec)| sec.starts_with(WIRELESS_SECTION_PREFIX))
+        .unwrap_or(false)
+}
+
+/// Render the `uci set` batch for ONE validated SSID: the owned `pc_<slug>_*`
+/// sections — bridge, interface, one wifi-iface per radio, dhcp, firewall zone,
+/// forwarding, dhcp/dns allow-rules, and (only when `gated`) a portal rule. Each
+/// section is stamped `owner = portcullis-wireless`. Pure; assumes
+/// [`validate_wireless`] passed. `responder_port` is the LOCAL :8080 redirect port.
+pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
+    let s = spec.slug.as_str();
+    let enc = if spec.encryption.is_empty() { "none" } else { spec.encryption.as_str() };
+    let egress = if spec.egress_zone.is_empty() { WAN_ZONE } else { spec.egress_zone.as_str() };
+    let iface = format!("pc_{s}_if");
+
+    let mut c = Vec::with_capacity(48);
+
+    // network.pc_<s>_dev = device  (the bridge)
+    let dev = format!("network.pc_{s}_dev");
+    c.push(UciCmd::set(&dev, "device"));
+    c.push(UciCmd::set(format!("{dev}.name"), &spec.bridge_name));
+    c.push(UciCmd::set(format!("{dev}.type"), "bridge"));
+    c.push(UciCmd::set(format!("{dev}.owner"), WIRELESS_OWNER));
+
+    // network.pc_<s>_if = interface  (static subnet on the bridge)
+    let ifk = format!("network.{iface}");
+    c.push(UciCmd::set(&ifk, "interface"));
+    c.push(UciCmd::set(format!("{ifk}.device"), &spec.bridge_name));
+    c.push(UciCmd::set(format!("{ifk}.proto"), "static"));
+    c.push(UciCmd::set(format!("{ifk}.ipaddr"), &spec.ipaddr));
+    c.push(UciCmd::set(format!("{ifk}.netmask"), &spec.netmask));
+    c.push(UciCmd::set(format!("{ifk}.owner"), WIRELESS_OWNER));
+
+    // wireless.pc_<s>_ap{i} = wifi-iface  (one per radio)
+    for (i, radio) in effective_radios(spec).iter().enumerate() {
+        let ap = format!("wireless.pc_{s}_ap{i}");
+        c.push(UciCmd::set(&ap, "wifi-iface"));
+        c.push(UciCmd::set(format!("{ap}.device"), *radio));
+        c.push(UciCmd::set(format!("{ap}.mode"), "ap"));
+        c.push(UciCmd::set(format!("{ap}.network"), &iface));
+        c.push(UciCmd::set(format!("{ap}.ssid"), &spec.ssid));
+        c.push(UciCmd::set(format!("{ap}.encryption"), enc));
+        if enc != "none" {
+            c.push(UciCmd::set(format!("{ap}.key"), &spec.key));
+        }
+        c.push(UciCmd::set(format!("{ap}.isolate"), if spec.isolate { "1" } else { "0" }));
+        if spec.hidden {
+            c.push(UciCmd::set(format!("{ap}.hidden"), "1"));
+        }
+        c.push(UciCmd::set(format!("{ap}.owner"), WIRELESS_OWNER));
+    }
+
+    // dhcp.pc_<s> = dhcp  (guest pool), unless bridged-no-dhcp
+    if !spec.dhcp_disabled {
+        let d = format!("dhcp.pc_{s}");
+        c.push(UciCmd::set(&d, "dhcp"));
+        c.push(UciCmd::set(format!("{d}.interface"), &iface));
+        c.push(UciCmd::set(format!("{d}.start"), &spec.dhcp_start));
+        c.push(UciCmd::set(format!("{d}.limit"), &spec.dhcp_limit));
+        c.push(UciCmd::set(format!("{d}.leasetime"), &spec.dhcp_leasetime));
+        c.push(UciCmd::set(format!("{d}.dhcpv6"), "disabled"));
+        c.push(UciCmd::set(format!("{d}.owner"), WIRELESS_OWNER));
+    }
+
+    // firewall.pc_<s>_zone = zone  (SECURE posture; zone name = slug)
+    let z = format!("firewall.pc_{s}_zone");
+    c.push(UciCmd::set(&z, "zone"));
+    c.push(UciCmd::set(format!("{z}.name"), s));
+    c.push(UciCmd::set(format!("{z}.network"), &iface));
+    c.push(UciCmd::set(format!("{z}.input"), "REJECT"));
+    c.push(UciCmd::set(format!("{z}.output"), "ACCEPT"));
+    c.push(UciCmd::set(format!("{z}.forward"), "REJECT"));
+    c.push(UciCmd::set(format!("{z}.owner"), WIRELESS_OWNER));
+
+    // firewall.pc_<s>_fwd = forwarding  (zone -> egress; NAT inherited from egress)
+    let f = format!("firewall.pc_{s}_fwd");
+    c.push(UciCmd::set(&f, "forwarding"));
+    c.push(UciCmd::set(format!("{f}.src"), s));
+    c.push(UciCmd::set(format!("{f}.dest"), egress));
+    c.push(UciCmd::set(format!("{f}.owner"), WIRELESS_OWNER));
+
+    // firewall.pc_<s>_dhcp = rule  (allow guest DHCP)
+    let rd = format!("firewall.pc_{s}_dhcp");
+    c.push(UciCmd::set(&rd, "rule"));
+    c.push(UciCmd::set(format!("{rd}.name"), format!("Allow-{s}-DHCP")));
+    c.push(UciCmd::set(format!("{rd}.src"), s));
+    c.push(UciCmd::set(format!("{rd}.proto"), "udp"));
+    c.push(UciCmd::set(format!("{rd}.dest_port"), "67"));
+    c.push(UciCmd::set(format!("{rd}.target"), "ACCEPT"));
+    c.push(UciCmd::set(format!("{rd}.owner"), WIRELESS_OWNER));
+
+    // firewall.pc_<s>_dns = rule  (allow guest DNS)
+    let rn = format!("firewall.pc_{s}_dns");
+    c.push(UciCmd::set(&rn, "rule"));
+    c.push(UciCmd::set(format!("{rn}.name"), format!("Allow-{s}-DNS")));
+    c.push(UciCmd::set(format!("{rn}.src"), s));
+    c.push(UciCmd::set(format!("{rn}.proto"), "tcp udp"));
+    c.push(UciCmd::set(format!("{rn}.dest_port"), "53"));
+    c.push(UciCmd::set(format!("{rn}.target"), "ACCEPT"));
+    c.push(UciCmd::set(format!("{rn}.owner"), WIRELESS_OWNER));
+
+    // firewall.pc_<s>_portal = rule  (GATED only: open the captive redirect port)
+    if spec.gated {
+        let rp = format!("firewall.pc_{s}_portal");
+        c.push(UciCmd::set(&rp, "rule"));
+        c.push(UciCmd::set(format!("{rp}.name"), format!("Allow-{s}-portal")));
+        c.push(UciCmd::set(format!("{rp}.src"), s));
+        c.push(UciCmd::set(format!("{rp}.proto"), "tcp"));
+        c.push(UciCmd::set(format!("{rp}.dest_port"), responder_port.to_string()));
+        c.push(UciCmd::set(format!("{rp}.target"), "ACCEPT"));
+        c.push(UciCmd::set(format!("{rp}.owner"), WIRELESS_OWNER));
+    }
+
+    c
+}
+
+/// Render the full desired-state `uci set` batch (every SSID). Pure; assumes
+/// [`validate_wireless`] passed. The set/delete DIFF against on-device owned
+/// state is computed in `sm.rs` — this renders the desired half.
+pub fn render_wireless(state: &WirelessDesiredState, responder_port: u16) -> Vec<UciCmd> {
+    let mut c = Vec::new();
+    for ssid in &state.ssids {
+        c.extend(render_ssid(ssid, responder_port));
+    }
+    c
+}
+
+/// Render a `uci delete` for each given `config.section` key (deletes are
+/// best-effort at apply time). Used by the reconcile diff to drop pre-existing
+/// owned sections before re-setting the desired state.
+pub fn render_deletes(section_keys: &[String]) -> Vec<UciCmd> {
+    section_keys.iter().map(UciCmd::delete).collect()
+}
+
+/// Extract the section-decl keys (`config.section`, i.e. exactly one `.`) from a
+/// rendered `set` batch — the sections the batch creates. Single source of truth
+/// for "which sections does this desired-state own" (fed to the rollback /
+/// marker as `current_sections`), derived from the renderer so they can't drift.
+pub fn section_decls(cmds: &[UciCmd]) -> Vec<String> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            UciCmd::Set { key, .. } if key.matches('.').count() == 1 => Some(key.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Delete every owned section of one SSID (firewall first — rules/forwarding
+/// reference the zone — then dhcp → wifi → interface → bridge). Deletes are
+/// best-effort, so over-deleting unused `ap{i}` indices is harmless.
+pub fn render_ssid_teardown(slug: &str) -> Vec<UciCmd> {
+    let s = slug;
+    let mut c = Vec::with_capacity(6 + MAX_RADIOS_PER_SSID + 2);
+    c.push(UciCmd::delete(format!("firewall.pc_{s}_portal")));
+    c.push(UciCmd::delete(format!("firewall.pc_{s}_dns")));
+    c.push(UciCmd::delete(format!("firewall.pc_{s}_dhcp")));
+    c.push(UciCmd::delete(format!("firewall.pc_{s}_fwd")));
+    c.push(UciCmd::delete(format!("firewall.pc_{s}_zone")));
+    c.push(UciCmd::delete(format!("dhcp.pc_{s}")));
+    for i in 0..MAX_RADIOS_PER_SSID {
+        c.push(UciCmd::delete(format!("wireless.pc_{s}_ap{i}")));
+    }
+    c.push(UciCmd::delete(format!("network.pc_{s}_if")));
+    c.push(UciCmd::delete(format!("network.pc_{s}_dev")));
+    c
+}
+
+/// A slug: `[a-z0-9_]` (lowercase only), 1..=16 chars.
+fn is_slug(s: &str) -> bool {
+    let n = s.chars().count();
+    (1..=16).contains(&n) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Validate a whole [`WirelessDesiredState`] before ANY apply (fail-OPEN: reject
+/// up front so a bad push writes nothing). Per-SSID: slug (namespaced, not
+/// reserved), ssid length, radios, encryption/key, bridge (not reserved),
+/// egress_zone (not `lan`), static subnet (host gateway, contiguous mask), DHCP.
+/// Cross-SSID: unique slugs + bridges, non-overlapping subnets, per-radio VIF cap.
+/// An empty `ssids` (tear down everything) is valid.
+pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionError> {
     let bad = |m: String| Err(ProvisionError::Invalid(m));
 
-    if spec.provision_id.trim().is_empty() {
-        return bad("provision_id must not be empty".into());
-    }
-    if spec.confirm_timeout_secs != 0
-        && !(MIN_CONFIRM_TIMEOUT_SECS..=MAX_CONFIRM_TIMEOUT_SECS).contains(&spec.confirm_timeout_secs)
+    if state.confirm_timeout_secs != 0
+        && !(MIN_CONFIRM_TIMEOUT_SECS..=MAX_CONFIRM_TIMEOUT_SECS).contains(&state.confirm_timeout_secs)
     {
         return bad(format!(
             "confirm_timeout_secs must be 0 (default) or in [{MIN_CONFIRM_TIMEOUT_SECS}, {MAX_CONFIRM_TIMEOUT_SECS}], got {}",
-            spec.confirm_timeout_secs
+            state.confirm_timeout_secs
         ));
     }
-
-    // Allowlist guard: the resulting bridge is the ONE fixed name. Anything else
-    // would point the interface's `device`/`network` at a non-owned section.
-    if spec.bridge_name != "br-hotspot" {
-        return bad(format!(
-            "bridge_name is a fixed owned name; must be 'br-hotspot', got '{}'",
-            spec.bridge_name
-        ));
+    if state.ssids.is_empty() {
+        return Ok(()); // teardown-all
     }
 
-    // Teardown needs nothing more than identity + the fixed bridge.
-    if !spec.enabled {
-        return Ok(());
-    }
+    let mut seen_slugs: Vec<&str> = Vec::new();
+    let mut seen_bridges: Vec<&str> = Vec::new();
+    let mut subnets: Vec<(u32, u32, &str)> = Vec::new(); // (net, bcast, slug)
+    let mut radio_vifs: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
 
-    // --- enable path: validate the network parameters ---
-    let ssid = spec.ssid.trim();
-    if ssid.is_empty() || ssid.len() > 32 {
-        return bad(format!("ssid must be 1..=32 chars, got {} chars", ssid.len()));
-    }
+    for ssid in &state.ssids {
+        let s = ssid.slug.as_str();
+        if !is_slug(s) {
+            return bad(format!("slug must match [a-z0-9_]{{1,16}}, got '{s}'"));
+        }
+        if RESERVED_SLUGS.contains(&s) {
+            return bad(format!("slug '{s}' is reserved"));
+        }
+        if seen_slugs.contains(&s) {
+            return bad(format!("duplicate slug '{s}'"));
+        }
+        seen_slugs.push(s);
 
-    // radio: empty => engine default; otherwise a plain wifi-device token.
-    if !spec.radio.is_empty() && !is_uci_ident(&spec.radio) {
-        return bad(format!("radio must be a UCI identifier, got '{}'", spec.radio));
-    }
+        // Validate the RAW ssid (what render_ssid emits verbatim) so validation
+        // and rendering agree. Reject control chars: an SSID with `\n`/`\r` would
+        // otherwise be written to UCI and could corrupt the tmpfs marker's
+        // line-based (key=value) round-trip that rollback replays.
+        let name = ssid.ssid.as_str();
+        if name.trim().is_empty() || name.chars().count() > 32 {
+            return bad(format!("ssid for '{s}' must be 1..=32 chars"));
+        }
+        if name.chars().any(|c| c.is_control()) {
+            return bad(format!("ssid for '{s}' must not contain control characters"));
+        }
 
-    let enc = if spec.encryption.is_empty() { "none" } else { spec.encryption.as_str() };
-    if enc != "none" {
-        // WPA-family: require a key of a sane length (WPA2 PSK is 8..=63 chars).
-        let key_len = spec.key.chars().count();
-        if !(8..=63).contains(&key_len) {
-            return bad(format!(
-                "encryption '{enc}' requires a key of 8..=63 chars, got {key_len}"
-            ));
+        let radios = effective_radios(ssid);
+        if radios.len() > MAX_RADIOS_PER_SSID {
+            return bad(format!("slug '{s}' spans {} radios (max {MAX_RADIOS_PER_SSID})", radios.len()));
+        }
+        for r in &radios {
+            if !is_uci_ident(r) {
+                return bad(format!("radio '{r}' for slug '{s}' is not a UCI identifier"));
+            }
+            *radio_vifs.entry(*r).or_insert(0) += 1;
+        }
+
+        let enc = if ssid.encryption.is_empty() { "none" } else { ssid.encryption.as_str() };
+        if !matches!(enc, "none" | "psk2" | "psk2+ccmp" | "sae" | "sae-mixed") {
+            return bad(format!("encryption '{enc}' for slug '{s}' unsupported"));
+        }
+        if enc != "none" {
+            let kl = ssid.key.chars().count();
+            if !(8..=63).contains(&kl) {
+                return bad(format!("encryption '{enc}' for slug '{s}' requires key 8..=63 chars, got {kl}"));
+            }
+            // A WPA passphrase is printable ASCII (0x20..=0x7e). Rejecting
+            // control chars / non-ASCII keeps a key from corrupting the rendered
+            // config or the tmpfs marker's line-based round-trip (rollback safety).
+            if ssid.key.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
+                return bad(format!("key for slug '{s}' must be printable ASCII (32..=126)"));
+            }
+        }
+
+        // Validate the RAW bridge_name (is_uci_ident already rejects whitespace)
+        // so validation matches what render_ssid / rescope emit verbatim.
+        let br = ssid.bridge_name.as_str();
+        if !is_uci_ident(br) {
+            return bad(format!("bridge_name '{br}' for slug '{s}' is not a valid iface name"));
+        }
+        if RESERVED_BRIDGES.contains(&br) {
+            return bad(format!("bridge_name '{br}' is reserved"));
+        }
+        if seen_bridges.contains(&br) {
+            return bad(format!("duplicate bridge_name '{br}'"));
+        }
+        seen_bridges.push(br);
+
+        let egress = if ssid.egress_zone.is_empty() { WAN_ZONE } else { ssid.egress_zone.as_str() };
+        if !is_uci_ident(egress) {
+            return bad(format!("egress_zone '{egress}' for slug '{s}' is not a valid zone name"));
+        }
+        if RESERVED_EGRESS.contains(&egress) {
+            return bad(format!("egress_zone '{egress}' for slug '{s}' is not allowed (would bypass the gate)"));
+        }
+
+        let gw = parse_ipv4(&ssid.ipaddr).ok_or_else(|| {
+            ProvisionError::Invalid(format!("ipaddr '{}' for slug '{s}' not a dotted-quad IPv4", ssid.ipaddr))
+        })?;
+        let mask = parse_ipv4(&ssid.netmask).ok_or_else(|| {
+            ProvisionError::Invalid(format!("netmask '{}' for slug '{s}' not a dotted-quad IPv4", ssid.netmask))
+        })?;
+        if !is_contiguous_mask(mask) {
+            return bad(format!("netmask '{}' for slug '{s}' is not a contiguous subnet mask", ssid.netmask));
+        }
+        let net = mask_and(gw, mask);
+        let bcast = or_inv(net, mask);
+        if gw == net || gw == bcast {
+            return bad(format!("ipaddr '{}' for slug '{s}' is the network/broadcast address", ssid.ipaddr));
+        }
+        for (onet, obcast, oslug) in &subnets {
+            if net <= *obcast && *onet <= bcast {
+                return bad(format!("subnet of slug '{s}' overlaps slug '{oslug}'"));
+            }
+        }
+        subnets.push((net, bcast, s));
+
+        if !ssid.dhcp_disabled {
+            let start: u32 = ssid.dhcp_start.trim().parse().map_err(|_| {
+                ProvisionError::Invalid(format!("dhcp_start '{}' for slug '{s}' not a number", ssid.dhcp_start))
+            })?;
+            let limit: u32 = ssid.dhcp_limit.trim().parse().map_err(|_| {
+                ProvisionError::Invalid(format!("dhcp_limit '{}' for slug '{s}' not a number", ssid.dhcp_limit))
+            })?;
+            if start == 0 || start > 65535 {
+                return bad(format!("dhcp_start out of range (1..=65535) for slug '{s}': {start}"));
+            }
+            if limit == 0 || limit > 65535 {
+                return bad(format!("dhcp_limit out of range (1..=65535) for slug '{s}': {limit}"));
+            }
+            if !is_leasetime(&ssid.dhcp_leasetime) {
+                return bad(format!("dhcp_leasetime '{}' for slug '{s}' is invalid", ssid.dhcp_leasetime));
+            }
         }
     }
 
-    let gw = parse_ipv4(&spec.ipaddr)
-        .ok_or_else(|| ProvisionError::Invalid(format!("ipaddr not a dotted-quad IPv4: '{}'", spec.ipaddr)))?;
-    let mask = parse_ipv4(&spec.netmask)
-        .ok_or_else(|| ProvisionError::Invalid(format!("netmask not a dotted-quad IPv4: '{}'", spec.netmask)))?;
-    if !is_contiguous_mask(mask) {
-        return bad(format!("netmask '{}' is not a contiguous subnet mask", spec.netmask));
-    }
-    // Gateway must be a host address (not the network or broadcast address) so a
-    // client can actually route through it.
-    let net = mask_and(gw, mask);
-    let bcast = or_inv(net, mask);
-    if gw == net || gw == bcast {
-        return bad(format!(
-            "ipaddr '{}' is the network/broadcast address of {}/{}",
-            spec.ipaddr, spec.ipaddr, spec.netmask
-        ));
-    }
-
-    let start: u32 = spec
-        .dhcp_start
-        .trim()
-        .parse()
-        .map_err(|_| ProvisionError::Invalid(format!("dhcp_start not a number: '{}'", spec.dhcp_start)))?;
-    let limit: u32 = spec
-        .dhcp_limit
-        .trim()
-        .parse()
-        .map_err(|_| ProvisionError::Invalid(format!("dhcp_limit not a number: '{}'", spec.dhcp_limit)))?;
-    if start == 0 || start > 65535 {
-        return bad(format!("dhcp_start out of range (1..=65535): {start}"));
-    }
-    if limit == 0 || limit > 65535 {
-        return bad(format!("dhcp_limit out of range (1..=65535): {limit}"));
-    }
-
-    if !is_leasetime(&spec.dhcp_leasetime) {
-        return bad(format!(
-            "dhcp_leasetime must be '<n>[smhd]' or 'infinite', got '{}'",
-            spec.dhcp_leasetime
-        ));
+    for (r, n) in &radio_vifs {
+        if *n > MAX_SSIDS_PER_RADIO {
+            return bad(format!("radio '{r}' would carry {n} SSIDs (max {MAX_SSIDS_PER_RADIO})"));
+        }
     }
 
     Ok(())
-}
-
-/// Render the `uci set` batch for the ENABLE path — the exact owned sections in
-/// the design doc's reference UCI. Pure: assumes [`validate`] passed.
-///
-/// Renders (in order): the bridge device → the interface (static, ipaddr/netmask)
-/// → the wifi-iface (ssid/encryption/isolate) → the dhcp pool → the firewall
-/// zone + forwarding + three allow-rules. Each owned section is stamped with
-/// `option owner 'portcullis-hotspot'` so the ownership is visible on-device and
-/// a future audit can confirm the subsystem's footprint.
-///
-/// `responder_port` is the portcullis :8080 redirect responder port
-/// ([`portcullis_config::Config::responder_port`]) — it is a LOCAL engine
-/// setting, not carried on the wire, so it is injected here rather than read from
-/// the spec. The `hotspot_portal` rule opens exactly that port so a pre-auth
-/// guest can reach the captive redirect.
-pub fn render_uci(spec: &ProvisionSpec, responder_port: u16) -> Vec<UciCmd> {
-    let radio = effective_radio(spec);
-    let enc = if spec.encryption.is_empty() { "none" } else { spec.encryption.as_str() };
-
-    let mut cmds = Vec::with_capacity(40);
-
-    // network.br_hotspot = device  (the bridge)
-    cmds.push(UciCmd::set("network.br_hotspot", "device"));
-    cmds.push(UciCmd::set("network.br_hotspot.name", &spec.bridge_name));
-    cmds.push(UciCmd::set("network.br_hotspot.type", "bridge"));
-    cmds.push(UciCmd::set("network.br_hotspot.owner", "portcullis-hotspot"));
-
-    // network.hotspot = interface  (static subnet on the bridge)
-    cmds.push(UciCmd::set("network.hotspot", "interface"));
-    cmds.push(UciCmd::set("network.hotspot.device", &spec.bridge_name));
-    cmds.push(UciCmd::set("network.hotspot.proto", "static"));
-    cmds.push(UciCmd::set("network.hotspot.ipaddr", &spec.ipaddr));
-    cmds.push(UciCmd::set("network.hotspot.netmask", &spec.netmask));
-    cmds.push(UciCmd::set("network.hotspot.owner", "portcullis-hotspot"));
-
-    // wireless.wifi_hotspot = wifi-iface  (the public AP, attached to `hotspot`)
-    cmds.push(UciCmd::set("wireless.wifi_hotspot", "wifi-iface"));
-    cmds.push(UciCmd::set("wireless.wifi_hotspot.device", radio));
-    cmds.push(UciCmd::set("wireless.wifi_hotspot.mode", "ap"));
-    cmds.push(UciCmd::set("wireless.wifi_hotspot.network", "hotspot"));
-    cmds.push(UciCmd::set("wireless.wifi_hotspot.ssid", &spec.ssid));
-    cmds.push(UciCmd::set("wireless.wifi_hotspot.encryption", enc));
-    if enc != "none" {
-        cmds.push(UciCmd::set("wireless.wifi_hotspot.key", &spec.key));
-    }
-    cmds.push(UciCmd::set(
-        "wireless.wifi_hotspot.isolate",
-        if spec.isolate { "1" } else { "0" },
-    ));
-    cmds.push(UciCmd::set("wireless.wifi_hotspot.owner", "portcullis-hotspot"));
-
-    // dhcp.hotspot = dhcp  (guest pool)
-    cmds.push(UciCmd::set("dhcp.hotspot", "dhcp"));
-    cmds.push(UciCmd::set("dhcp.hotspot.interface", "hotspot"));
-    cmds.push(UciCmd::set("dhcp.hotspot.start", &spec.dhcp_start));
-    cmds.push(UciCmd::set("dhcp.hotspot.limit", &spec.dhcp_limit));
-    cmds.push(UciCmd::set("dhcp.hotspot.leasetime", &spec.dhcp_leasetime));
-    cmds.push(UciCmd::set("dhcp.hotspot.dhcpv6", "disabled"));
-    cmds.push(UciCmd::set("dhcp.hotspot.owner", "portcullis-hotspot"));
-
-    // firewall.hotspot = zone  (SECURE captive posture: guests cannot reach the
-    // router (input REJECT) nor forward anywhere by default (forward REJECT); the
-    // three rules below open only DHCP, DNS, and the portal responder, and the
-    // forwarding below opens hotspot → wan. No masq here — the existing `wan`
-    // zone already masquerades (RUTOS default), so NAT breakout is inherited.
-    cmds.push(UciCmd::set("firewall.hotspot", "zone"));
-    cmds.push(UciCmd::set("firewall.hotspot.name", "hotspot"));
-    cmds.push(UciCmd::set("firewall.hotspot.network", "hotspot"));
-    cmds.push(UciCmd::set("firewall.hotspot.input", "REJECT"));
-    cmds.push(UciCmd::set("firewall.hotspot.output", "ACCEPT"));
-    cmds.push(UciCmd::set("firewall.hotspot.forward", "REJECT"));
-    cmds.push(UciCmd::set("firewall.hotspot.owner", "portcullis-hotspot"));
-
-    // firewall.hotspot_fwd = forwarding  (hotspot → wan: the NAT breakout path)
-    cmds.push(UciCmd::set("firewall.hotspot_fwd", "forwarding"));
-    cmds.push(UciCmd::set("firewall.hotspot_fwd.src", "hotspot"));
-    cmds.push(UciCmd::set("firewall.hotspot_fwd.dest", WAN_ZONE));
-    cmds.push(UciCmd::set("firewall.hotspot_fwd.owner", "portcullis-hotspot"));
-
-    // firewall.hotspot_dhcp = rule  (allow guest DHCP requests to the router)
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp", "rule"));
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp.name", "Allow-hotspot-DHCP"));
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp.src", "hotspot"));
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp.proto", "udp"));
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp.dest_port", "67"));
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp.target", "ACCEPT"));
-    cmds.push(UciCmd::set("firewall.hotspot_dhcp.owner", "portcullis-hotspot"));
-
-    // firewall.hotspot_dns = rule  (allow guest DNS to the router's dnsmasq)
-    cmds.push(UciCmd::set("firewall.hotspot_dns", "rule"));
-    cmds.push(UciCmd::set("firewall.hotspot_dns.name", "Allow-hotspot-DNS"));
-    cmds.push(UciCmd::set("firewall.hotspot_dns.src", "hotspot"));
-    cmds.push(UciCmd::set("firewall.hotspot_dns.proto", "tcp udp"));
-    cmds.push(UciCmd::set("firewall.hotspot_dns.dest_port", "53"));
-    cmds.push(UciCmd::set("firewall.hotspot_dns.target", "ACCEPT"));
-    cmds.push(UciCmd::set("firewall.hotspot_dns.owner", "portcullis-hotspot"));
-
-    // firewall.hotspot_portal = rule  (allow the captive redirect responder —
-    // the local :8080 port, injected from Config.responder_port, NOT the wire).
-    cmds.push(UciCmd::set("firewall.hotspot_portal", "rule"));
-    cmds.push(UciCmd::set("firewall.hotspot_portal.name", "Allow-hotspot-portal"));
-    cmds.push(UciCmd::set("firewall.hotspot_portal.src", "hotspot"));
-    cmds.push(UciCmd::set("firewall.hotspot_portal.proto", "tcp"));
-    cmds.push(UciCmd::set("firewall.hotspot_portal.dest_port", responder_port.to_string()));
-    cmds.push(UciCmd::set("firewall.hotspot_portal.target", "ACCEPT"));
-    cmds.push(UciCmd::set("firewall.hotspot_portal.owner", "portcullis-hotspot"));
-
-    cmds
-}
-
-/// Render the teardown batch: delete exactly the nine owned sections (and
-/// nothing else). Deletes are best-effort at apply time (a missing section is
-/// fine), so ordering is not load-bearing here — but we delete the firewall
-/// sections first, then dhcp → wifi → interface → bridge (reverse of create) for
-/// tidiness (a zone's forwarding/rules reference it, so drop those before it).
-pub fn render_teardown() -> Vec<UciCmd> {
-    vec![
-        UciCmd::delete("firewall.hotspot_portal"),
-        UciCmd::delete("firewall.hotspot_dns"),
-        UciCmd::delete("firewall.hotspot_dhcp"),
-        UciCmd::delete("firewall.hotspot_fwd"),
-        UciCmd::delete("firewall.hotspot"),
-        UciCmd::delete("dhcp.hotspot"),
-        UciCmd::delete("wireless.wifi_hotspot"),
-        UciCmd::delete("network.hotspot"),
-        UciCmd::delete("network.br_hotspot"),
-    ]
 }
 
 // --- validation helpers ----------------------------------------------------
@@ -426,178 +512,6 @@ fn is_leasetime(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn valid_spec() -> ProvisionSpec {
-        ProvisionSpec {
-            provision_id: "prov-1".into(),
-            enabled: true,
-            ssid: "WifiHub Guest".into(),
-            radio: "radio0".into(),
-            encryption: "none".into(),
-            key: String::new(),
-            isolate: true,
-            bridge_name: "br-hotspot".into(),
-            ipaddr: "10.0.0.1".into(),
-            netmask: "255.255.255.0".into(),
-            dhcp_start: "10".into(),
-            dhcp_limit: "200".into(),
-            dhcp_leasetime: "2h".into(),
-            confirm_timeout_secs: 0,
-        }
-    }
-
-    #[test]
-    fn render_uci_matches_reference_design_doc() {
-        // The reference desired-state UCI (RUT200, design doc P0.5): an open
-        // captive SSID on radio0 + br-hotspot 10.0.0.1/24 + a DHCP pool + the
-        // firewall zone/forwarding/rules (portal rule on the 8080 responder).
-        let cmds = render_uci(&valid_spec(), 8080);
-        let flat: Vec<(String, String)> = cmds
-            .iter()
-            .map(|c| match c {
-                UciCmd::Set { key, value } => (key.clone(), value.clone()),
-                UciCmd::Delete { key } => (format!("DELETE {key}"), String::new()),
-            })
-            .collect();
-
-        let expect = vec![
-            ("network.br_hotspot", "device"),
-            ("network.br_hotspot.name", "br-hotspot"),
-            ("network.br_hotspot.type", "bridge"),
-            ("network.br_hotspot.owner", "portcullis-hotspot"),
-            ("network.hotspot", "interface"),
-            ("network.hotspot.device", "br-hotspot"),
-            ("network.hotspot.proto", "static"),
-            ("network.hotspot.ipaddr", "10.0.0.1"),
-            ("network.hotspot.netmask", "255.255.255.0"),
-            ("network.hotspot.owner", "portcullis-hotspot"),
-            ("wireless.wifi_hotspot", "wifi-iface"),
-            ("wireless.wifi_hotspot.device", "radio0"),
-            ("wireless.wifi_hotspot.mode", "ap"),
-            ("wireless.wifi_hotspot.network", "hotspot"),
-            ("wireless.wifi_hotspot.ssid", "WifiHub Guest"),
-            ("wireless.wifi_hotspot.encryption", "none"),
-            ("wireless.wifi_hotspot.isolate", "1"),
-            ("wireless.wifi_hotspot.owner", "portcullis-hotspot"),
-            ("dhcp.hotspot", "dhcp"),
-            ("dhcp.hotspot.interface", "hotspot"),
-            ("dhcp.hotspot.start", "10"),
-            ("dhcp.hotspot.limit", "200"),
-            ("dhcp.hotspot.leasetime", "2h"),
-            ("dhcp.hotspot.dhcpv6", "disabled"),
-            ("dhcp.hotspot.owner", "portcullis-hotspot"),
-            ("firewall.hotspot", "zone"),
-            ("firewall.hotspot.name", "hotspot"),
-            ("firewall.hotspot.network", "hotspot"),
-            ("firewall.hotspot.input", "REJECT"),
-            ("firewall.hotspot.output", "ACCEPT"),
-            ("firewall.hotspot.forward", "REJECT"),
-            ("firewall.hotspot.owner", "portcullis-hotspot"),
-            ("firewall.hotspot_fwd", "forwarding"),
-            ("firewall.hotspot_fwd.src", "hotspot"),
-            ("firewall.hotspot_fwd.dest", "wan"),
-            ("firewall.hotspot_fwd.owner", "portcullis-hotspot"),
-            ("firewall.hotspot_dhcp", "rule"),
-            ("firewall.hotspot_dhcp.name", "Allow-hotspot-DHCP"),
-            ("firewall.hotspot_dhcp.src", "hotspot"),
-            ("firewall.hotspot_dhcp.proto", "udp"),
-            ("firewall.hotspot_dhcp.dest_port", "67"),
-            ("firewall.hotspot_dhcp.target", "ACCEPT"),
-            ("firewall.hotspot_dhcp.owner", "portcullis-hotspot"),
-            ("firewall.hotspot_dns", "rule"),
-            ("firewall.hotspot_dns.name", "Allow-hotspot-DNS"),
-            ("firewall.hotspot_dns.src", "hotspot"),
-            ("firewall.hotspot_dns.proto", "tcp udp"),
-            ("firewall.hotspot_dns.dest_port", "53"),
-            ("firewall.hotspot_dns.target", "ACCEPT"),
-            ("firewall.hotspot_dns.owner", "portcullis-hotspot"),
-            ("firewall.hotspot_portal", "rule"),
-            ("firewall.hotspot_portal.name", "Allow-hotspot-portal"),
-            ("firewall.hotspot_portal.src", "hotspot"),
-            ("firewall.hotspot_portal.proto", "tcp"),
-            ("firewall.hotspot_portal.dest_port", "8080"),
-            ("firewall.hotspot_portal.target", "ACCEPT"),
-            ("firewall.hotspot_portal.owner", "portcullis-hotspot"),
-        ];
-        let expect: Vec<(String, String)> =
-            expect.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        assert_eq!(flat, expect);
-    }
-
-    #[test]
-    fn render_uci_portal_rule_uses_injected_responder_port() {
-        // Default 8080.
-        let cmds = render_uci(&valid_spec(), 8080);
-        assert!(cmds.contains(&UciCmd::set("firewall.hotspot_portal.dest_port", "8080")));
-        // A custom port flows through verbatim (not a wire field).
-        let cmds = render_uci(&valid_spec(), 9443);
-        assert!(cmds.contains(&UciCmd::set("firewall.hotspot_portal.dest_port", "9443")));
-        assert!(!cmds.contains(&UciCmd::set("firewall.hotspot_portal.dest_port", "8080")));
-    }
-
-    #[test]
-    fn render_uci_forwarding_targets_wan_and_no_masq_on_hotspot() {
-        let cmds = render_uci(&valid_spec(), 8080);
-        // hotspot -> wan forwarding (NAT breakout inherited from the wan zone).
-        assert!(cmds.contains(&UciCmd::set("firewall.hotspot_fwd.dest", "wan")));
-        // No masq is ever set on the hotspot zone (the wan zone already masqs).
-        assert!(!cmds.iter().any(|c| matches!(c, UciCmd::Set { key, .. } if key.starts_with("firewall.hotspot.masq"))));
-    }
-
-    #[test]
-    fn render_uci_only_touches_owned_sections() {
-        // Every `set` key must be prefixed by one of the nine owned section keys
-        // — the allowlist guarantee, asserted structurally.
-        for c in render_uci(&valid_spec(), 8080) {
-            let key = match &c {
-                UciCmd::Set { key, .. } => key,
-                UciCmd::Delete { key } => key,
-            };
-            assert!(
-                OWNED.iter().any(|owned| key == owned || key.starts_with(&format!("{owned}."))),
-                "key '{key}' escapes the owned allowlist"
-            );
-        }
-    }
-
-    #[test]
-    fn render_uci_with_psk_emits_key() {
-        let mut s = valid_spec();
-        s.encryption = "psk2".into();
-        s.key = "supersecret".into();
-        let cmds = render_uci(&s, 8080);
-        assert!(cmds.contains(&UciCmd::set("wireless.wifi_hotspot.encryption", "psk2")));
-        assert!(cmds.contains(&UciCmd::set("wireless.wifi_hotspot.key", "supersecret")));
-    }
-
-    #[test]
-    fn render_uci_open_has_no_key() {
-        let cmds = render_uci(&valid_spec(), 8080);
-        assert!(!cmds.iter().any(|c| matches!(c, UciCmd::Set { key, .. } if key.ends_with(".key"))));
-    }
-
-    #[test]
-    fn render_teardown_deletes_only_owned() {
-        let cmds = render_teardown();
-        assert_eq!(cmds.len(), 9);
-        for c in &cmds {
-            match c {
-                UciCmd::Delete { key } => assert!(OWNED.contains(&key.as_str())),
-                other => panic!("teardown must be deletes only, got {other:?}"),
-            }
-        }
-        // Every owned section is torn down (no stragglers left on-device).
-        let deleted: Vec<&str> = cmds
-            .iter()
-            .map(|c| match c {
-                UciCmd::Delete { key } => key.as_str(),
-                _ => unreachable!(),
-            })
-            .collect();
-        for owned in OWNED {
-            assert!(deleted.contains(&owned), "teardown missed owned section {owned}");
-        }
-    }
-
     #[test]
     fn argv_is_explicit_no_shell() {
         assert_eq!(
@@ -610,110 +524,236 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_accepts_reference_spec() {
-        validate(&valid_spec()).unwrap();
+    // --- CP-managed wireless (P-W1) ----------------------------------------
+
+    fn valid_ssid(slug: &str, gated: bool) -> SsidSpec {
+        SsidSpec {
+            slug: slug.into(),
+            ssid: format!("WifiHub {slug}"),
+            radios: vec!["radio0".into()],
+            encryption: if gated { "none".into() } else { "psk2".into() },
+            key: if gated { String::new() } else { "supersecret".into() },
+            hidden: false,
+            isolate: true,
+            gated,
+            bridge_name: format!("br-{slug}"),
+            ipaddr: "10.0.0.1".into(),
+            netmask: "255.255.255.0".into(),
+            dhcp_start: "10".into(),
+            dhcp_limit: "200".into(),
+            dhcp_leasetime: "2h".into(),
+            dhcp_disabled: false,
+            egress_zone: String::new(),
+        }
+    }
+
+    /// `valid_ssid` on a distinct `/24` (third octet = `subnet3`) so multi-SSID
+    /// states don't trip the overlap check.
+    fn ssid_on(slug: &str, gated: bool, subnet3: u8) -> SsidSpec {
+        let mut s = valid_ssid(slug, gated);
+        s.ipaddr = format!("10.0.{subnet3}.1");
+        s
+    }
+
+    fn wstate(ssids: Vec<SsidSpec>) -> WirelessDesiredState {
+        WirelessDesiredState { config_version: "cfg-1".into(), ssids, confirm_timeout_secs: 0 }
+    }
+
+    fn has_set(cmds: &[UciCmd], key: &str, value: &str) -> bool {
+        cmds.iter().any(|c| *c == UciCmd::set(key, value))
+    }
+    fn has_key(cmds: &[UciCmd], key: &str) -> bool {
+        cmds.iter().any(|c| matches!(c, UciCmd::Set { key: k, .. } if k == key))
+    }
+    fn has_delete(cmds: &[UciCmd], key: &str) -> bool {
+        cmds.iter().any(|c| *c == UciCmd::delete(key))
     }
 
     #[test]
-    fn validate_rejects_non_owned_bridge_name() {
-        let mut s = valid_spec();
+    fn render_ssid_gated_open_has_expected_sections() {
+        let cmds = render_ssid(&valid_ssid("public", true), 8080);
+        // bridge + interface
+        assert!(has_set(&cmds, "network.pc_public_dev", "device"));
+        assert!(has_set(&cmds, "network.pc_public_dev.name", "br-public"));
+        assert!(has_set(&cmds, "network.pc_public_if", "interface"));
+        assert!(has_set(&cmds, "network.pc_public_if.ipaddr", "10.0.0.1"));
+        // wifi-iface (open captive → no key)
+        assert!(has_set(&cmds, "wireless.pc_public_ap0", "wifi-iface"));
+        assert!(has_set(&cmds, "wireless.pc_public_ap0.device", "radio0"));
+        assert!(has_set(&cmds, "wireless.pc_public_ap0.encryption", "none"));
+        assert!(!has_key(&cmds, "wireless.pc_public_ap0.key"));
+        // dhcp + firewall zone/forwarding
+        assert!(has_set(&cmds, "dhcp.pc_public", "dhcp"));
+        assert!(has_set(&cmds, "firewall.pc_public_zone", "zone"));
+        assert!(has_set(&cmds, "firewall.pc_public_zone.name", "public"));
+        assert!(has_set(&cmds, "firewall.pc_public_fwd.dest", "wan"));
+        assert!(has_set(&cmds, "firewall.pc_public_dhcp.dest_port", "67"));
+        assert!(has_set(&cmds, "firewall.pc_public_dns.dest_port", "53"));
+        // gated → portal rule opens the responder port
+        assert!(has_set(&cmds, "firewall.pc_public_portal.dest_port", "8080"));
+        // every section stamped with the owner
+        assert!(has_set(&cmds, "firewall.pc_public_zone.owner", WIRELESS_OWNER));
+    }
+
+    #[test]
+    fn render_ssid_trusted_psk_has_key_and_no_portal() {
+        let cmds = render_ssid(&valid_ssid("home", false), 8080);
+        assert!(has_set(&cmds, "wireless.pc_home_ap0.encryption", "psk2"));
+        assert!(has_set(&cmds, "wireless.pc_home_ap0.key", "supersecret"));
+        // NOT gated → no portal rule
+        assert!(!has_key(&cmds, "firewall.pc_home_portal"));
+    }
+
+    #[test]
+    fn render_ssid_multi_radio_makes_one_ap_per_radio() {
+        let mut s = valid_ssid("public", true);
+        s.radios = vec!["radio0".into(), "radio1".into()];
+        let cmds = render_ssid(&s, 8080);
+        assert!(has_set(&cmds, "wireless.pc_public_ap0.device", "radio0"));
+        assert!(has_set(&cmds, "wireless.pc_public_ap1.device", "radio1"));
+    }
+
+    #[test]
+    fn render_ssid_egress_zone_overrides_wan() {
+        let mut s = valid_ssid("public", true);
+        s.egress_zone = "wan_4g".into();
+        let cmds = render_ssid(&s, 8080);
+        assert!(has_set(&cmds, "firewall.pc_public_fwd.dest", "wan_4g"));
+    }
+
+    #[test]
+    fn render_wireless_covers_all_ssids() {
+        let st = wstate(vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)]);
+        let cmds = render_wireless(&st, 8080);
+        assert!(has_set(&cmds, "wireless.pc_public_ap0", "wifi-iface"));
+        assert!(has_set(&cmds, "wireless.pc_staff_ap0", "wifi-iface"));
+    }
+
+    #[test]
+    fn validate_wireless_accepts_valid_multi() {
+        let st = wstate(vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)]);
+        validate_wireless(&st).unwrap();
+    }
+
+    #[test]
+    fn validate_wireless_empty_is_teardown_ok() {
+        validate_wireless(&wstate(vec![])).unwrap();
+    }
+
+    #[test]
+    fn validate_wireless_rejects_reserved_slug() {
+        assert!(validate_wireless(&wstate(vec![ssid_on("lan", false, 0)])).is_err());
+        assert!(validate_wireless(&wstate(vec![ssid_on("wan", false, 0)])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_duplicate_slug() {
+        let st = wstate(vec![ssid_on("dup", true, 0), ssid_on("dup", false, 1)]);
+        assert!(validate_wireless(&st).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_duplicate_bridge() {
+        let mut a = ssid_on("public", true, 0);
+        let mut b = ssid_on("staff", false, 1);
+        a.bridge_name = "br-shared".into();
+        b.bridge_name = "br-shared".into();
+        assert!(validate_wireless(&wstate(vec![a, b])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_br_lan() {
+        let mut s = ssid_on("public", true, 0);
         s.bridge_name = "br-lan".into();
-        assert!(matches!(validate(&s), Err(ProvisionError::Invalid(_))));
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
     }
 
     #[test]
-    fn validate_rejects_empty_provision_id() {
-        let mut s = valid_spec();
-        s.provision_id = "".into();
-        assert!(validate(&s).is_err());
+    fn validate_wireless_rejects_egress_lan() {
+        let mut s = ssid_on("public", true, 0);
+        s.egress_zone = "lan".into();
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
     }
 
     #[test]
-    fn validate_rejects_bad_timeout() {
-        let mut s = valid_spec();
-        s.confirm_timeout_secs = 5; // below 15
-        assert!(validate(&s).is_err());
-        s.confirm_timeout_secs = 601; // above 600
-        assert!(validate(&s).is_err());
-        s.confirm_timeout_secs = 0; // 0 = default, allowed
-        assert!(validate(&s).is_ok());
-        s.confirm_timeout_secs = 90;
-        assert!(validate(&s).is_ok());
+    fn validate_wireless_rejects_overlapping_subnets() {
+        let a = ssid_on("public", true, 0);
+        let b = ssid_on("staff", false, 0); // same /24 as a
+        assert!(validate_wireless(&wstate(vec![a, b])).is_err());
     }
 
     #[test]
-    fn validate_rejects_bad_subnet() {
-        let mut s = valid_spec();
-        s.ipaddr = "999.1.1.1".into();
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.netmask = "255.0.255.0".into(); // non-contiguous
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.ipaddr = "10.0.0.0".into(); // network address, not a host
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.ipaddr = "10.0.0.255".into(); // broadcast address for /24
-        assert!(validate(&s).is_err());
+    fn validate_wireless_rejects_bad_key_len() {
+        let mut s = ssid_on("home", false, 0);
+        s.key = "short".into(); // < 8
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
     }
 
     #[test]
-    fn validate_rejects_bad_dhcp_and_lease() {
-        let mut s = valid_spec();
-        s.dhcp_start = "x".into();
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.dhcp_limit = "0".into();
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.dhcp_leasetime = "2 hours".into();
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.dhcp_leasetime = "infinite".into();
-        assert!(validate(&s).is_ok());
+    fn validate_wireless_rejects_radio_vif_overflow() {
+        let ssids: Vec<SsidSpec> = (0..=(MAX_SSIDS_PER_RADIO as u8))
+            .map(|i| ssid_on(&format!("s{i}"), false, i)) // all default radio0
+            .collect();
+        assert!(validate_wireless(&wstate(ssids)).is_err());
     }
 
     #[test]
-    fn validate_rejects_bad_ssid_and_missing_psk() {
-        let mut s = valid_spec();
-        s.ssid = "".into();
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.ssid = "x".repeat(33);
-        assert!(validate(&s).is_err());
-
-        let mut s = valid_spec();
-        s.encryption = "psk2".into();
-        s.key = "short".into(); // < 8 chars
-        assert!(validate(&s).is_err());
+    fn validate_wireless_rejects_bad_timeout() {
+        let mut st = wstate(vec![ssid_on("public", true, 0)]);
+        st.confirm_timeout_secs = 5; // below MIN 15
+        assert!(validate_wireless(&st).is_err());
     }
 
     #[test]
-    fn validate_teardown_ignores_network_params() {
-        // A teardown only needs id + fixed bridge + valid timeout; garbage
-        // network fields are irrelevant because the sections are being deleted.
-        let mut s = valid_spec();
-        s.enabled = false;
-        s.ssid = "".into();
-        s.ipaddr = "not-an-ip".into();
-        s.dhcp_start = "junk".into();
-        validate(&s).unwrap();
+    fn render_ssid_teardown_deletes_owned() {
+        let cmds = render_ssid_teardown("public");
+        assert!(has_delete(&cmds, "firewall.pc_public_zone"));
+        assert!(has_delete(&cmds, "firewall.pc_public_portal"));
+        assert!(has_delete(&cmds, "dhcp.pc_public"));
+        assert!(has_delete(&cmds, "wireless.pc_public_ap0"));
+        assert!(has_delete(&cmds, "network.pc_public_if"));
+        assert!(has_delete(&cmds, "network.pc_public_dev"));
     }
 
     #[test]
-    fn effective_timeout_defaults_when_zero() {
-        let mut s = valid_spec();
-        s.confirm_timeout_secs = 0;
-        assert_eq!(effective_confirm_timeout(&s), DEFAULT_CONFIRM_TIMEOUT_SECS);
-        s.confirm_timeout_secs = 120;
-        assert_eq!(effective_confirm_timeout(&s), 120);
+    fn is_owned_wireless_section_only_for_pc_prefix() {
+        assert!(is_owned_wireless_section("network.pc_public_dev"));
+        assert!(is_owned_wireless_section("firewall.pc_staff_zone"));
+        assert!(!is_owned_wireless_section("network.lan"));
+        assert!(!is_owned_wireless_section("wireless.wifi_hotspot"));
+        assert!(!is_owned_wireless_section("firewall.wan"));
+    }
+
+    #[test]
+    fn validate_wireless_rejects_control_chars_in_ssid_and_key() {
+        // Security MED-1: a `\n` in the SSID/PSK would corrupt the rendered config
+        // and the tmpfs marker's line-based round-trip used by rollback.
+        let mut a = ssid_on("public", true, 0);
+        a.ssid = "Bad\nSSID".into();
+        assert!(validate_wireless(&wstate(vec![a])).is_err());
+
+        let mut b = ssid_on("home", false, 1);
+        b.key = "sup\nersecret".into(); // control char in key
+        assert!(validate_wireless(&wstate(vec![b])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_whitespace_in_bridge_name() {
+        // F3: validation is on the RAW bridge_name (matching what render emits),
+        // so a trailing space fails the ident check.
+        let mut s = ssid_on("public", true, 0);
+        s.bridge_name = "br-public ".into();
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn ssid_spec_debug_redacts_key() {
+        // LOW-1: the PSK must never appear in Debug output.
+        let mut s = valid_ssid("home", false); // key = "supersecret"
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("supersecret"), "Debug leaked the PSK: {dbg}");
+        assert!(dbg.contains("<redacted>"));
+        s.key = String::new();
+        assert!(format!("{s:?}").contains("<none>"));
     }
 }

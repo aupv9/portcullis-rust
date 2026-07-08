@@ -10,8 +10,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use portcullis_types::{
-    Error, GrantParams, HealthStatus, MacAddr, ProvisionSpec, ProvisionState, ProvisionStatus,
-    Result, RevokeReason, SessionEvent, SessionId, SessionInfo, Tier,
+    Error, GrantParams, HealthStatus, MacAddr, ProvisionState, Result, RevokeReason, SessionEvent,
+    SessionId, SessionInfo, SsidSpec, Tier, WirelessDesiredState, WirelessStatus,
 };
 
 use crate::pb;
@@ -184,35 +184,8 @@ pub fn health_to_pb(h: HealthStatus) -> pb::HealthReply {
 }
 
 // ---------------------------------------------------------------------------
-// Hotspot provisioning (P0.5): pb::ProvisionHotspotRequest -> domain
-// ProvisionSpec, and domain ProvisionStatus -> pb::ProvisionStatus.
+// Provisioning lifecycle state -> wire (shared by the wireless status mapping).
 // ---------------------------------------------------------------------------
-
-/// Translate a wire [`pb::ProvisionHotspotRequest`] into the domain
-/// [`ProvisionSpec`] the provision subsystem consumes — so the subsystem never
-/// depends on the generated proto. Field-level validation (allowlist, subnet,
-/// timeout bounds) lives in `portcullis-provision::validate`; this mapping is a
-/// straight, total copy (empty strings carried verbatim, defaulted by the spec /
-/// validator), rejecting nothing here so the subsystem produces the single
-/// authoritative `CommandAck`.
-pub fn provision_request_to_spec(req: pb::ProvisionHotspotRequest) -> ProvisionSpec {
-    ProvisionSpec {
-        provision_id: req.provision_id,
-        enabled: req.enabled,
-        ssid: req.ssid,
-        radio: req.radio,
-        encryption: req.encryption,
-        key: req.key,
-        isolate: req.isolate,
-        bridge_name: req.bridge_name,
-        ipaddr: req.ipaddr,
-        netmask: req.netmask,
-        dhcp_start: req.dhcp_start,
-        dhcp_limit: req.dhcp_limit,
-        dhcp_leasetime: req.dhcp_leasetime,
-        confirm_timeout_secs: req.confirm_timeout_secs,
-    }
-}
 
 fn provision_state_to_pb(s: ProvisionState) -> pb::ProvisionState {
     match s {
@@ -223,14 +196,98 @@ fn provision_state_to_pb(s: ProvisionState) -> pb::ProvisionState {
     }
 }
 
-/// Map a domain [`ProvisionStatus`] to the wire message the engine pushes up as
-/// an `EngineFrame.provision_status`.
-pub fn provision_status_to_pb(s: &ProvisionStatus) -> pb::ProvisionStatus {
-    pb::ProvisionStatus {
-        provision_id: s.provision_id.clone(),
+// ---------------------------------------------------------------------------
+// CP-managed wireless (P-W1): pb::SetWirelessConfigRequest -> domain
+// WirelessDesiredState, and domain WirelessStatus / WirelessDesiredState -> pb.
+// Keys (PSKs) are REDACTED on the way out (the engine never echoes secrets).
+// ---------------------------------------------------------------------------
+
+/// Translate one wire [`pb::WirelessSsid`] into the domain [`SsidSpec`]
+/// (flattening the nested network/firewall submessages). Field-level validation
+/// lives in `portcullis-provision::validate_wireless`; this is a total copy.
+pub fn wireless_ssid_from_pb(s: pb::WirelessSsid) -> SsidSpec {
+    let net = s.network.unwrap_or_default();
+    let fw = s.firewall.unwrap_or_default();
+    SsidSpec {
+        slug: s.slug,
+        ssid: s.ssid,
+        radios: s.radios,
+        encryption: s.encryption,
+        key: s.key,
+        hidden: s.hidden,
+        isolate: s.isolate,
+        gated: s.gated,
+        bridge_name: net.bridge_name,
+        ipaddr: net.ipaddr,
+        netmask: net.netmask,
+        dhcp_start: net.dhcp_start,
+        dhcp_limit: net.dhcp_limit,
+        dhcp_leasetime: net.dhcp_leasetime,
+        dhcp_disabled: net.dhcp_disabled,
+        egress_zone: fw.egress_zone,
+    }
+}
+
+/// Translate a wire [`pb::SetWirelessConfigRequest`] into the domain desired-state
+/// the provision subsystem consumes.
+pub fn wireless_config_from_pb(req: pb::SetWirelessConfigRequest) -> WirelessDesiredState {
+    WirelessDesiredState {
+        config_version: req.config_version,
+        ssids: req.ssids.into_iter().map(wireless_ssid_from_pb).collect(),
+        confirm_timeout_secs: req.confirm_timeout_secs,
+    }
+}
+
+/// Map a domain [`WirelessStatus`] to the wire `EngineFrame.wireless_status`.
+/// (Status carries no secrets — only slugs/ifaces/verdicts.)
+pub fn wireless_status_to_pb(s: &WirelessStatus) -> pb::WirelessStatus {
+    pb::WirelessStatus {
+        config_version: s.config_version.clone(),
         state: provision_state_to_pb(s.state) as i32,
+        per_ssid: s
+            .per_ssid
+            .iter()
+            .map(|r| pb::SsidResult {
+                slug: r.slug.clone(),
+                ok: r.ok,
+                message: r.message.clone(),
+                iface: r.iface.clone(),
+            })
+            .collect(),
         message: s.message.clone(),
-        bridge_name: s.bridge_name.clone(),
+    }
+}
+
+/// Map the committed domain [`WirelessDesiredState`] to the `get_wireless_config`
+/// reply. PSK keys are **REDACTED** (emptied): the engine never echoes a secret
+/// back over the wire, even to the control plane that set it.
+pub fn wireless_config_to_pb(state: &WirelessDesiredState) -> pb::WirelessConfig {
+    pb::WirelessConfig {
+        config_version: state.config_version.clone(),
+        ssids: state.ssids.iter().map(ssid_spec_to_pb_redacted).collect(),
+    }
+}
+
+fn ssid_spec_to_pb_redacted(s: &SsidSpec) -> pb::WirelessSsid {
+    pb::WirelessSsid {
+        slug: s.slug.clone(),
+        ssid: s.ssid.clone(),
+        radios: s.radios.clone(),
+        encryption: s.encryption.clone(),
+        key: String::new(), // REDACTED — never echo the PSK
+        hidden: s.hidden,
+        isolate: s.isolate,
+        gated: s.gated,
+        network: Some(pb::WirelessNetwork {
+            bridge_name: s.bridge_name.clone(),
+            ipaddr: s.ipaddr.clone(),
+            netmask: s.netmask.clone(),
+            dhcp_start: s.dhcp_start.clone(),
+            dhcp_limit: s.dhcp_limit.clone(),
+            dhcp_leasetime: s.dhcp_leasetime.clone(),
+            dhcp_disabled: s.dhcp_disabled,
+        }),
+        firewall: Some(pb::WirelessFirewall { egress_zone: s.egress_zone.clone() }),
     }
 }
 
@@ -407,37 +464,8 @@ mod tests {
     }
 
     #[test]
-    fn provision_request_maps_all_fields_to_spec() {
-        let req = pb::ProvisionHotspotRequest {
-            provision_id: "prov-9".into(),
-            ssid: "Guest".into(),
-            radio: "radio0".into(),
-            encryption: "psk2".into(),
-            key: "supersecret".into(),
-            isolate: true,
-            bridge_name: "br-hotspot".into(),
-            ipaddr: "10.0.0.1".into(),
-            netmask: "255.255.255.0".into(),
-            dhcp_start: "10".into(),
-            dhcp_limit: "200".into(),
-            dhcp_leasetime: "2h".into(),
-            confirm_timeout_secs: 120,
-            enabled: true,
-        };
-        let spec = provision_request_to_spec(req);
-        assert_eq!(spec.provision_id, "prov-9");
-        assert!(spec.enabled);
-        assert_eq!(spec.ssid, "Guest");
-        assert_eq!(spec.encryption, "psk2");
-        assert_eq!(spec.key, "supersecret");
-        assert!(spec.isolate);
-        assert_eq!(spec.bridge_name, "br-hotspot");
-        assert_eq!(spec.ipaddr, "10.0.0.1");
-        assert_eq!(spec.confirm_timeout_secs, 120);
-    }
-
-    #[test]
-    fn provision_status_maps_states() {
+    fn wireless_status_maps_provision_states() {
+        // provision_state_to_pb is exercised via the wireless status mapping.
         let cases = [
             (ProvisionState::AppliedPending, pb::ProvisionState::ProvisionAppliedPending),
             (ProvisionState::Committed, pb::ProvisionState::ProvisionCommitted),
@@ -445,16 +473,13 @@ mod tests {
             (ProvisionState::Failed, pb::ProvisionState::ProvisionFailed),
         ];
         for (domain, wire) in cases {
-            let s = ProvisionStatus {
-                provision_id: "p".into(),
+            let s = WirelessStatus {
+                config_version: "cfg".into(),
                 state: domain,
+                per_ssid: Vec::new(),
                 message: "m".into(),
-                bridge_name: "br-hotspot".into(),
             };
-            let pb = provision_status_to_pb(&s);
-            assert_eq!(pb.state, wire as i32);
-            assert_eq!(pb.provision_id, "p");
-            assert_eq!(pb.bridge_name, "br-hotspot");
+            assert_eq!(wireless_status_to_pb(&s).state, wire as i32);
         }
     }
 
@@ -471,5 +496,102 @@ mod tests {
         assert!(!pb.kernel_table_present);
         assert!(pb.cp_connected);
         assert!(!pb.last_reconcile_ok);
+    }
+
+    // --- CP-managed wireless (P-W1) ----------------------------------------
+
+    fn pb_ssid(slug: &str, gated: bool, key: &str) -> pb::WirelessSsid {
+        pb::WirelessSsid {
+            slug: slug.into(),
+            ssid: format!("WifiHub {slug}"),
+            radios: vec!["radio0".into()],
+            encryption: if gated { "none".into() } else { "psk2".into() },
+            key: key.into(),
+            hidden: false,
+            isolate: true,
+            gated,
+            network: Some(pb::WirelessNetwork {
+                bridge_name: format!("br-{slug}"),
+                ipaddr: "10.0.0.1".into(),
+                netmask: "255.255.255.0".into(),
+                dhcp_start: "10".into(),
+                dhcp_limit: "200".into(),
+                dhcp_leasetime: "2h".into(),
+                dhcp_disabled: false,
+            }),
+            firewall: Some(pb::WirelessFirewall { egress_zone: "wan".into() }),
+        }
+    }
+
+    #[test]
+    fn wireless_config_from_pb_flattens_ssids() {
+        let req = pb::SetWirelessConfigRequest {
+            config_version: "cfg-1".into(),
+            ssids: vec![pb_ssid("public", true, ""), pb_ssid("home", false, "supersecret")],
+            confirm_timeout_secs: 90,
+        };
+        let st = wireless_config_from_pb(req);
+        assert_eq!(st.config_version, "cfg-1");
+        assert_eq!(st.confirm_timeout_secs, 90);
+        assert_eq!(st.ssids.len(), 2);
+        let home = st.ssids.iter().find(|s| s.slug == "home").unwrap();
+        assert_eq!(home.bridge_name, "br-home");
+        assert_eq!(home.egress_zone, "wan");
+        assert_eq!(home.key, "supersecret");
+        assert!(!home.gated);
+    }
+
+    #[test]
+    fn wireless_config_to_pb_redacts_keys() {
+        // The get_wireless reply must NEVER echo a PSK back over the wire.
+        let state = WirelessDesiredState {
+            config_version: "cfg-2".into(),
+            confirm_timeout_secs: 0,
+            ssids: vec![SsidSpec {
+                slug: "home".into(),
+                ssid: "Staff".into(),
+                radios: vec!["radio0".into()],
+                encryption: "psk2".into(),
+                key: "supersecret".into(),
+                hidden: false,
+                isolate: true,
+                gated: false,
+                bridge_name: "br-home".into(),
+                ipaddr: "10.1.0.1".into(),
+                netmask: "255.255.255.0".into(),
+                dhcp_start: "10".into(),
+                dhcp_limit: "200".into(),
+                dhcp_leasetime: "2h".into(),
+                dhcp_disabled: false,
+                egress_zone: String::new(),
+            }],
+        };
+        let pb = wireless_config_to_pb(&state);
+        assert_eq!(pb.config_version, "cfg-2");
+        assert_eq!(pb.ssids.len(), 1);
+        assert_eq!(pb.ssids[0].key, "", "PSK must be redacted in the reply");
+        // Non-secret fields are preserved.
+        assert_eq!(pb.ssids[0].encryption, "psk2");
+        assert_eq!(pb.ssids[0].network.as_ref().unwrap().bridge_name, "br-home");
+    }
+
+    #[test]
+    fn wireless_status_maps_states_and_per_ssid() {
+        let s = WirelessStatus {
+            config_version: "cfg-3".into(),
+            state: ProvisionState::Committed,
+            per_ssid: vec![portcullis_types::SsidResult {
+                slug: "public".into(),
+                ok: true,
+                message: String::new(),
+                iface: "br-public".into(),
+            }],
+            message: "confirmed".into(),
+        };
+        let pb = wireless_status_to_pb(&s);
+        assert_eq!(pb.config_version, "cfg-3");
+        assert_eq!(pb.state, pb::ProvisionState::ProvisionCommitted as i32);
+        assert_eq!(pb.per_ssid.len(), 1);
+        assert_eq!(pb.per_ssid[0].iface, "br-public");
     }
 }

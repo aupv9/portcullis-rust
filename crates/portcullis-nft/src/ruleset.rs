@@ -94,10 +94,11 @@ fn match_set_accept(proto: &str, field: &str, set_name: &str) -> Value {
     ])
 }
 
-/// An `iifname == "<iface>"` match statement (P0 interface scoping). Prepended
-/// to the gating rules (the forward `drop` and the prerouting `redirect`) so
-/// they fire ONLY for ingress from the hotspot SSID; everything else (br-lan…)
-/// falls through untouched.
+/// An `iifname == "<iface>"` match statement (interface scoping). Prepended to
+/// the gating rules (the forward `drop` and the prerouting `redirect`) so they
+/// fire ONLY for ingress from a gated SSID; everything else (br-lan…) falls
+/// through untouched. One gating rule is emitted PER gated iface (P-W1), so each
+/// carries a single-value `iifname` match.
 fn iifname_match(iface: &str) -> Value {
     json!({
         "match": {
@@ -128,24 +129,25 @@ fn ct_established_accept() -> Value {
 /// consumes on stdin. Order matters: table, then sets, then chains, then the
 /// rules within each chain in evaluation order.
 ///
-/// P0 interface scoping (`hotspot_iface`):
-/// - `Some("br-hotspot")` → the two **gating** rules (the prerouting
-///   `tcp dport 80 redirect` and the forward terminal `drop`) are prefixed with
-///   `iifname "br-hotspot"`, so ONLY ingress from the hotspot SSID is
-///   redirected/dropped. br-lan and every other interface fall through untouched.
-/// - `None` (or empty) → those two gating rules are **omitted entirely**
+/// Interface scoping (`gated_ifaces`, P-W1 — one or more gated SSIDs):
+/// - a non-empty set → for EACH iface, the two **gating** rules (the prerouting
+///   `tcp dport 80 redirect` and the forward terminal `drop`) are emitted
+///   prefixed with `iifname "<iface>"`, so ONLY ingress from a gated SSID is
+///   redirected/dropped. br-lan and every non-gated interface fall through.
+/// - empty (or all-blank) → those gating rules are **omitted entirely**
 ///   (fail-OPEN): the table, sets, chains and the auth/garden `accept` rules are
 ///   still created (so kernel-as-truth adoption keeps working), but nothing is
 ///   redirected or dropped — the whole router, including br-lan, is untouched.
-///   This is the ONE deliberate fail-open, gated on an unset interface.
-pub fn build_base_ruleset(hotspot_iface: Option<&str>) -> Value {
-    let iface = hotspot_iface.filter(|s| !s.trim().is_empty());
-    if iface.is_none() {
+///   This is the ONE deliberate fail-open, gated on an empty iface set.
+pub fn build_base_ruleset(gated_ifaces: &[String]) -> Value {
+    let ifaces: Vec<&str> =
+        gated_ifaces.iter().map(String::as_str).filter(|s| !s.trim().is_empty()).collect();
+    if ifaces.is_empty() {
         tracing::warn!(
             target: "portcullis_nft",
-            "no hotspot_iface configured: enforcement is INERT — the wifihub table/sets/chains \
+            "no gated ifaces configured: enforcement is INERT — the wifihub table/sets/chains \
              are created but the prerouting redirect and forward drop are omitted (nothing gated; \
-             br-lan and the whole router are untouched). Set hotspot_iface to gate the SSID."
+             br-lan and the whole router are untouched). Gate at least one SSID iface to enforce."
         );
     }
 
@@ -166,75 +168,90 @@ pub fn build_base_ruleset(hotspot_iface: Option<&str>) -> Value {
     cmds.push(add(chain_obj(CHAIN_PREROUTING, "prerouting", prio_dstnat, "nat")));
     cmds.push(add(chain_obj(CHAIN_FORWARD, "forward", prio_filter, "filter")));
 
-    // prerouting rules, in order.
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        match_set_accept("ether", "saddr", SET_AUTH),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        match_set_accept("ip", "daddr", SET_GARDEN4),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_PREROUTING,
-        match_set_accept("ip6", "daddr", SET_GARDEN6),
-    )));
-    // [iifname "<iface>"] tcp dport 80 redirect to :8080 — the captive gate.
-    // Only emitted when scoped to a hotspot iface (fail-OPEN otherwise).
-    if let Some(iface) = iface {
-        let mut expr: Vec<Value> = Vec::new();
-        expr.push(iifname_match(iface));
-        expr.push(json!({
-            "match": {
-                "op": "==",
-                "left": { "payload": { "protocol": "tcp", "field": "dport" } },
-                "right": 80
-            }
-        }));
-        expr.push(json!({ "redirect": { "port": REDIRECT_PORT } }));
-        cmds.push(add(rule_obj(CHAIN_PREROUTING, Value::Array(expr))));
-    }
+    // Rules (extracted so the runtime re-scope path can re-emit the exact same
+    // rule set after flushing the chains — see [`build_rescope_ruleset`]).
+    cmds.extend(prerouting_rules(&ifaces));
+    cmds.extend(forward_rules(&ifaces));
 
-    // forward rules, in order; terminal drop last.
-    cmds.push(add(rule_obj(CHAIN_FORWARD, ct_established_accept())));
-    cmds.push(add(rule_obj(
-        CHAIN_FORWARD,
-        match_set_accept("ether", "saddr", SET_AUTH),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_FORWARD,
-        match_set_accept("ip", "daddr", SET_GARDEN4),
-    )));
-    cmds.push(add(rule_obj(
-        CHAIN_FORWARD,
-        match_set_accept("ip6", "daddr", SET_GARDEN6),
-    )));
-    // [iifname "<iface>"] drop — the only globally-terminal verdict (§7.1).
-    // Only emitted when scoped to a hotspot iface (fail-OPEN otherwise).
-    if let Some(iface) = iface {
-        cmds.push(add(rule_obj(
-            CHAIN_FORWARD,
-            json!([iifname_match(iface), { "drop": null }]),
-        )));
-    }
+    json!({ "nftables": cmds })
+}
 
+/// The prerouting chain's `add rule` commands in evaluation order: auth +
+/// garden4/6 `accept` exemptions, then one `iifname "<iface>" tcp dport 80
+/// redirect to :8080` per gated iface.
+fn prerouting_rules(ifaces: &[&str]) -> Vec<Value> {
+    let mut r = vec![
+        add(rule_obj(CHAIN_PREROUTING, match_set_accept("ether", "saddr", SET_AUTH))),
+        add(rule_obj(CHAIN_PREROUTING, match_set_accept("ip", "daddr", SET_GARDEN4))),
+        add(rule_obj(CHAIN_PREROUTING, match_set_accept("ip6", "daddr", SET_GARDEN6))),
+    ];
+    for iface in ifaces {
+        let expr: Vec<Value> = vec![
+            iifname_match(iface),
+            json!({
+                "match": {
+                    "op": "==",
+                    "left": { "payload": { "protocol": "tcp", "field": "dport" } },
+                    "right": 80
+                }
+            }),
+            json!({ "redirect": { "port": REDIRECT_PORT } }),
+        ];
+        r.push(add(rule_obj(CHAIN_PREROUTING, Value::Array(expr))));
+    }
+    r
+}
+
+/// The forward chain's `add rule` commands in evaluation order: established +
+/// auth + garden4/6 `accept`, then one terminal `iifname "<iface>" drop` per
+/// gated iface.
+fn forward_rules(ifaces: &[&str]) -> Vec<Value> {
+    let mut r = vec![
+        add(rule_obj(CHAIN_FORWARD, ct_established_accept())),
+        add(rule_obj(CHAIN_FORWARD, match_set_accept("ether", "saddr", SET_AUTH))),
+        add(rule_obj(CHAIN_FORWARD, match_set_accept("ip", "daddr", SET_GARDEN4))),
+        add(rule_obj(CHAIN_FORWARD, match_set_accept("ip6", "daddr", SET_GARDEN6))),
+    ];
+    for iface in ifaces {
+        r.push(add(rule_obj(CHAIN_FORWARD, json!([iifname_match(iface), { "drop": null }]))));
+    }
+    r
+}
+
+/// Build the RUNTIME re-scope command doc (P-W1): flush ONLY the two gating
+/// chains' rules, then re-add them for the new `gated_ifaces` set. The table,
+/// the chains themselves, and — crucially — the `auth`/garden **sets** are NEVER
+/// touched, so authorized clients (kernel-as-truth) are preserved across a
+/// re-scope. `nft -j` applies the whole document as one atomic transaction, so a
+/// failure rolls back to the prior rules (fail-safe: the old scope stays live).
+pub fn build_rescope_ruleset(gated_ifaces: &[String]) -> Value {
+    let ifaces: Vec<&str> =
+        gated_ifaces.iter().map(String::as_str).filter(|s| !s.trim().is_empty()).collect();
+    let flush = |chain: &str| {
+        json!({ "flush": { "chain": { "family": TABLE_FAMILY, "table": TABLE_NAME, "name": chain } } })
+    };
+    let mut cmds: Vec<Value> = vec![flush(CHAIN_PREROUTING), flush(CHAIN_FORWARD)];
+    cmds.extend(prerouting_rules(&ifaces));
+    cmds.extend(forward_rules(&ifaces));
     json!({ "nftables": cmds })
 }
 
 /// Build the equivalent human-readable nft script (for DEBUG logging only;
 /// the JSON form is what is actually applied). Mirrors [`build_base_ruleset`]'s
-/// P0 interface scoping: with a hotspot iface the gate rules carry `iifname`;
-/// with none they are omitted (fail-OPEN).
-pub fn build_base_script(hotspot_iface: Option<&str>) -> String {
-    let iface = hotspot_iface.filter(|s| !s.trim().is_empty());
-    // The two gating lines, scoped to the hotspot iface or omitted entirely.
-    let (redirect_line, drop_line) = match iface {
-        Some(i) => (
-            format!("\t\tiifname \"{i}\" tcp dport 80 redirect to :{REDIRECT_PORT}\n"),
-            format!("\t\tiifname \"{i}\" drop\n"),
-        ),
-        None => (String::new(), String::new()),
-    };
+/// interface scoping: one gating line per gated iface; none when the set is
+/// empty (fail-OPEN).
+pub fn build_base_script(gated_ifaces: &[String]) -> String {
+    let ifaces: Vec<&str> =
+        gated_ifaces.iter().map(String::as_str).filter(|s| !s.trim().is_empty()).collect();
+    // One gating line per gated iface (both the redirect and the drop).
+    let mut redirect_line = String::new();
+    let mut drop_line = String::new();
+    for i in &ifaces {
+        redirect_line.push_str(&format!(
+            "\t\tiifname \"{i}\" tcp dport 80 redirect to :{REDIRECT_PORT}\n"
+        ));
+        drop_line.push_str(&format!("\t\tiifname \"{i}\" drop\n"));
+    }
     format!(
         "table {fam} {tbl} {{\n\
          \tset {g4} {{ type ipv4_addr; flags interval; }}\n\
@@ -318,7 +335,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_single_inet_wifihub_table() {
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
         let tables: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("table")))
@@ -330,7 +347,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_all_three_sets_with_correct_types_and_flags() {
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
         let sets: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("set")))
@@ -351,7 +368,7 @@ mod tests {
 
     #[test]
     fn ruleset_has_both_chains_with_right_hooks_and_priorities() {
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
         let chains: Vec<&Value> = cmds(&rs)
             .iter()
             .filter_map(|c| c.get("add").and_then(|a| a.get("chain")))
@@ -373,7 +390,7 @@ mod tests {
 
     #[test]
     fn prerouting_redirects_tcp_80_to_8080() {
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
         let redirect = rule_exprs(&rs, "prerouting")
             .iter()
             .any(|expr| is_redirect_80(expr));
@@ -382,7 +399,7 @@ mod tests {
 
     #[test]
     fn forward_chain_ends_with_iface_scoped_drop() {
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
         // P0: the terminal forward rule is `iifname "<iface>" drop`.
         let forward = rule_exprs(&rs, "forward");
         let last = forward.last().unwrap();
@@ -399,7 +416,7 @@ mod tests {
     fn scoped_gate_carries_iifname_on_both_backends_rules() {
         // P0 (nft): with a hotspot iface, BOTH gating rules carry
         // `iifname "<iface>"` — the prerouting redirect and the forward drop.
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
 
         let redirect = rule_exprs(&rs, "prerouting")
             .into_iter()
@@ -428,8 +445,8 @@ mod tests {
         // accept rules are STILL created (kernel-as-truth adoption keeps working),
         // but NO prerouting redirect and NO forward drop are emitted — nothing is
         // gated, so br-lan and the whole router are untouched.
-        for none in [None, Some(""), Some("   ")] {
-            let rs = build_base_ruleset(none);
+        for none in [Vec::<String>::new(), vec!["".to_string()], vec!["   ".to_string()]] {
+            let rs = build_base_ruleset(&none);
 
             // Base still present.
             let tables = cmds(&rs)
@@ -468,10 +485,66 @@ mod tests {
     }
 
     #[test]
+    fn multiple_gated_ifaces_get_one_scoped_gate_each() {
+        // P-W1: two gated SSIDs → two iface-scoped redirect rules AND two
+        // iface-scoped drop rules (one per iface), each a single-value iifname.
+        let ifaces = vec!["br-public".to_string(), "br-guest".to_string()];
+        let rs = build_base_ruleset(&ifaces);
+
+        let redirects: Vec<Option<&str>> = rule_exprs(&rs, "prerouting")
+            .into_iter()
+            .filter(|expr| is_redirect_80(expr))
+            .map(|expr| iifname_of(expr))
+            .collect();
+        assert_eq!(redirects.len(), 2, "one redirect per gated iface");
+        assert!(redirects.contains(&Some("br-public")));
+        assert!(redirects.contains(&Some("br-guest")));
+
+        let drops: Vec<Option<&str>> = rule_exprs(&rs, "forward")
+            .into_iter()
+            .filter(|expr| expr.iter().any(|e| e.get("drop").is_some()))
+            .map(|expr| iifname_of(expr))
+            .collect();
+        assert_eq!(drops.len(), 2, "one drop per gated iface");
+        assert!(drops.contains(&Some("br-public")));
+        assert!(drops.contains(&Some("br-guest")));
+    }
+
+    #[test]
+    fn rescope_flushes_gating_chains_and_readds_scoped_gate() {
+        // P-W1 runtime re-scope: flush ONLY the two gating chains' rules and
+        // re-add the gate for a new iface set — never touch the table or the
+        // auth/garden SETS (kernel-as-truth: authorized clients are preserved).
+        let rs = build_rescope_ruleset(&["br-public".to_string()]);
+        let s = serde_json::to_string(&rs).unwrap();
+        assert!(s.contains("\"flush\""), "must flush chains");
+        // No `add table` / `add set` / `add chain` command (the table, sets and
+        // chains already exist; rescope only touches the chains' RULES). Note the
+        // rule objects legitimately carry a `"table":"wifihub"` string field, so
+        // we check the command STRUCTURE, not the substring.
+        let has_add = |kind: &str| {
+            cmds(&rs).iter().any(|c| c.get("add").and_then(|a| a.get(kind)).is_some())
+        };
+        assert!(!has_add("table"), "rescope must not (re)create the table");
+        assert!(!has_add("set"), "rescope must not add/recreate sets");
+        assert!(!has_add("chain"), "rescope must not (re)create chains");
+        // auth/garden accept exemptions re-added; the sets themselves untouched.
+        assert!(s.contains("@auth"));
+        assert!(s.contains("@garden4"));
+        // The iface-scoped gate is re-added in both chains.
+        assert!(rule_exprs(&rs, "prerouting")
+            .iter()
+            .any(|e| is_redirect_80(e) && iifname_of(e) == Some("br-public")));
+        assert!(rule_exprs(&rs, "forward")
+            .iter()
+            .any(|e| e.iter().any(|x| x.get("drop").is_some()) && iifname_of(e) == Some("br-public")));
+    }
+
+    #[test]
     fn no_postrouting_or_masquerade() {
         // We must not duplicate fw3's NAT.
-        for iface in [Some(IFACE), None] {
-            let rs = build_base_ruleset(iface);
+        for ifaces in [vec![IFACE.to_string()], Vec::<String>::new()] {
+            let rs = build_base_ruleset(&ifaces);
             let s = serde_json::to_string(&rs).unwrap();
             assert!(!s.contains("postrouting"), "must not define postrouting");
             assert!(!s.contains("masquerade"), "must not masquerade");
@@ -481,7 +554,7 @@ mod tests {
 
     #[test]
     fn forward_accepts_established_and_auth() {
-        let rs = build_base_ruleset(Some(IFACE));
+        let rs = build_base_ruleset(&[IFACE.to_string()]);
         let s = serde_json::to_string(&rs).unwrap();
         assert!(s.contains("established"));
         assert!(s.contains("@auth"));
@@ -491,7 +564,7 @@ mod tests {
 
     #[test]
     fn script_form_matches_invariants() {
-        let script = build_base_script(Some(IFACE));
+        let script = build_base_script(&[IFACE.to_string()]);
         assert!(script.contains("table inet wifihub"));
         assert!(script.contains("priority dstnat - 50"));
         assert!(script.contains("priority filter - 50"));
@@ -504,7 +577,7 @@ mod tests {
 
     #[test]
     fn script_form_omits_gate_when_unset() {
-        let script = build_base_script(None);
+        let script = build_base_script(&[]);
         assert!(script.contains("table inet wifihub"));
         // Base structure intact, but no gate + no iifname.
         assert!(!script.contains("redirect to"));
