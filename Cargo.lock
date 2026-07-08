@@ -633,7 +633,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "portcullis-accounting"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "portcullis-types",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-config"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "portcullis-types",
  "serde",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-control"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-engined"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-garden"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "portcullis-types",
  "thiserror",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-nft"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "portcullis-types",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-provision"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "portcullis-types",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-redirect"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-session"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "portcullis-types",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "portcullis-types"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "serde",
