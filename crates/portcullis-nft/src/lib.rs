@@ -28,5 +28,5 @@ pub mod writer;
 pub use backend::{FirewallBackend, MockBackend, MockOp};
 pub use ipset_iptables::{parse_ipset_list, IpsetIptablesBackend};
 pub use nftables_json::{parse_auth_set, NftJsonBackend};
-pub use ruleset::{build_base_ruleset, build_base_script};
+pub use ruleset::{build_base_ruleset, build_base_script, build_rescope_ruleset};
 pub use writer::{spawn, spawn_with_capacity, spawn_with_metrics, WriterHandle};

@@ -69,6 +69,21 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // initial view is consistent; the periodic reconcile loop refreshes these.
     w.mgr.mark_reconcile(true, true);
 
+    // F2: restore the enforcement scope from the last committed CP-managed
+    // wireless config (persisted to tmpfs on confirm). Survives a daemon restart
+    // — the auth set was already adopted above (kernel-as-truth); this re-applies
+    // the gated-SSID iface set so a CP-provisioned gated SSID keeps its captive
+    // gate across the restart, before the CP reconnects. `None` = no committed
+    // config → keep the static seed. Best-effort (never blocks startup).
+    if let Some(gated) = portcullis_provision::read_committed_gated(std::path::Path::new(
+        portcullis_provision::DEFAULT_STATE_DIR,
+    )) {
+        match writer.set_gated_ifaces(gated.clone()).await {
+            Ok(()) => tracing::info!(gated_ifaces = ?gated, "restored enforcement scope from committed wireless config"),
+            Err(e) => tracing::warn!(error = %e, "boot re-scope from committed wireless config failed; using static seed"),
+        }
+    }
+
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // 4b. Hotspot provisioning subsystem (P0.5) — spawned as an ISOLATED task,
@@ -79,22 +94,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //     manages router config, not enforcement, and kernel-as-truth means a
     //     provision fault never drops an authorized client. Spawned BEFORE the
     //     control channel so its handle + status stream can be wired in.
-    let (provisioner, provision_status_rx, provision_join) =
+    let (provisioner, wireless_status_rx, provision_join) =
         portcullis_provision::run_provision_subsystem(
             portcullis_provision::ProcessRunner,
             portcullis_provision::DEFAULT_STATE_DIR,
-            // The redirect-responder port opened by the hotspot_portal firewall
+            // The redirect-responder port opened by the per-SSID portal firewall
             // rule so pre-auth guests can reach the captive redirect. LOCAL engine
             // setting, not on the wire.
             cfg.responder_port,
         );
     let provisioner: Arc<dyn Provisioner> = Arc::new(provisioner);
     tasks.push(provision_join);
-    // The control channel consumes the status stream (fans it into outbound
-    // EngineFrames). Kept in an Option so it is moved into the channel task only
-    // when TLS is present; otherwise the subsystem still runs (watchdog rollback
-    // works without the CP) and statuses simply buffer in the mpsc.
-    let mut provision_status_rx = Some(provision_status_rx);
+    // The control channel consumes the WirelessStatus stream (fans it into
+    // outbound EngineFrames). Kept in an Option so it is moved into the channel
+    // task only when TLS is present; otherwise the subsystem still runs (watchdog
+    // rollback works without the CP) and statuses simply buffer in the mpsc.
+    let mut wireless_status_rx = Some(wireless_status_rx);
 
     // 5. Outbound control channel over mutual TLS (§13, CGNAT design doc). The
     //    engine dials the control plane and holds a long-lived bidirectional
@@ -109,19 +124,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 keepalive: Duration::from_secs(cfg.control_keepalive_secs.max(1)),
                 reconnect_max: Duration::from_secs(cfg.control_reconnect_max_secs.max(1)),
                 provisioner: provisioner.clone(),
+                // P-W1: lets the channel re-scope enforcement to the committed
+                // wireless config's gated-SSID ifaces (never flushes the auth set).
+                writer: writer.clone(),
             };
             let enforcer = w.mgr.clone() as Arc<dyn Enforcer>;
             let events = w.event_tx.clone();
             let mgr = w.mgr.clone();
             let m = metrics.clone();
-            // Move the provision status stream into the channel task so it fans
-            // ProvisionStatus (incl. unsolicited watchdog ROLLED_BACK) up to the CP.
-            let status_rx = provision_status_rx
+            // Move the WirelessStatus stream into the channel task so it fans
+            // status (incl. unsolicited watchdog ROLLED_BACK) up to the CP.
+            let wireless_rx = wireless_status_rx
                 .take()
-                .expect("provision status receiver taken once");
+                .expect("wireless status receiver taken once");
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
-                portcullis_control::run_control_channel(chan_cfg, enforcer, events, status_rx, move |up| {
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, move |up| {
                     mgr.set_cp_connected(up);
                     if !up {
                         m.incr(Metric::CpDisconnect);
@@ -290,6 +308,19 @@ fn detect_backend(cfg: &Config) -> Box<dyn FirewallBackend> {
     detect_backend_with(cfg, "nft")
 }
 
+/// The set of interfaces enforcement gates. Today: the single configured
+/// `hotspot_iface` (empty → none, i.e. fail-OPEN inert). P-W1 chunk 4 replaces
+/// this static seed with the dynamic set fed from the committed CP-managed
+/// wireless config (each `gated=true` SSID's resulting iface), re-applied via the
+/// writer without flushing the auth set.
+fn gated_ifaces(cfg: &Config) -> Vec<String> {
+    if cfg.hotspot_iface.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![cfg.hotspot_iface.clone()]
+    }
+}
+
 /// [`detect_backend`] with an injectable `nft` program path for the probe (unit
 /// tests stand in a fake script, cf. the shaper's `fake_tc` pattern).
 fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> {
@@ -313,7 +344,7 @@ fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> 
             "firewall backend selected"
         );
         Box::new(
-            portcullis_nft::NftJsonBackend::default().with_hotspot_iface(cfg.hotspot_iface.clone()),
+            portcullis_nft::NftJsonBackend::default().with_gated_ifaces(gated_ifaces(cfg)),
         )
     } else {
         tracing::info!(
@@ -324,7 +355,7 @@ fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> 
         Box::new(
             portcullis_nft::IpsetIptablesBackend::default()
                 .with_redirect_port(cfg.responder_port)
-                .with_hotspot_iface(cfg.hotspot_iface.clone()),
+                .with_gated_ifaces(gated_ifaces(cfg)),
         )
     }
 }
