@@ -117,6 +117,24 @@ pub struct Config {
     /// (e.g. a device without `conntrack`). `#[serde(default)]` for back-compat.
     #[serde(default = "default_reap_conntrack")]
     pub reap_conntrack: bool,
+
+    /// Enable per-session bandwidth shaping (tc/HTB, G5). Off by default (Phase-2,
+    /// device-validated). When on, `shape_iface` must name the LAN egress
+    /// interface the HTB qdisc lives on; the engine advertises the `shaper`
+    /// capability so the control plane may send `rate_bps` caps. `#[serde(default)]`.
+    #[serde(default)]
+    pub shape_bandwidth: bool,
+
+    /// LAN egress interface for the tc/HTB qdisc (e.g. `br-lan`). Only used when
+    /// `shape_bandwidth` is on; empty disables shaping even if the flag is set.
+    #[serde(default)]
+    pub shape_iface: String,
+
+    /// Local seed for the idle-timeout threshold in seconds (G6); `0` = disabled.
+    /// The control plane can override at runtime via `SetEngineParameters`.
+    /// `#[serde(default)]` (0) for back-compat.
+    #[serde(default)]
+    pub idle_timeout: u64,
 }
 
 fn default_reap_conntrack() -> bool {
@@ -169,6 +187,9 @@ impl Default for Config {
             firewall_backend: default_firewall_backend(),
             hotspot_iface: String::new(),
             reap_conntrack: default_reap_conntrack(),
+            shape_bandwidth: false,
+            shape_iface: String::new(),
+            idle_timeout: 0,
         }
     }
 }
@@ -358,6 +379,9 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "firewall_backend" => cfg.firewall_backend = val.to_string(),
         "hotspot_iface" => cfg.hotspot_iface = val.to_string(),
         "reap_conntrack" => cfg.reap_conntrack = parse_bool(val)?,
+        "shape_bandwidth" => cfg.shape_bandwidth = parse_bool(val)?,
+        "shape_iface" => cfg.shape_iface = val.to_string(),
+        "idle_timeout" => cfg.idle_timeout = parse_u64(val)?,
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -604,6 +628,9 @@ config portcullis 'main'
             hotspot_iface: "br-hotspot".to_string(),
             // non-default so the roundtrip actually exercises the field.
             reap_conntrack: false,
+            shape_bandwidth: true,
+            shape_iface: "br-lan".to_string(),
+            idle_timeout: 300,
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
@@ -658,6 +685,16 @@ config portcullis 'main'
         let old = Config::from_uci_str(UCI_EXAMPLE).unwrap();
         let mut new = old.clone();
         new.garden_fqdn.push("new.example".to_string());
+        assert_eq!(diff(&old, &new), ReloadImpact::HotReloadable);
+    }
+
+    #[test]
+    fn diff_idle_timeout_is_hot_reloadable() {
+        // G6/G7: idle_timeout is pushed through the runtime controller on SIGHUP,
+        // no restart needed.
+        let old = Config::from_uci_str(UCI_EXAMPLE).unwrap();
+        let mut new = old.clone();
+        new.idle_timeout = 600;
         assert_eq!(diff(&old, &new), ReloadImpact::HotReloadable);
     }
 

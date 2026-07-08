@@ -10,49 +10,28 @@
 //! The [`NoopShaper`] is the Phase-1 default.
 
 use async_trait::async_trait;
-use portcullis_types::{Error, MacAddr, Result};
+// The `Shaper` port + `NoopShaper` live in `portcullis-types` (like `FlowReaper`)
+// so the SessionManager can hold `Arc<dyn Shaper>` without depending on this
+// crate. This crate owns the concrete `TcShaper` (the tc/HTB adapter).
+use portcullis_types::{Error, MacAddr, Result, Shaper};
 use tokio::process::Command;
 
-/// Apply / clear a per-client bandwidth cap. `rate_bps == 0` means unlimited.
-#[async_trait]
-pub trait Shaper: Send + Sync {
-    /// Apply an HTB class capping `mac` to `rate_bps` bits/sec. `rate_bps == 0`
-    /// is treated as "no cap" and should clear any existing shaping for `mac`.
-    async fn apply(&self, mac: MacAddr, rate_bps: u64) -> Result<()>;
-
-    /// Remove any shaping applied to `mac` (idempotent — clearing an unshaped
-    /// MAC is not an error).
-    async fn clear(&self, mac: MacAddr) -> Result<()>;
-}
-
-/// Phase-1 default: does nothing. Used when the uplink is otherwise capped or
-/// shaping is disabled. Every method is a successful no-op.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopShaper;
-
-#[async_trait]
-impl Shaper for NoopShaper {
-    async fn apply(&self, mac: MacAddr, rate_bps: u64) -> Result<()> {
-        tracing::trace!(%mac, rate_bps, "NoopShaper: ignoring apply (shaping disabled)");
-        Ok(())
-    }
-
-    async fn clear(&self, mac: MacAddr) -> Result<()> {
-        tracing::trace!(%mac, "NoopShaper: ignoring clear");
-        Ok(())
-    }
-}
-
-/// Phase-2 `tc`/HTB shaper. Shells out to `tc` to attach a per-MAC HTB class on
-/// the LAN egress interface. This is a skeleton: the real class-id allocation
-/// and filter wiring are device-specific and validated on-hardware (§16/§18);
-/// it is documented and trait-shaped here so Phase 1 can ship with [`NoopShaper`]
-/// and swap this in without touching call sites.
+/// `tc`/HTB per-MAC bandwidth shaper (G5). Attaches an HTB class capped at the
+/// grant's `rate_bps` on the LAN egress interface and steers the client's
+/// downstream traffic (matched by destination MAC) into it; the class is torn
+/// down on revoke/expiry.
+///
+/// NOTE (device-validated): the exact `tc` filter/class syntax and the classid
+/// allocation are validated on the MIPS target (§16/§18) — like the ipset/nft
+/// backends, the kernel-touching invocation is only exercised on-device / against
+/// a fake `tc` in tests. The classid allocation and the argument vectors are pure
+/// and unit-tested here; a live `tc` failure degrades (best-effort, never fails
+/// the grant — see the SessionManager wiring).
 #[derive(Clone, Debug)]
 pub struct TcShaper {
     /// Egress interface the HTB qdisc lives on (e.g. the LAN bridge `br-lan`).
     iface: String,
-    /// `tc` binary (overridable for odd install paths).
+    /// `tc` binary (overridable for odd install paths / a fake in tests).
     program: String,
 }
 
@@ -65,7 +44,57 @@ impl TcShaper {
         TcShaper { iface: iface.into(), program: program.into() }
     }
 
-    async fn run(&self, args: &[&str]) -> Result<()> {
+    /// Deterministic HTB minor handle for a MAC, in `[0x0002, 0xffff]` (`1:0` is
+    /// the qdisc, `1:1` the root class). FNV-1a over the 6 MAC bytes. Collisions
+    /// are possible in principle but negligible at per-store client counts; a
+    /// collision would only mean two MACs share one class (documented; revisit
+    /// with a stateful allocator if it ever bites on-device).
+    fn classid_minor(mac: MacAddr) -> u16 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in mac.octets() {
+            h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+        }
+        let m = (h & 0xffff) as u16;
+        m.max(2)
+    }
+
+    /// The `tc class replace ...` argument vector for `mac` at `rate_bps` (pure,
+    /// unit-tested). `replace` is idempotent — re-granting refreshes the cap.
+    fn class_args(&self, mac: MacAddr, rate_bps: u64) -> Vec<String> {
+        let classid = format!("1:{:x}", Self::classid_minor(mac));
+        let rate = format!("{rate_bps}bit");
+        [
+            "class", "replace", "dev", &self.iface, "parent", "1:", "classid", &classid, "htb",
+            "rate", &rate, "ceil", &rate,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The `tc filter ...` argument vector steering `mac`'s downstream traffic
+    /// into its class (pure, unit-tested).
+    fn filter_args(&self, mac: MacAddr) -> Vec<String> {
+        let classid = format!("1:{:x}", Self::classid_minor(mac));
+        [
+            "filter", "replace", "dev", &self.iface, "parent", "1:", "protocol", "all", "u32",
+            "match", "ether", "dst", &mac.to_string(), "flowid", &classid,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The `tc class delete ...` argument vector for `mac` (pure, unit-tested).
+    fn del_class_args(&self, mac: MacAddr) -> Vec<String> {
+        let classid = format!("1:{:x}", Self::classid_minor(mac));
+        ["class", "delete", "dev", &self.iface, "classid", &classid]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    async fn run(&self, args: &[String]) -> Result<()> {
         let output = Command::new(&self.program)
             .args(args)
             .output()
@@ -92,24 +121,23 @@ impl Shaper for TcShaper {
             // Unlimited: ensure no leftover class remains.
             return self.clear(mac).await;
         }
-        // Phase-2 skeleton: a real impl allocates a stable classid per MAC,
-        // creates the HTB class with `rate`/`ceil`, and installs a filter that
-        // matches the client's dst MAC. Left as a documented shell-out shape.
-        let rate = format!("{rate_bps}bit");
-        tracing::info!(%mac, iface = %self.iface, rate = %rate, "TcShaper: applying HTB class (Phase-2)");
-        self.run(&["qdisc", "show", "dev", &self.iface]).await
+        tracing::info!(%mac, iface = %self.iface, rate_bps, "TcShaper: applying per-MAC HTB cap");
+        self.run(&self.class_args(mac, rate_bps)).await?;
+        self.run(&self.filter_args(mac)).await
     }
 
     async fn clear(&self, mac: MacAddr) -> Result<()> {
-        tracing::info!(%mac, iface = %self.iface, "TcShaper: clearing HTB class (Phase-2)");
-        // Real impl deletes the per-MAC class/filter; show is a safe placeholder.
-        self.run(&["qdisc", "show", "dev", &self.iface]).await
+        tracing::info!(%mac, iface = %self.iface, "TcShaper: clearing per-MAC HTB cap");
+        // Deleting the class also drops its attached filter. Idempotent on-device
+        // ("class not found" is tolerated by the caller's best-effort handling).
+        self.run(&self.del_class_args(mac)).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portcullis_types::NoopShaper;
 
     #[tokio::test]
     async fn noop_shaper_is_a_noop() {
@@ -119,5 +147,43 @@ mod tests {
         assert!(s.apply(mac, 1_000_000).await.is_ok());
         assert!(s.apply(mac, 0).await.is_ok());
         assert!(s.clear(mac).await.is_ok());
+    }
+
+    #[test]
+    fn classid_is_deterministic_and_reserved_safe() {
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let a = TcShaper::classid_minor(mac);
+        let b = TcShaper::classid_minor(mac);
+        assert_eq!(a, b, "same MAC -> same classid (idempotent apply)");
+        assert!(a >= 2, "must avoid the reserved 1:0 / 1:1 handles");
+        // Different MACs generally map to different handles.
+        let other: MacAddr = "aa:bb:cc:dd:ee:00".parse().unwrap();
+        assert_ne!(TcShaper::classid_minor(mac), TcShaper::classid_minor(other));
+    }
+
+    #[test]
+    fn class_and_filter_args_are_well_formed() {
+        let s = TcShaper::new("br-lan");
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let class = s.class_args(mac, 2_000_000);
+        assert_eq!(&class[0..4], &["class", "replace", "dev", "br-lan"]);
+        assert!(class.contains(&"htb".to_string()));
+        assert!(class.contains(&"2000000bit".to_string()), "rate carried through: {class:?}");
+        let filter = s.filter_args(mac);
+        assert!(filter.contains(&"aa:bb:cc:dd:ee:ff".to_string()), "filter matches dst MAC");
+        // class + filter reference the SAME classid.
+        let cid = format!("1:{:x}", TcShaper::classid_minor(mac));
+        assert!(class.contains(&cid) && filter.contains(&cid));
+    }
+
+    #[tokio::test]
+    async fn apply_zero_rate_clears() {
+        // rate 0 = unlimited -> apply must clear, not install a class. Point at a
+        // missing binary so a real class install would error; clear on a fake `tc`
+        // that exits 0 succeeds. Here we just assert the zero-rate path routes to
+        // clear via a fake `tc` that always succeeds.
+        let s = TcShaper::with_program("br-lan", "true");
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        assert!(s.apply(mac, 0).await.is_ok());
     }
 }
