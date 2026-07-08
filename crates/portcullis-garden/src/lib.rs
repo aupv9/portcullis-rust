@@ -35,12 +35,29 @@ use std::time::Duration;
 
 use portcullis_types::{Error, Result};
 
-/// The set of garden FQDNs plus the nftables target (table + per-family sets)
+/// Which dnsmasq set-syncing directive family to emit — determined by the live
+/// firewall backend. The nft-JSON backend uses `nftset=` into `table inet
+/// wifihub`; the ipset+iptables backend (stock RutOS / fw3, the RUTM11 path)
+/// uses `ipset=` into the `wifihub_g4` / `wifihub_g6` sets. Emitting the wrong
+/// family silently no-ops the garden — the directive populates a set the active
+/// backend never created, so a pre-auth client can't even reach the portal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GardenBackend {
+    /// dnsmasq `nftset=` → nft sets in `table inet wifihub`.
+    #[default]
+    Nft,
+    /// dnsmasq `ipset=` → ipset sets (`wifihub_g4` / `wifihub_g6`).
+    Ipset,
+}
+
+/// The set of garden FQDNs plus the target (backend + table + per-family sets)
 /// that dnsmasq should populate.
 ///
 /// `table` is the dnsmasq `nftset=` *family#name* prefix (default
-/// `"inet#wifihub"`, matching the single table this engine owns); `set4` / `set6`
-/// are the interval sets dnsmasq injects resolved A / AAAA records into.
+/// `"inet#wifihub"`, used only by the nft backend); `set4` / `set6` are the
+/// per-family set names dnsmasq injects resolved A / AAAA records into. `backend`
+/// selects the directive family (`nftset=` vs `ipset=`) and must match the live
+/// [`GardenBackend`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GardenConfig {
     /// The garden FQDNs (e.g. `portal.wifihub.vn`). Order is normalised on
@@ -50,8 +67,10 @@ pub struct GardenConfig {
     pub table: String,
     /// IPv4 nftables set name (default `garden4`).
     pub set4: String,
-    /// IPv6 nftables set name (default `garden6`).
+    /// IPv6 set name (default `garden6`; ipset backend uses `wifihub_g6`).
     pub set6: String,
+    /// Which dnsmasq directive family to render (`nftset=` vs `ipset=`).
+    pub backend: GardenBackend,
 }
 
 impl Default for GardenConfig {
@@ -61,6 +80,7 @@ impl Default for GardenConfig {
             table: "inet#wifihub".to_string(),
             set4: "garden4".to_string(),
             set6: "garden6".to_string(),
+            backend: GardenBackend::Nft,
         }
     }
 }
@@ -75,6 +95,30 @@ impl GardenConfig {
         GardenConfig {
             fqdns: fqdns.into_iter().map(Into::into).collect(),
             ..Default::default()
+        }
+    }
+
+    /// Construct for a specific [`GardenBackend`], selecting the set names and
+    /// directive family that match the live firewall backend. The ipset set
+    /// names mirror `portcullis_nft::{IPSET_G4, IPSET_G6}` — kept in sync by
+    /// convention, since this crate depends only on `portcullis-types` and
+    /// cannot import them (a drift here silently empties the garden).
+    pub fn with_fqdns_for<I, S>(backend: GardenBackend, fqdns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let fqdns = fqdns.into_iter().map(Into::into).collect();
+        match backend {
+            GardenBackend::Nft => GardenConfig { fqdns, ..Default::default() },
+            GardenBackend::Ipset => GardenConfig {
+                fqdns,
+                // No `family#table` selector in `ipset=`; table is unused here.
+                table: String::new(),
+                set4: "wifihub_g4".to_string(),
+                set6: "wifihub_g6".to_string(),
+                backend: GardenBackend::Ipset,
+            },
         }
     }
 
@@ -94,7 +138,8 @@ impl GardenConfig {
     }
 }
 
-/// Render the dnsmasq `nftset=` directives for the given garden config (TDD §7.3).
+/// Render the dnsmasq garden directives for the given garden config (TDD §7.3) —
+/// `nftset=` for the nft backend, `ipset=` for the ipset backend.
 ///
 /// Produces exactly two lines — one per address family — each a single directive
 /// listing every FQDN, e.g.:
@@ -119,10 +164,21 @@ pub fn render_dnsmasq(cfg: &GardenConfig) -> String {
         joined.push('/');
     }
 
-    let mut out = String::new();
-    out.push_str(&format!("nftset={joined}4#{}#{}\n", cfg.table, cfg.set4));
-    out.push_str(&format!("nftset={joined}6#{}#{}\n", cfg.table, cfg.set6));
-    out
+    match cfg.backend {
+        // nftset: one directive per family; the leading `4#` / `6#` tells dnsmasq
+        // which address family to inject into each set.
+        GardenBackend::Nft => {
+            let mut out = String::new();
+            out.push_str(&format!("nftset={joined}4#{}#{}\n", cfg.table, cfg.set4));
+            out.push_str(&format!("nftset={joined}6#{}#{}\n", cfg.table, cfg.set6));
+            out
+        }
+        // ipset: no per-family selector — list both family-specific sets on one
+        // directive. dnsmasq routes each resolved A → the inet set and AAAA → the
+        // inet6 set; a wrong-family add is rejected by the kernel and ignored.
+        // Single line keeps the output byte-stable for idempotent reconcile.
+        GardenBackend::Ipset => format!("ipset={joined}{},{}\n", cfg.set4, cfg.set6),
+    }
 }
 
 /// Reconcile the dnsmasq garden config at `path` with the desired [`GardenConfig`].
@@ -263,12 +319,50 @@ mod tests {
             table: "inet#myt".into(),
             set4: "g4".into(),
             set6: "g6".into(),
+            backend: GardenBackend::Nft,
         };
         assert_eq!(
             render_dnsmasq(&cfg),
             "nftset=/x.example/4#inet#myt#g4\n\
              nftset=/x.example/6#inet#myt#g6\n"
         );
+    }
+
+    #[test]
+    fn ipset_render_known_list_exact() {
+        let cfg = GardenConfig::with_fqdns_for(
+            GardenBackend::Ipset,
+            ["portal.wifihub.vn", "cdn.wifihub.vn"],
+        );
+        // One `ipset=` directive listing both family-specific sets; FQDNs sorted.
+        assert_eq!(
+            render_dnsmasq(&cfg),
+            "ipset=/cdn.wifihub.vn/portal.wifihub.vn/wifihub_g4,wifihub_g6\n"
+        );
+    }
+
+    #[test]
+    fn ipset_render_empty_list() {
+        let cfg = GardenConfig::with_fqdns_for(GardenBackend::Ipset, Vec::<String>::new());
+        // No FQDNs -> bare `/` before the set names; directive shape invariant.
+        assert_eq!(render_dnsmasq(&cfg), "ipset=/wifihub_g4,wifihub_g6\n");
+    }
+
+    #[test]
+    fn ipset_backend_uses_wifihub_set_names() {
+        let cfg = GardenConfig::with_fqdns_for(GardenBackend::Ipset, ["a.example"]);
+        assert_eq!(cfg.backend, GardenBackend::Ipset);
+        assert_eq!(cfg.set4, "wifihub_g4");
+        assert_eq!(cfg.set6, "wifihub_g6");
+    }
+
+    #[test]
+    fn nft_and_ipset_render_differ_for_same_fqdns() {
+        let nft = GardenConfig::with_fqdns_for(GardenBackend::Nft, ["a.example"]);
+        let ipset = GardenConfig::with_fqdns_for(GardenBackend::Ipset, ["a.example"]);
+        assert!(render_dnsmasq(&nft).starts_with("nftset="));
+        assert!(render_dnsmasq(&ipset).starts_with("ipset="));
+        assert_ne!(render_dnsmasq(&nft), render_dnsmasq(&ipset));
     }
 
     #[test]

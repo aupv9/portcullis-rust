@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use portcullis_session::SessionManager;
-use portcullis_types::{Counter, Gauge, Metric, MetricsSink};
+use portcullis_types::{Counter, Gauge, Metric, MetricsSink, MetricsSnapshot};
 
 /// Counter-backed metrics recorder. Implements [`MetricsSink`]; a shared `Arc` is
 /// handed to the session manager, the nft writer, and the redirect responder.
@@ -30,6 +30,8 @@ pub struct Metrics {
     reconciles: Counter,
     reconcile_repairs: Counter,
     cp_disconnects: Counter,
+    flows_reaped: Counter,
+    reap_failures: Counter,
     active_sessions: Counter,
 }
 
@@ -50,6 +52,8 @@ impl Metrics {
             ("portcullis_reconcile_total", self.reconciles.get()),
             ("portcullis_reconcile_repairs_total", self.reconcile_repairs.get()),
             ("portcullis_cp_disconnects_total", self.cp_disconnects.get()),
+            ("portcullis_flows_reaped_total", self.flows_reaped.get()),
+            ("portcullis_reap_failures_total", self.reap_failures.get()),
         ] {
             let _ = writeln!(s, "# TYPE {name} counter");
             let _ = writeln!(s, "{name} {val}");
@@ -58,6 +62,23 @@ impl Metrics {
         let _ = writeln!(s, "# TYPE portcullis_active_sessions gauge");
         let _ = writeln!(s, "portcullis_active_sessions {}", self.active_sessions.get());
         s
+    }
+
+    /// Point-in-time counter snapshot for the `GetMetrics` RPC (G4). Reads the
+    /// same cells as [`render`](Self::render); `sessions_active` reflects the
+    /// last value pushed to the gauge (refreshed at each `/metrics` scrape).
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            sessions_active: self.active_sessions.get(),
+            grants_total: self.grants.get(),
+            revokes_total: self.revokes.get(),
+            expires_total: self.expiries.get(),
+            quota_kills_total: self.quota_exceeded.get(),
+            flows_reaped_total: self.flows_reaped.get(),
+            reap_failures_total: self.reap_failures.get(),
+            nft_txn_errors_total: self.nft_txn_errors.get(),
+            cp_disconnects_total: self.cp_disconnects.get(),
+        }
     }
 }
 
@@ -73,6 +94,8 @@ impl MetricsSink for Metrics {
             Metric::Reconcile => &self.reconciles,
             Metric::ReconcileRepair => &self.reconcile_repairs,
             Metric::CpDisconnect => &self.cp_disconnects,
+            Metric::FlowsReaped => &self.flows_reaped,
+            Metric::ReapFailed => &self.reap_failures,
         };
         counter.inc();
     }
@@ -159,11 +182,13 @@ mod tests {
             Metric::Reconcile,
             Metric::ReconcileRepair,
             Metric::CpDisconnect,
+            Metric::FlowsReaped,
+            Metric::ReapFailed,
         ] {
             m.incr(metric);
         }
         let out = m.render();
-        // 9 counters at 1 + the gauge line.
-        assert_eq!(out.matches(" 1\n").count(), 9, "each counter should read 1:\n{out}");
+        // 11 counters at 1 + the gauge line.
+        assert_eq!(out.matches(" 1\n").count(), 11, "each counter should read 1:\n{out}");
     }
 }

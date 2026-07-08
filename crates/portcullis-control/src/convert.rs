@@ -10,8 +10,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use portcullis_types::{
-    Error, GrantParams, HealthStatus, MacAddr, ProvisionState, Result, RevokeReason, SessionEvent,
-    SessionId, SessionInfo, SsidSpec, Tier, WirelessDesiredState, WirelessStatus,
+    EngineInfoSnapshot, EngineParameters, Error, GrantParams, HealthStatus, MacAddr,
+    MetricsSnapshot, ProvisionState, Result, RevokeReason, SessionEvent, SessionId, SessionInfo,
+    SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessStatus,
 };
 
 use crate::pb;
@@ -58,6 +59,79 @@ pub fn grant_request_to_params(req: pb::GrantRequest) -> Result<GrantParams> {
         tier,
         session_id: SessionId::from(req.session_id),
     })
+}
+
+/// Fill a grant's unset (`0`) `ttl`/`quota` from the named tier's policy (G3a).
+/// `rate_bps` is deliberately left alone until G5 lifts the Phase-1 rejection in
+/// [`grant_request_to_params`] — accepting a rate cap the engine can't yet
+/// enforce would tell the control plane a cap is in effect when it isn't.
+pub fn apply_tier_defaults(req: &mut pb::GrantRequest, pol: &TierPolicy) {
+    if req.ttl_seconds == 0 {
+        req.ttl_seconds = pol.ttl_secs;
+    }
+    if req.quota_bytes == 0 {
+        req.quota_bytes = pol.quota_bytes;
+    }
+}
+
+/// Wire [`pb::SetTierPoliciesRequest`] -> domain tier policies (G3a). Validation
+/// (name shape, duplicates) is done by the [`EngineControl`] impl on apply.
+///
+/// [`EngineControl`]: portcullis_types::EngineControl
+pub fn tier_policies_from_pb(req: pb::SetTierPoliciesRequest) -> Vec<TierPolicy> {
+    req.policies
+        .into_iter()
+        .map(|p| TierPolicy {
+            tier: p.tier,
+            ttl_secs: p.ttl_seconds,
+            quota_bytes: p.quota_bytes,
+            rate_bps: p.rate_bps,
+        })
+        .collect()
+}
+
+/// Wire [`pb::SetEngineParametersRequest`] -> domain [`EngineParameters`] (G3a).
+/// Per the proto, `0` means "use the engine built-in default" for every field
+/// EXCEPT `idle_timeout_secs`, where `0` means "disabled". Bounds are enforced by
+/// [`EngineParameters::validate`] on apply.
+pub fn engine_params_from_pb(req: pb::SetEngineParametersRequest) -> EngineParameters {
+    let d = EngineParameters::default();
+    let or_default = |v: u32, dflt: u32| if v == 0 { dflt } else { v };
+    EngineParameters {
+        accounting_interval_secs: or_default(req.accounting_interval_secs, d.accounting_interval_secs),
+        garden_tick_secs: or_default(req.garden_tick_secs, d.garden_tick_secs),
+        expiry_tick_secs: or_default(req.expiry_tick_secs, d.expiry_tick_secs),
+        max_sessions: or_default(req.max_sessions, d.max_sessions),
+        idle_timeout_secs: req.idle_timeout_secs, // 0 = disabled (kept verbatim)
+    }
+}
+
+/// Domain [`EngineInfoSnapshot`] -> wire [`pb::EngineInfo`] (G4). Fields this
+/// snapshot doesn't own (event seqs, wireless hash) default to 0/empty.
+pub fn engine_info_to_pb(info: EngineInfoSnapshot) -> pb::EngineInfo {
+    pb::EngineInfo {
+        version: info.version,
+        boot_id: info.boot_id,
+        capabilities: info.capabilities,
+        enforcement_enabled: info.enforcement_enabled,
+        tier_policies_hash: info.tier_policies_hash,
+        engine_params_hash: info.engine_params_hash,
+        garden_hash: info.garden_hash,
+        ..Default::default()
+    }
+}
+
+/// Domain [`MetricsSnapshot`] -> wire [`pb::MetricsReply`] (G4). Counters the
+/// snapshot doesn't carry (grant_failures, event buffer, shaper, rss) default to 0.
+pub fn metrics_to_pb(m: MetricsSnapshot) -> pb::MetricsReply {
+    pb::MetricsReply {
+        sessions_active: m.sessions_active,
+        grants_total: m.grants_total,
+        revokes_total: m.revokes_total,
+        expires_total: m.expires_total,
+        quota_kills_total: m.quota_kills_total,
+        ..Default::default()
+    }
 }
 
 /// Parse a wire MAC string into a [`MacAddr`], rejecting anything malformed.
@@ -593,5 +667,58 @@ mod tests {
         assert_eq!(pb.state, pb::ProvisionState::ProvisionCommitted as i32);
         assert_eq!(pb.per_ssid.len(), 1);
         assert_eq!(pb.per_ssid[0].iface, "br-public");
+    }
+
+    // ---- config-push conversions (G3a) ----
+
+    #[test]
+    fn apply_tier_defaults_fills_only_unset_ttl_and_quota() {
+        let pol = TierPolicy { tier: "vip".into(), ttl_secs: 7200, quota_bytes: 5_000, rate_bps: 999 };
+        // ttl/quota unset (0) -> filled; rate deliberately untouched (G5).
+        let mut a = pb::GrantRequest { ttl_seconds: 0, quota_bytes: 0, ..Default::default() };
+        apply_tier_defaults(&mut a, &pol);
+        assert_eq!(a.ttl_seconds, 7200);
+        assert_eq!(a.quota_bytes, 5_000);
+        assert_eq!(a.rate_bps, 0, "rate must NOT be filled from the tier until G5");
+        // explicit non-zero values are preserved (not overwritten by the tier).
+        let mut b = pb::GrantRequest { ttl_seconds: 60, quota_bytes: 100, ..Default::default() };
+        apply_tier_defaults(&mut b, &pol);
+        assert_eq!(b.ttl_seconds, 60);
+        assert_eq!(b.quota_bytes, 100);
+    }
+
+    #[test]
+    fn engine_params_from_pb_maps_zero_to_default_except_idle() {
+        let d = EngineParameters::default();
+        let req = pb::SetEngineParametersRequest {
+            accounting_interval_secs: 0, // -> default
+            garden_tick_secs: 45,        // -> kept
+            expiry_tick_secs: 0,         // -> default
+            max_sessions: 0,             // -> default
+            idle_timeout_secs: 0,        // -> stays 0 (disabled), NOT default
+        };
+        let p = engine_params_from_pb(req);
+        assert_eq!(p.accounting_interval_secs, d.accounting_interval_secs);
+        assert_eq!(p.garden_tick_secs, 45);
+        assert_eq!(p.expiry_tick_secs, d.expiry_tick_secs);
+        assert_eq!(p.max_sessions, d.max_sessions);
+        assert_eq!(p.idle_timeout_secs, 0, "idle 0 = disabled, must not become a default");
+    }
+
+    #[test]
+    fn tier_policies_from_pb_maps_fields() {
+        let req = pb::SetTierPoliciesRequest {
+            policies: vec![pb::TierPolicy {
+                tier: "home".into(),
+                ttl_seconds: 3600,
+                quota_bytes: 1_000,
+                rate_bps: 2_000,
+            }],
+        };
+        let out = tier_policies_from_pb(req);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tier, "home");
+        assert_eq!(out[0].ttl_secs, 3600);
+        assert_eq!(out[0].rate_bps, 2_000);
     }
 }

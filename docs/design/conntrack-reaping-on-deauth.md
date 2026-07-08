@@ -1,6 +1,12 @@
 # Design: conntrack reaping on de-auth — closing the established-flow leak
 
-Status: **Proposed** — not yet implemented.
+Status: **Implemented** (engine/Rust side) — Phases 0–5 landed (`FlowReaper` +
+`NoopReaper` in `portcullis-types`; `ConntrackReaper` + `reap_orphan_flows` +
+`run_reap_loop` in `portcullis-accounting`; de-auth reaping wired into
+`SessionManager::{revoke_internal, tick_expiry}`; reconcile sweep + cold-start
+reap in the composition root; `reap_conntrack` config, default on). Invariant #9
+recorded in `CLAUDE.md`. Phase 6 (netns E2E: revoke cuts a *live* flow) ships
+with the G9 harness. `NeighResolver::table()` provides the MAC→IP reverse lookup.
 Scope: `portcullis-session`, `portcullis-accounting`, `portcullis-nft`
 (`FirewallBackend`), `portcullis-types`, composition root. No proto/wire change.
 

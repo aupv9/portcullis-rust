@@ -29,7 +29,8 @@ use std::time::Duration;
 
 use futures::SinkExt;
 use portcullis_types::{
-    Enforcer, ProvisionState, Provisioner, RulesetWriter, SessionEvent, WirelessStatus,
+    EngineControl, Enforcer, ProvisionState, Provisioner, RulesetWriter, SessionEvent,
+    WirelessStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
@@ -70,6 +71,11 @@ pub struct ControlChannelConfig {
     /// (which re-applies only the scoped gating rules — never flushing the auth
     /// set). Best-effort: a re-scope failure leaves the prior scope live.
     pub writer: Arc<dyn RulesetWriter>,
+    /// Runtime control surface (G3/G4): the `Set*` config-push and `Get*`
+    /// introspection frames are dispatched here, and the `Grant` path resolves a
+    /// tier's default ttl/quota through it. Fail-closed: a rejected `Set*` is
+    /// answered `ok:false` (never a silent accept).
+    pub engine_control: Arc<dyn EngineControl>,
 }
 
 /// Run the control channel until `events` is closed (engine shutting down).
@@ -176,7 +182,7 @@ where
         tokio::select! {
             msg = inbound.message() => match msg {
                 Ok(Some(ctrl)) => {
-                    for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner).await {
+                    for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner, &cfg.engine_control).await {
                         if out_tx.send(out).await.is_err() {
                             return Ok(()); // outbound half gone; reconnect
                         }
@@ -233,6 +239,7 @@ async fn handle_control_frame(
     ctrl: pb::ControlFrame,
     enforcer: &Arc<dyn Enforcer>,
     provisioner: &Arc<dyn Provisioner>,
+    engine_control: &Arc<dyn EngineControl>,
 ) -> Vec<pb::EngineFrame> {
     let cid = ctrl.correlation_id;
     let Some(msg) = ctrl.msg else {
@@ -241,7 +248,13 @@ async fn handle_control_frame(
     };
 
     match msg {
-        control_frame::Msg::Grant(g) => {
+        control_frame::Msg::Grant(mut g) => {
+            // G3a: fill unset ttl/quota from the named tier's policy before
+            // converting (a grant that names a tier but omits limits inherits
+            // the CP-pushed defaults for that user-group).
+            if let Some(pol) = engine_control.tier_policy(&g.tier).await {
+                convert::apply_tier_defaults(&mut g, &pol);
+            }
             let ack = match convert::grant_request_to_params(g) {
                 Err(e) => ack_err(e),
                 Ok(params) => match enforcer.grant(params).await {
@@ -296,24 +309,51 @@ async fn handle_control_frame(
                 ))),
             )]
         }
-        // Config-push + introspection variants from the reconciled superset proto
-        // (SetTierPolicies/SetGarden/SetEnforcement/SetEngineParameters and the
-        // GetEngineInfo/GetMetrics queries). Not implemented yet: answer each Set*
-        // with a rejecting CommandAck (never fail open / never silently accept a
-        // config the engine won't apply) and the get_* queries likewise, so the
-        // control plane learns the engine lacks the capability instead of hanging.
-        control_frame::Msg::SetTierPolicies(_)
-        | control_frame::Msg::SetGarden(_)
-        | control_frame::Msg::SetEnforcement(_)
-        | control_frame::Msg::SetEngineParameters(_)
-        | control_frame::Msg::GetEngineInfo(_)
-        | control_frame::Msg::GetMetrics(_) => {
-            vec![frame(
-                cid,
-                engine_frame::Msg::Ack(ack_err(portcullis_types::Error::BadRequest(
-                    "config-push / introspection command not implemented by this engine".into(),
-                ))),
-            )]
+        // Config-push (G3) — each writes the runtime controller (validate →
+        // persist → publish). A rejected apply is answered `ok:false` (never a
+        // silent accept: the CP must not believe a config it can't apply took).
+        control_frame::Msg::SetTierPolicies(r) => {
+            let ack = match engine_control
+                .set_tier_policies(convert::tier_policies_from_pb(r))
+                .await
+            {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(e),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        control_frame::Msg::SetGarden(r) => {
+            let ack = match engine_control.set_garden(r.fqdns).await {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(e),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        control_frame::Msg::SetEnforcement(r) => {
+            let ack = match engine_control.set_enforcement(r.enabled).await {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(e),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        control_frame::Msg::SetEngineParameters(r) => {
+            let ack = match engine_control
+                .set_engine_parameters(convert::engine_params_from_pb(r))
+                .await
+            {
+                Ok(()) => ok_ack(),
+                Err(e) => ack_err(e),
+            };
+            vec![frame(cid, engine_frame::Msg::Ack(ack))]
+        }
+        // Introspection (G4) — pure reads of the runtime state + metrics recorder.
+        control_frame::Msg::GetEngineInfo(_) => {
+            let info = convert::engine_info_to_pb(engine_control.engine_info().await);
+            vec![frame(cid, engine_frame::Msg::EngineInfo(info))]
+        }
+        control_frame::Msg::GetMetrics(_) => {
+            let m = convert::metrics_to_pb(engine_control.metrics_snapshot().await);
+            vec![frame(cid, engine_frame::Msg::Metrics(m))]
         }
         // CP-managed wireless (P-W1) — routed to the ISOLATED Provisioner, never
         // the Enforcer (same isolation as hotspot provisioning). set/confirm are
@@ -573,6 +613,52 @@ mod tests {
         MockProvisioner::ok() as Arc<dyn Provisioner>
     }
 
+    /// Mock [`EngineControl`] for the config-push / introspection tests. Records
+    /// the last `set_*` and can serve a tier policy for the grant-resolution test.
+    #[derive(Default)]
+    struct MockControl {
+        last_enforcement: std::sync::Mutex<Option<bool>>,
+        last_tiers: std::sync::Mutex<Option<Vec<portcullis_types::TierPolicy>>>,
+    }
+    #[async_trait::async_trait]
+    impl EngineControl for MockControl {
+        async fn set_enforcement(&self, enabled: bool) -> portcullis_types::Result<()> {
+            *self.last_enforcement.lock().unwrap() = Some(enabled);
+            Ok(())
+        }
+        async fn set_garden(&self, _fqdns: Vec<String>) -> portcullis_types::Result<()> {
+            Ok(())
+        }
+        async fn set_tier_policies(
+            &self,
+            policies: Vec<portcullis_types::TierPolicy>,
+        ) -> portcullis_types::Result<()> {
+            *self.last_tiers.lock().unwrap() = Some(policies);
+            Ok(())
+        }
+        async fn set_engine_parameters(
+            &self,
+            params: portcullis_types::EngineParameters,
+        ) -> portcullis_types::Result<()> {
+            // Mirror the real controller: out-of-bounds is rejected, not clamped.
+            params.validate()
+        }
+        async fn engine_info(&self) -> portcullis_types::EngineInfoSnapshot {
+            portcullis_types::EngineInfoSnapshot { version: "test".into(), ..Default::default() }
+        }
+        async fn metrics_snapshot(&self) -> portcullis_types::MetricsSnapshot {
+            portcullis_types::MetricsSnapshot::default()
+        }
+        async fn tier_policy(&self, _tier: &str) -> Option<portcullis_types::TierPolicy> {
+            None
+        }
+    }
+
+    /// A no-op engine-control arc for tests that don't drive a config-push frame.
+    fn ec() -> Arc<dyn EngineControl> {
+        Arc::new(MockControl::default()) as Arc<dyn EngineControl>
+    }
+
     fn grant_ctrl(cid: u64, mac: &str) -> pb::ControlFrame {
         pb::ControlFrame {
             correlation_id: cid,
@@ -598,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn grant_frame_acks_ok_and_echoes_correlation() {
-        let out = handle_control_frame(grant_ctrl(7, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(grant_ctrl(7, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].correlation_id, 7);
         let ack = ack_of(&out[0]);
@@ -608,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_grant_acks_error_not_silent_accept() {
-        let out = handle_control_frame(grant_ctrl(1, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(grant_ctrl(1, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         let ack = ack_of(&out[0]);
         assert!(!ack.ok);
         assert!(!ack.message.is_empty());
@@ -616,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_mac_grant_acks_error() {
-        let out = handle_control_frame(grant_ctrl(1, "garbage"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(grant_ctrl(1, "garbage"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         let ack = ack_of(&out[0]);
         assert!(!ack.ok);
     }
@@ -630,7 +716,7 @@ mod tests {
                 reason: pb::RevokeReason::RevokeQuota as i32,
             })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert_eq!(out[0].correlation_id, 3);
         assert!(ack_of(&out[0]).ok);
     }
@@ -641,7 +727,7 @@ mod tests {
             correlation_id: 5,
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Session(_))));
         match &out[1].msg {
@@ -657,7 +743,7 @@ mod tests {
             correlation_id: 5,
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert_eq!(out.len(), 1);
         match &out[0].msg {
             Some(engine_frame::Msg::ListEnd(le)) => assert!(!le.ok),
@@ -671,7 +757,7 @@ mod tests {
             correlation_id: 9,
             msg: Some(control_frame::Msg::List(pb::ListRequest { page_size: 0, page_token: String::new() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         // 2 sessions + 1 list_end
         assert_eq!(out.len(), 3);
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Session(_))));
@@ -685,7 +771,7 @@ mod tests {
             correlation_id: 2,
             msg: Some(control_frame::Msg::Ping(pb::Ping { ts_unix: 100 })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         match &out[0].msg {
             Some(engine_frame::Msg::Health(h)) => assert!(h.backend_ok),
             other => panic!("expected Health, got {other:?}"),
@@ -695,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn empty_frame_is_ignored_no_panic() {
         let ctrl = pb::ControlFrame { correlation_id: 0, msg: None };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert!(out.is_empty());
     }
 
@@ -708,14 +794,14 @@ mod tests {
             correlation_id: 4,
             msg: Some(control_frame::Msg::ProvisionHotspot(pb::ProvisionHotspotRequest::default())),
         };
-        let out = handle_control_frame(hotspot, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(hotspot, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert!(!ack_of(&out[0]).ok, "ProvisionHotspot must be rejected (deprecated)");
 
         let confirm = pb::ControlFrame {
             correlation_id: 5,
             msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest::default())),
         };
-        let out = handle_control_frame(confirm, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov()).await;
+        let out = handle_control_frame(confirm, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
         assert!(!ack_of(&out[0]).ok, "ConfirmProvision must be rejected (deprecated)");
     }
 
@@ -759,6 +845,7 @@ mod tests {
             ctrl,
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &(MockProvisioner::ok() as Arc<dyn Provisioner>),
+            &ec(),
         )
         .await;
         assert_eq!(out[0].correlation_id, 9);
@@ -779,6 +866,7 @@ mod tests {
             ctrl,
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &(MockProvisioner::failing() as Arc<dyn Provisioner>),
+            &ec(),
         )
         .await;
         assert!(!ack_of(&out[0]).ok, "a rejected wireless push must ack error, never silent-accept");
@@ -794,6 +882,7 @@ mod tests {
             ctrl,
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &(MockProvisioner::ok() as Arc<dyn Provisioner>),
+            &ec(),
         )
         .await;
         assert_eq!(out.len(), 1);
@@ -802,5 +891,109 @@ mod tests {
             Some(engine_frame::Msg::WirelessConfig(c)) => assert_eq!(c.config_version, "cfg-live"),
             other => panic!("expected WirelessConfig, got {other:?}"),
         }
+    }
+
+    // ---- config-push + introspection (G3a / G4) ----
+
+    #[tokio::test]
+    async fn set_tier_policies_frame_acks_ok_and_applies() {
+        let control = Arc::new(MockControl::default());
+        let ctrl = pb::ControlFrame {
+            correlation_id: 3,
+            msg: Some(control_frame::Msg::SetTierPolicies(pb::SetTierPoliciesRequest {
+                policies: vec![pb::TierPolicy {
+                    tier: "vip".into(),
+                    ttl_seconds: 7200,
+                    quota_bytes: 0,
+                    rate_bps: 0,
+                }],
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &(control.clone() as Arc<dyn EngineControl>),
+        )
+        .await;
+        assert!(ack_of(&out[0]).ok);
+        assert_eq!(control.last_tiers.lock().unwrap().as_ref().unwrap()[0].tier, "vip");
+    }
+
+    #[tokio::test]
+    async fn set_engine_parameters_out_of_bounds_acks_error() {
+        // expiry_tick 999 is out of [1,60] -> rejected, never silently applied.
+        let ctrl = pb::ControlFrame {
+            correlation_id: 1,
+            msg: Some(control_frame::Msg::SetEngineParameters(pb::SetEngineParametersRequest {
+                accounting_interval_secs: 0,
+                garden_tick_secs: 0,
+                expiry_tick_secs: 999,
+                max_sessions: 0,
+                idle_timeout_secs: 0,
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+        )
+        .await;
+        assert!(!ack_of(&out[0]).ok, "out-of-bounds params must ack error");
+    }
+
+    #[tokio::test]
+    async fn set_enforcement_frame_toggles_and_acks() {
+        let control = Arc::new(MockControl::default());
+        let ctrl = pb::ControlFrame {
+            correlation_id: 2,
+            msg: Some(control_frame::Msg::SetEnforcement(pb::SetEnforcementRequest { enabled: false })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &(control.clone() as Arc<dyn EngineControl>),
+        )
+        .await;
+        assert!(ack_of(&out[0]).ok);
+        assert_eq!(*control.last_enforcement.lock().unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn get_engine_info_frame_returns_engine_info() {
+        let ctrl = pb::ControlFrame {
+            correlation_id: 4,
+            msg: Some(control_frame::Msg::GetEngineInfo(pb::Empty {})),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+        )
+        .await;
+        assert_eq!(out[0].correlation_id, 4);
+        match &out[0].msg {
+            Some(engine_frame::Msg::EngineInfo(i)) => assert_eq!(i.version, "test"),
+            other => panic!("expected EngineInfo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_metrics_frame_returns_metrics() {
+        let ctrl = pb::ControlFrame {
+            correlation_id: 6,
+            msg: Some(control_frame::Msg::GetMetrics(pb::Empty {})),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+        )
+        .await;
+        assert!(matches!(out[0].msg, Some(engine_frame::Msg::Metrics(_))));
     }
 }

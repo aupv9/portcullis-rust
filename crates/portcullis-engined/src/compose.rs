@@ -37,7 +37,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //    no nftables NAT chain support (CONFIG_NFT_NAT unset), so the auto-probe
     //    fails there and picks ipset + iptables/ip6tables (TDD §17 option B).
     //    Both implement the same FirewallBackend seam.
-    let backend = detect_backend(&cfg);
+    let (backend, garden_backend) = detect_backend(&cfg);
     let (writer_handle, _writer_join) =
         portcullis_nft::spawn_with_metrics(backend, metrics.clone());
     let writer: Arc<dyn RulesetWriter> = Arc::new(writer_handle);
@@ -68,6 +68,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // ensure_base + adoption succeeded → the kernel table is present and the
     // initial view is consistent; the periodic reconcile loop refreshes these.
     w.mgr.mark_reconcile(true, true);
+
+    // 4c. conntrack flow reaper (invariant #9, G1): removing a MAC from `@auth`
+    //     only gates NEW connections — established flows leak through the
+    //     `ct established,related accept` fast path. The reaper severs a client's
+    //     flows on de-auth. Injected into the SessionManager (fast path) and
+    //     driven by the reconcile sweep (step 7b). `reap_conntrack = false` (or a
+    //     device without `conntrack`) → NoopReaper (pre-invariant-#9 behaviour).
+    let reaper: Arc<dyn portcullis_types::FlowReaper> = if cfg.reap_conntrack {
+        Arc::new(portcullis_accounting::ConntrackReaper::default())
+    } else {
+        Arc::new(portcullis_types::NoopReaper)
+    };
+    w.mgr.set_reaper(reaper.clone());
 
     // F2: restore the enforcement scope from the last committed CP-managed
     // wireless config (persisted to tmpfs on confirm). Survives a daemon restart
@@ -117,6 +130,34 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     //    reconnects with backoff and sets the `cp_connected` health flag.
     match load_client_tls(&cfg) {
         Ok(Some(tls)) => {
+            // Runtime control state (F0): the CP-pushed config store + EngineControl
+            // controller, seeded from the static config until the CP pushes, and
+            // persisted to tmpfs so it survives a restart. Dispatches the Set*/Get*
+            // frames and resolves tier defaults on the grant path (G3/G4).
+            let boot_id = {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                format!("{:x}-{nanos:x}", std::process::id())
+            };
+            let seed = portcullis_types::RuntimeConfig {
+                enforcement_enabled: true,
+                garden_fqdns: cfg.garden_fqdn.clone(),
+                tier_policies: Vec::new(),
+                engine_params: portcullis_types::EngineParameters {
+                    accounting_interval_secs: cfg.accounting_interval.clamp(1, 3600) as u32,
+                    ..portcullis_types::EngineParameters::default()
+                },
+            };
+            let engine_control: Arc<dyn portcullis_types::EngineControl> =
+                Arc::new(crate::runtime::RuntimeController::new(
+                    crate::runtime::RUNTIME_STATE_PATH,
+                    env!("CARGO_PKG_VERSION"),
+                    boot_id,
+                    metrics.clone(),
+                    seed,
+                ));
             let chan_cfg = portcullis_control::ControlChannelConfig {
                 endpoint: cfg.control_endpoint.clone(),
                 tls,
@@ -127,6 +168,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 // P-W1: lets the channel re-scope enforcement to the committed
                 // wireless config's gated-SSID ifaces (never flushes the auth set).
                 writer: writer.clone(),
+                // G3/G4: config-push + introspection dispatch target.
+                engine_control,
             };
             let enforcer = w.mgr.clone() as Arc<dyn Enforcer>;
             let events = w.event_tx.clone();
@@ -205,10 +248,36 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }));
     }
 
-    // 8. Walled-garden reconciler (§7.3): keep dnsmasq's nftset config in sync
-    //    with the configured FQDN list.
+    // 7b. conntrack reconcile sweep (invariant #9, G1): periodically reap flows
+    //     of any neighbour whose MAC is no longer in `@auth`. Backstops the
+    //     de-auth fast path (IPs the session never recorded — dual-stack, DHCP
+    //     churn) and does the COLD-START reap (the first tick fires immediately,
+    //     severing flows left over from before this daemon adopted kernel state).
+    //     Only LAN neighbours are candidates, so the router's own IPs and the
+    //     outbound control-plane flow are never reaped. Skipped when reaping off.
+    if cfg.reap_conntrack {
+        let writer = writer.clone();
+        let resolver = Arc::new(portcullis_redirect::IpNeighResolver::new());
+        let reaper = reaper.clone();
+        let interval = Duration::from_secs(cfg.reconcile_interval.max(5));
+        tasks.push(tokio::spawn(async move {
+            portcullis_accounting::run_reap_loop(
+                writer,
+                resolver,
+                reaper,
+                interval,
+                std::future::pending::<()>(),
+            )
+            .await;
+        }));
+    }
+
+    // 8. Walled-garden reconciler (§7.3): keep dnsmasq's garden config in sync
+    //    with the configured FQDN list, using the directive family (`nftset=` vs
+    //    `ipset=`) that matches the selected firewall backend (G2).
     {
-        let garden = portcullis_garden::GardenConfig::with_fqdns(cfg.garden_fqdn.clone());
+        let garden =
+            portcullis_garden::GardenConfig::with_fqdns_for(garden_backend, cfg.garden_fqdn.clone());
         tasks.push(tokio::spawn(async move {
             portcullis_garden::run_garden_loop(GARDEN_CONF_PATH, garden, GARDEN_TICK).await;
         }));
@@ -304,7 +373,7 @@ fn metrics_listen_addr(cfg: &Config) -> std::net::SocketAddr {
 /// kernel for nft NAT chain support and falls back to the ipset+iptables backend
 /// on stock RutOS (no CONFIG_NFT_NAT). The ipset backend's tcp:80 REDIRECT is
 /// wired to `cfg.responder_port` so it always targets the live responder.
-fn detect_backend(cfg: &Config) -> Box<dyn FirewallBackend> {
+fn detect_backend(cfg: &Config) -> (Box<dyn FirewallBackend>, portcullis_garden::GardenBackend) {
     detect_backend_with(cfg, "nft")
 }
 
@@ -323,7 +392,10 @@ fn gated_ifaces(cfg: &Config) -> Vec<String> {
 
 /// [`detect_backend`] with an injectable `nft` program path for the probe (unit
 /// tests stand in a fake script, cf. the shaper's `fake_tc` pattern).
-fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> {
+fn detect_backend_with(
+    cfg: &Config,
+    nft_bin: &str,
+) -> (Box<dyn FirewallBackend>, portcullis_garden::GardenBackend) {
     let use_nft = match cfg.firewall_backend.as_str() {
         "nft" => true,
         "ipset" => false,
@@ -337,14 +409,20 @@ fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> 
     // P0: scope the FORWARD/PREROUTING gate to the hotspot interface so only the
     // public SSID is gated (br-lan untouched). Empty `hotspot_iface` → the
     // backend installs no gate at all (fail-OPEN; see the backend docs).
+    //
+    // The chosen backend also decides how dnsmasq syncs the walled garden
+    // (`nftset=` for nft sets vs `ipset=` for ipset sets, G2) — return it so the
+    // garden loop renders the matching directive family (a mismatch silently
+    // empties the garden).
     if use_nft {
         tracing::info!(
             backend = "nft",
             hotspot_iface = %cfg.hotspot_iface,
             "firewall backend selected"
         );
-        Box::new(
-            portcullis_nft::NftJsonBackend::default().with_gated_ifaces(gated_ifaces(cfg)),
+        (
+            Box::new(portcullis_nft::NftJsonBackend::default().with_gated_ifaces(gated_ifaces(cfg))),
+            portcullis_garden::GardenBackend::Nft,
         )
     } else {
         tracing::info!(
@@ -352,10 +430,13 @@ fn detect_backend_with(cfg: &Config, nft_bin: &str) -> Box<dyn FirewallBackend> 
             hotspot_iface = %cfg.hotspot_iface,
             "firewall backend selected"
         );
-        Box::new(
-            portcullis_nft::IpsetIptablesBackend::default()
-                .with_redirect_port(cfg.responder_port)
-                .with_gated_ifaces(gated_ifaces(cfg)),
+        (
+            Box::new(
+                portcullis_nft::IpsetIptablesBackend::default()
+                    .with_redirect_port(cfg.responder_port)
+                    .with_gated_ifaces(gated_ifaces(cfg)),
+            ),
+            portcullis_garden::GardenBackend::Ipset,
         )
     }
 }
@@ -521,16 +602,29 @@ mod tests {
         }
 
         // Forced choices never run the probe (the nft binary is absent here).
+        // detect_backend_with now also returns the matching GardenBackend (G2);
+        // assert both the adapter and the garden directive family line up.
+        use portcullis_garden::GardenBackend;
         let missing = "/nonexistent/portcullis-test-nft";
-        assert!(is_nft(detect_backend_with(&cfg("nft"), missing)).await);
-        assert!(is_ipset(detect_backend_with(&cfg("ipset"), missing)).await);
+        let (b, gb) = detect_backend_with(&cfg("nft"), missing);
+        assert!(is_nft(b).await);
+        assert_eq!(gb, GardenBackend::Nft);
+        let (b, gb) = detect_backend_with(&cfg("ipset"), missing);
+        assert!(is_ipset(b).await);
+        assert_eq!(gb, GardenBackend::Ipset);
 
         // auto: the probe outcome decides.
         let (nat_ok, _log) = fake_nft("auto-yes", false);
-        assert!(is_nft(detect_backend_with(&cfg("auto"), &nat_ok)).await);
+        let (b, gb) = detect_backend_with(&cfg("auto"), &nat_ok);
+        assert!(is_nft(b).await);
+        assert_eq!(gb, GardenBackend::Nft);
         let (no_nat, _log) = fake_nft("auto-no", true);
-        assert!(is_ipset(detect_backend_with(&cfg("auto"), &no_nat)).await);
+        let (b, gb) = detect_backend_with(&cfg("auto"), &no_nat);
+        assert!(is_ipset(b).await);
+        assert_eq!(gb, GardenBackend::Ipset);
         // ...and a box with no nft at all falls back to ipset (RUTM11 today).
-        assert!(is_ipset(detect_backend_with(&cfg("auto"), missing)).await);
+        let (b, gb) = detect_backend_with(&cfg("auto"), missing);
+        assert!(is_ipset(b).await);
+        assert_eq!(gb, GardenBackend::Ipset);
     }
 }

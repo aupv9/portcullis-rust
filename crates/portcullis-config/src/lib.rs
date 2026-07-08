@@ -109,6 +109,18 @@ pub struct Config {
     /// `deny_unknown_fields`.
     #[serde(default)]
     pub hotspot_iface: String,
+
+    /// Reap established conntrack flows on de-auth (revoke/expiry/quota/idle) and
+    /// via a periodic reconcile sweep — invariant #9, conntrack ⊆ auth. On (the
+    /// default) closes the "established flow leaks past de-auth" bug; requires the
+    /// `conntrack` binary (already a metering dependency). Set `false` to disable
+    /// (e.g. a device without `conntrack`). `#[serde(default)]` for back-compat.
+    #[serde(default = "default_reap_conntrack")]
+    pub reap_conntrack: bool,
+}
+
+fn default_reap_conntrack() -> bool {
+    true
 }
 
 fn default_metrics_port() -> u16 {
@@ -156,6 +168,7 @@ impl Default for Config {
             garden_fqdn: Vec::new(),
             firewall_backend: default_firewall_backend(),
             hotspot_iface: String::new(),
+            reap_conntrack: default_reap_conntrack(),
         }
     }
 }
@@ -317,6 +330,15 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
             Error::Config(format!("UCI line {lineno}: '{key}' expects a u64, got '{v}'"))
         })
     };
+    let parse_bool = |v: &str| -> Result<bool> {
+        match v {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(Error::Config(format!(
+                "UCI line {lineno}: '{key}' expects a bool (0/1/true/false), got '{v}'"
+            ))),
+        }
+    };
 
     match key {
         "store_id" => cfg.store_id = val.to_string(),
@@ -335,6 +357,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "reconcile_interval" => cfg.reconcile_interval = parse_u64(val)?,
         "firewall_backend" => cfg.firewall_backend = val.to_string(),
         "hotspot_iface" => cfg.hotspot_iface = val.to_string(),
+        "reap_conntrack" => cfg.reap_conntrack = parse_bool(val)?,
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -579,6 +602,8 @@ config portcullis 'main'
             ],
             firewall_backend: "auto".to_string(),
             hotspot_iface: "br-hotspot".to_string(),
+            // non-default so the roundtrip actually exercises the field.
+            reap_conntrack: false,
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
