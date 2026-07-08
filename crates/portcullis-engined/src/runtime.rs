@@ -1,16 +1,10 @@
-//! Runtime control state store + [`EngineControl`] controller (F0).
+//! Runtime control-state store + [`EngineControl`] controller — see ADR-0012.
 //!
-//! Holds the config the control plane pushes at runtime — tier policies, the
-//! walled-garden FQDN list, the global enforcement toggle, and the tunable
-//! timers/caps — in RAM, persisted to **tmpfs** (`/tmp/portcullis/`, never NAND)
-//! so it survives a daemon restart and is re-adopted at startup alongside the
-//! kernel `@auth` set. This is the keystone the G3/G4 handlers write through.
-//!
-//! Effects (garden reconcile from this state, enforcement teardown, timer
-//! re-arm) are delivered over `watch` channels the relevant loops subscribe to —
-//! a `set_*` mutates the state, persists it, and publishes the new value; the
-//! loops pick it up without a restart. Persistence failures are logged, never
-//! fatal (tmpfs is best-effort; the kernel set-element timeout is the backstop).
+//! Holds the CP-pushed runtime config (tier policies, garden list, enforcement
+//! toggle, tunable timers/caps) in RAM, persisted to tmpfs so it survives a
+//! restart. A `set_*` mutates + persists + publishes on a `watch` channel; the
+//! relevant loop applies the effect without a restart. Persistence is best-effort
+//! (logged, never fatal — the kernel set-element timeout is the backstop).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
