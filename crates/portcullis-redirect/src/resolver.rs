@@ -147,6 +147,26 @@ impl NeighResolver for IpNeighResolver {
             .filter(|(ip, _)| want.contains(ip))
             .collect())
     }
+
+    /// Full neighbour-table dump for the conntrack reconcile sweep's reverse
+    /// (MAC → IP) lookup (invariant #9). Same `ip neigh show` as `resolve_many`,
+    /// but returns every `(ip, mac)` instead of filtering to a request set.
+    async fn table(&self) -> Result<Vec<(IpAddr, MacAddr)>> {
+        let out = Command::new(&self.ip_bin)
+            .arg("neigh")
+            .arg("show")
+            .output()
+            .await
+            .map_err(|e| Error::Other(format!("ip neigh show (table dump): {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Other(format!(
+                "ip neigh show (table dump) exited with status {}",
+                out.status
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(Self::parse_neigh_table(&text))
+    }
 }
 
 /// In-memory resolver for unit tests: a fixed IP -> MAC map.

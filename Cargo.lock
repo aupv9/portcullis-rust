@@ -684,6 +684,7 @@ dependencies = [
  "portcullis-redirect",
  "portcullis-session",
  "portcullis-types",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",

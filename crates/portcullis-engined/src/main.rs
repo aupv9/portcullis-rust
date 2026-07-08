@@ -26,6 +26,7 @@ use portcullis_types::{EventSink, RulesetWriter};
 
 mod compose;
 mod metrics;
+mod runtime;
 
 /// Default portal base for the signed redirect (§7.2). Overridable via the
 /// `PORTCULLIS_PORTAL_URL` env var; the UCI config (§9) doesn't carry it.

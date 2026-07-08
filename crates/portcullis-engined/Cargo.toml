@@ -28,6 +28,7 @@ async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 
 # Build-only workaround, not used directly. Under `-Z build-std` (the tier-3
 # mipsel/mips cross-build), cargo's feature resolver drops the `default`/`std`

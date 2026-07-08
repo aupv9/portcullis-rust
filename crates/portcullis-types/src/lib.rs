@@ -429,6 +429,22 @@ pub trait NeighResolver: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Dump the full neighbour table as `(ip, mac)` pairs.
+    ///
+    /// This is the **reverse** lookup (MAC ← every IP that maps to it) used by
+    /// the conntrack reaper's cold-start + reconcile sweep to find the IPs of
+    /// MACs no longer in `@auth` (invariant #9, conntrack ⊆ auth). Only LAN
+    /// neighbours appear here, so the router's own IPs and the outbound
+    /// control-plane flow are structurally never candidates.
+    ///
+    /// The default returns empty — an adapter with no table dump simply
+    /// contributes no reverse lookups (the de-auth fast path still reaps the
+    /// session's recorded IP). A whole-dump failure returns `Err` so the caller
+    /// can skip the sweep (never fail open).
+    async fn table(&self) -> Result<Vec<(IpAddr, MacAddr)>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Snapshot of per-client byte counters from conntrack (TDD §7.6). Implemented
@@ -456,6 +472,199 @@ pub trait Enforcer: Send + Sync {
 #[async_trait]
 pub trait MeteringSink: Send + Sync {
     async fn apply_counters(&self, snapshot: Vec<(MacAddr, Counters)>) -> Result<()>;
+}
+
+/// Delete established conntrack flows by client source IP (invariant #9,
+/// conntrack ⊆ auth). Implemented by `portcullis-accounting` (shells
+/// `conntrack -D -s <ip>`); injected into the SessionManager (de-auth path) and
+/// the reconcile sweep.
+///
+/// Closing the leak: removing a MAC from `@auth` only gates *new* connections —
+/// an already-established flow sails through the `ct established,related accept`
+/// fast path indefinitely. Reaping the client's flows on de-auth severs those.
+///
+/// Fail-closed: a reap error is a *degradation* (the leaked flow persists until
+/// the next reconcile), never a fail-open — it must not abort the revoke or
+/// unblock the gate. "Nothing to delete" is `Ok(0)`, not an error.
+#[async_trait]
+pub trait FlowReaper: Send + Sync {
+    /// Delete every conntrack flow whose original source is `ip`. Returns the
+    /// number of flows removed (`Ok(0)` when there was nothing to delete).
+    async fn reap_by_ip(&self, ip: IpAddr) -> Result<usize>;
+}
+
+/// No-op reaper — the default when conntrack reaping is disabled or in tests
+/// (mirrors [`NoopMetrics`] / the accounting `NoopShaper`). Every reap is a
+/// successful `Ok(0)`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopReaper;
+
+#[async_trait]
+impl FlowReaper for NoopReaper {
+    async fn reap_by_ip(&self, _ip: IpAddr) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime control state (F0) — config the control plane pushes at runtime and
+// the engine holds in RAM (persisted to tmpfs, never NAND). Distinct from the
+// startup `portcullis-config::Config` (foundational bindings, restart-only):
+// these are the hot, CP-managed knobs — tier policies, garden list, the global
+// enforcement toggle, and the tunable timers/caps.
+// ---------------------------------------------------------------------------
+
+/// Grant-policy defaults for a tier. When a grant names this `tier` but leaves a
+/// field unset (`0`), the engine fills it from here (CP-pushed via
+/// `SetTierPolicies`). This is how "user groups" (guest vs VIP) map to different
+/// TTL / quota / rate without a separate SSID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierPolicy {
+    /// Tier name, `[a-z0-9_-]{1,32}` (conventionally `public` | `home` | `retail`).
+    pub tier: String,
+    /// Session length; `0` = unset → engine built-in default.
+    pub ttl_secs: u32,
+    /// Byte quota; `0` = unlimited.
+    pub quota_bytes: u64,
+    /// Bandwidth cap (bits/sec); `0` = unlimited (shaping applied by G5).
+    pub rate_bps: u64,
+}
+
+impl TierPolicy {
+    /// A tier name is valid iff it is 1..=32 chars of `[a-z0-9_-]`.
+    pub fn valid_tier_name(tier: &str) -> bool {
+        !tier.is_empty()
+            && tier.len() <= 32
+            && tier.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+}
+
+/// Runtime-tunable engine parameters (CP-pushed via `SetEngineParameters`). Held
+/// as effective values; the [`Default`] is the engine's built-in default set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineParameters {
+    pub accounting_interval_secs: u32,
+    pub garden_tick_secs: u32,
+    pub expiry_tick_secs: u32,
+    pub max_sessions: u32,
+    /// Idle-kill threshold; `0` = disabled (G6).
+    pub idle_timeout_secs: u32,
+}
+
+impl Default for EngineParameters {
+    fn default() -> Self {
+        EngineParameters {
+            accounting_interval_secs: 15,
+            garden_tick_secs: 30,
+            expiry_tick_secs: 1,
+            max_sessions: 4096,
+            idle_timeout_secs: 0,
+        }
+    }
+}
+
+impl EngineParameters {
+    /// Validate against the wire-documented bounds; `Err` names the offender so
+    /// the CP is told a bad param was rejected (never silently clamped).
+    pub fn validate(&self) -> Result<()> {
+        let check = |name: &str, v: u32, lo: u32, hi: u32| -> Result<()> {
+            if v < lo || v > hi {
+                Err(Error::Config(format!(
+                    "{name}={v} out of bounds [{lo},{hi}]"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        check("accounting_interval_secs", self.accounting_interval_secs, 1, 3600)?;
+        check("garden_tick_secs", self.garden_tick_secs, 5, 3600)?;
+        check("expiry_tick_secs", self.expiry_tick_secs, 1, 60)?;
+        check("max_sessions", self.max_sessions, 1, 16384)?;
+        // idle_timeout: 0 = disabled, else [30, 86400].
+        if self.idle_timeout_secs != 0 {
+            check("idle_timeout_secs", self.idle_timeout_secs, 30, 86400)?;
+        }
+        Ok(())
+    }
+}
+
+/// The full CP-pushed runtime state, persisted to tmpfs so it survives a daemon
+/// restart (adopted at startup alongside the kernel `@auth` set).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Global gate. `true` (the default) = blocking unauthenticated traffic.
+    pub enforcement_enabled: bool,
+    /// CP-managed walled-garden FQDNs (fed to the garden renderer).
+    pub garden_fqdns: Vec<String>,
+    /// Per-tier grant defaults.
+    pub tier_policies: Vec<TierPolicy>,
+    /// Runtime-tunable timers/caps.
+    pub engine_params: EngineParameters,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        // Enforcing by default — the engine gates from boot, before the CP
+        // pushes anything (fail-closed).
+        RuntimeConfig {
+            enforcement_enabled: true,
+            garden_fqdns: Vec::new(),
+            tier_policies: Vec::new(),
+            engine_params: EngineParameters::default(),
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// Look up a tier's policy by name.
+    pub fn tier_policy(&self, tier: &str) -> Option<&TierPolicy> {
+        self.tier_policies.iter().find(|p| p.tier == tier)
+    }
+}
+
+/// Point-in-time engine identity + config-drift snapshot (returned by
+/// `GetEngineInfo`). Hashes let a fleet controller detect config drift.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineInfoSnapshot {
+    pub version: String,
+    pub boot_id: String,
+    pub capabilities: Vec<String>,
+    pub enforcement_enabled: bool,
+    pub tier_policies_hash: String,
+    pub engine_params_hash: String,
+    pub garden_hash: String,
+}
+
+/// Runtime counter snapshot (returned by `GetMetrics`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub sessions_active: u64,
+    pub grants_total: u64,
+    pub revokes_total: u64,
+    pub expires_total: u64,
+    pub quota_kills_total: u64,
+    pub flows_reaped_total: u64,
+    pub reap_failures_total: u64,
+    pub nft_txn_errors_total: u64,
+    pub cp_disconnects_total: u64,
+}
+
+/// Control-plane-facing configuration + introspection port (G3/G4). Implemented
+/// by the composition root's runtime controller and called by both the unary
+/// gRPC server and the Attach bidi-stream dispatcher, so on-net and CGNAT paths
+/// share one code path. Fail-closed: a `set_*` that can't be applied returns
+/// `Err` (the CP is told, never a silent accept).
+#[async_trait]
+pub trait EngineControl: Send + Sync {
+    async fn set_enforcement(&self, enabled: bool) -> Result<()>;
+    async fn set_garden(&self, fqdns: Vec<String>) -> Result<()>;
+    async fn set_tier_policies(&self, policies: Vec<TierPolicy>) -> Result<()>;
+    async fn set_engine_parameters(&self, params: EngineParameters) -> Result<()>;
+    async fn engine_info(&self) -> EngineInfoSnapshot;
+    async fn metrics_snapshot(&self) -> MetricsSnapshot;
+    /// Look up a tier's grant-policy defaults (used to fill unset ttl/quota/rate
+    /// on a grant that names the tier). `None` = no policy for that tier.
+    async fn tier_policy(&self, tier: &str) -> Option<TierPolicy>;
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +912,13 @@ pub enum Metric {
     Reconcile,
     ReconcileRepair,
     CpDisconnect,
+    /// A de-auth (revoke/expiry/quota/idle) or the reconcile sweep removed at
+    /// least one established conntrack flow for a no-longer-authorized client
+    /// (invariant #9, conntrack ⊆ auth).
+    FlowsReaped,
+    /// A conntrack reap attempt errored. The gate still holds (fail-closed); the
+    /// leaked flow may persist until the next reconcile tick.
+    ReapFailed,
 }
 
 /// A point-in-time gauge exported over `/metrics` (TDD §12).

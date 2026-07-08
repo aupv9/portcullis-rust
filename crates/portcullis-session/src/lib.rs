@@ -41,9 +41,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use portcullis_types::{
-    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, GrantParams, HealthStatus,
-    MacAddr, Metric, MeteringSink, MetricsSink, NoopMetrics, ReconcileReport, Result, RevokeReason,
-    RulesetWriter, SessionEvent, SessionId, SessionInfo, Tier, UnknownKernelPolicy,
+    AuthElement, Counters, Enforcer, Error, EventKind, EventSink, FlowReaper, GrantParams,
+    HealthStatus, MacAddr, Metric, MeteringSink, MetricsSink, NoopMetrics, NoopReaper,
+    ReconcileReport, Result, RevokeReason, RulesetWriter, SessionEvent, SessionId, SessionInfo,
+    Tier, UnknownKernelPolicy,
 };
 
 /// Minimum remaining TTL for the reconciler to bother re-adding a kernel-missing
@@ -140,6 +141,14 @@ pub struct SessionManager {
     /// behind a mutex because it is set once at startup and read cheaply
     /// thereafter (an `Arc` clone), avoiding a hard dependency in `new`.
     metrics: Mutex<Arc<dyn MetricsSink>>,
+    /// conntrack flow reaper (invariant #9). Defaults to [`NoopReaper`]; the
+    /// composition root installs the real [`ConntrackReaper`] via [`set_reaper`]
+    /// when `reap_conntrack` is enabled. Held behind a mutex (set once at
+    /// startup, cloned cheaply on the de-auth path) — same pattern as `metrics`.
+    ///
+    /// [`ConntrackReaper`]: portcullis_types::FlowReaper
+    /// [`set_reaper`]: SessionManager::set_reaper
+    reaper: Mutex<Arc<dyn FlowReaper>>,
 }
 
 impl SessionManager {
@@ -156,6 +165,37 @@ impl SessionManager {
                 last_reconcile_ok: false,
             }),
             metrics: Mutex::new(Arc::new(NoopMetrics)),
+            reaper: Mutex::new(Arc::new(NoopReaper)),
+        }
+    }
+
+    /// Install the conntrack flow reaper (composition root, once at startup).
+    /// Without this the manager de-auths without reaping (NoopReaper), i.e. the
+    /// pre-invariant-#9 behaviour — safe, but established flows leak.
+    pub fn set_reaper(&self, reaper: Arc<dyn FlowReaper>) {
+        *self.reaper.lock().expect("reaper mutex poisoned") = reaper;
+    }
+
+    /// Clone the current reaper handle (cheap `Arc` clone).
+    fn reaper(&self) -> Arc<dyn FlowReaper> {
+        self.reaper.lock().expect("reaper mutex poisoned").clone()
+    }
+
+    /// Reap the established conntrack flows for `ip` (invariant #9). Called after
+    /// `del_auth` on every de-auth path. Fail-closed: a reap error is logged +
+    /// metered and swallowed — it never aborts the revoke or unblocks the gate.
+    async fn reap_flows(&self, ip: std::net::IpAddr) {
+        match self.reaper().reap_by_ip(ip).await {
+            Ok(n) => {
+                if n > 0 {
+                    self.metrics().incr(Metric::FlowsReaped);
+                    tracing::debug!(%ip, reaped = n, "reaped conntrack flows on de-auth");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%ip, error = %e, "conntrack reap failed; gate still holds (fail-closed)");
+                self.metrics().incr(Metric::ReapFailed);
+            }
         }
     }
 
@@ -297,6 +337,12 @@ impl SessionManager {
             tracing::warn!(mac = %mac, error = %e, "del_auth failed during revoke; in-RAM session already removed");
         }
 
+        // Invariant #9: gating the MAC only stops *new* connections — sever the
+        // client's already-established flows so a revoked client actually drops.
+        if let Some(ip) = session.ip {
+            self.reap_flows(ip).await;
+        }
+
         self.sink
             .emit(Self::build_event(
                 session.session_id.clone(),
@@ -335,6 +381,11 @@ impl SessionManager {
         for session in &expired {
             if let Err(e) = self.writer.del_auth(session.mac).await {
                 tracing::warn!(mac = %session.mac, error = %e, "del_auth failed during expiry tick");
+            }
+            // Invariant #9: sever any established flow so an expired client's
+            // long-lived sockets stop, not just its new connections.
+            if let Some(ip) = session.ip {
+                self.reap_flows(ip).await;
             }
             self.sink
                 .emit(Self::build_event(
@@ -709,6 +760,37 @@ mod tests {
         (m, writer, sink)
     }
 
+    /// Records every IP handed to the reaper; optionally errors (to prove a reap
+    /// failure never aborts the de-auth — fail-closed, invariant #9).
+    #[derive(Default)]
+    struct RecordingReaper {
+        reaped: std::sync::Mutex<Vec<std::net::IpAddr>>,
+        fail: bool,
+    }
+    impl RecordingReaper {
+        fn failing() -> Self {
+            RecordingReaper { fail: true, ..Default::default() }
+        }
+        fn ips(&self) -> Vec<std::net::IpAddr> {
+            self.reaped.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl FlowReaper for RecordingReaper {
+        async fn reap_by_ip(&self, ip: std::net::IpAddr) -> Result<usize> {
+            self.reaped.lock().unwrap().push(ip);
+            if self.fail {
+                Err(Error::Counter("boom".into()))
+            } else {
+                Ok(1)
+            }
+        }
+    }
+
+    fn grant_params_ip(m: MacAddr, ip: &str, ttl_secs: u64) -> GrantParams {
+        GrantParams { ip: Some(ip.parse().unwrap()), ..grant_params(m, ttl_secs, 0) }
+    }
+
     // ---- tests ------------------------------------------------------------
 
     #[tokio::test]
@@ -763,6 +845,55 @@ mod tests {
         // del_auth called (belt-and-suspenders) and EXPIRED emitted.
         assert!(writer.ops().contains(&WriterOp::DelAuth(mac(3))));
         assert!(sink.kinds().contains(&EventKind::Expired));
+    }
+
+    #[tokio::test]
+    async fn revoke_reaps_flows_after_del_auth() {
+        let (m, writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(5), "10.0.0.5", 60), now).await.unwrap();
+
+        m.revoke(mac(5), RevokeReason::Admin).await.unwrap();
+        // Invariant #9: del_auth happened AND the client's IP was reaped.
+        assert!(writer.ops().contains(&WriterOp::DelAuth(mac(5))));
+        assert_eq!(reaper.ips(), vec!["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn revoke_without_recorded_ip_does_not_reap() {
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params(mac(6), 60, 0), now).await.unwrap(); // ip = None
+        m.revoke(mac(6), RevokeReason::Admin).await.unwrap();
+        assert!(reaper.ips().is_empty(), "no recorded IP -> nothing to reap");
+    }
+
+    #[tokio::test]
+    async fn reap_failure_does_not_abort_revoke() {
+        let (m, _writer, sink) = mgr();
+        m.set_reaper(Arc::new(RecordingReaper::failing()));
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(7), "10.0.0.7", 60), now).await.unwrap();
+        // The revoke still completes and emits despite the reaper erroring:
+        // a reap failure is a degradation, never a fail-open that blocks tear-down.
+        m.revoke(mac(7), RevokeReason::Admin).await.unwrap();
+        assert_eq!(m.len(), 0);
+        assert!(sink.kinds().contains(&EventKind::Revoked));
+    }
+
+    #[tokio::test]
+    async fn expiry_reaps_flows() {
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(8), "10.0.0.8", 10), now).await.unwrap();
+        m.tick_expiry(now + Duration::from_secs(10)).await;
+        assert_eq!(reaper.ips(), vec!["10.0.0.8".parse::<std::net::IpAddr>().unwrap()]);
     }
 
     #[tokio::test]
