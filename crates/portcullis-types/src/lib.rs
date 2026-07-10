@@ -391,6 +391,17 @@ pub trait RulesetWriter: Send + Sync {
     async fn set_gated_ifaces(&self, _ifaces: Vec<String>) -> Result<()> {
         Ok(())
     }
+
+    /// Add resolved walled-garden IPs to the garden sets (the "engine-resolver
+    /// garden": used on stock dnsmasq that lacks `ipset=`, where the engine
+    /// resolves each garden FQDN itself and tops up the sets so pre-auth clients
+    /// can reach the portal). ADDITIVE and idempotent — never flushes the sets.
+    /// Best-effort / fail-open (a missed garden IP never blocks a client, only
+    /// leaves one portal asset un-pre-allowed). Default is a no-op for test
+    /// doubles; the writer actor overrides it to forward to the [`FirewallBackend`].
+    async fn add_garden(&self, _ips: &[IpAddr]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Sink for session lifecycle events flowing engine -> control plane (TDD §7.5).

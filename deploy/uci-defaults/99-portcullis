@@ -27,20 +27,16 @@ chown portcullis:portcullis /etc/portcullis /etc/portcullis/tls 2>/dev/null || t
 # 3) tmpfs runtime state dir (never NAND — §5.4).
 mkdir -p /tmp/portcullis
 
-# 4) Wire the walled garden into dnsmasq-full via nftset (§7.3). dnsmasq resolves
-#    each garden FQDN and injects the IPs into the inet wifihub garden4/garden6
-#    sets. portcullis-garden reconciles this list at runtime; this seeds it.
-GARDEN_CONF=/etc/dnsmasq.d/portcullis-garden.conf
-mkdir -p /etc/dnsmasq.d
-if [ ! -f "$GARDEN_CONF" ]; then
-	cat >"$GARDEN_CONF" <<'EOF'
-# Managed by portcullis (seed). Runtime reconcile may rewrite this.
-nftset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/4#inet#wifihub#garden4
-nftset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/6#inet#wifihub#garden6
-EOF
-fi
-# dnsmasq must include conf-dir /etc/dnsmasq.d (default on RutOS); reload to apply.
-/etc/init.d/dnsmasq reload 2>/dev/null || true
+# 4) Walled garden: the ENGINE is the single owner of the dnsmasq garden conf at
+#    runtime (portcullis-garden). It probes dnsmasq for ipset/nftset support before
+#    writing (so a stock/slim dnsmasq is never handed a fatal `ipset=`/`nftset=`
+#    directive), picks the set family that MATCHES the chosen firewall backend
+#    (nft→nftset / ipset→ipset — a hardcoded seed here could disagree and silently
+#    empty the garden), validates every FQDN, and writes atomically.
+#    A pre-engine seed is therefore both unnecessary (no engine running = no gate,
+#    so the garden is moot) and dangerous (unprobed + wrong-family + on flash where
+#    the daemon's self-heal can't reach it). We deliberately DO NOT write one here.
+#    See RC/audit #5 (unprobed fatal conf on fresh boot) and #6 (family mismatch).
 
 # 5) Enable + start the service.
 /etc/init.d/portcullis enable 2>/dev/null || true

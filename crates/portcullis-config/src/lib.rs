@@ -347,8 +347,39 @@ impl Config {
                 self.firewall_backend
             )));
         }
+        // Each garden FQDN is written verbatim into a dnsmasq `ipset=`/`nftset=`
+        // directive; a newline/space/`#`/`/` would inject a directive or produce a
+        // malformed line dnsmasq treats as FATAL (whole-LAN DNS loss). Reject
+        // anything that isn't a plain hostname at config load, so a UCI typo is
+        // caught loudly (the engine's garden renderer also drops invalid entries as
+        // a defence-in-depth sink guard).
+        for fqdn in &self.garden_fqdn {
+            if !is_valid_garden_fqdn(fqdn) {
+                return Err(Error::Config(format!(
+                    "garden_fqdn '{fqdn}' is not a valid hostname (dot-separated [A-Za-z0-9-] labels)"
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// A plain DNS hostname safe to embed in a dnsmasq set directive (see
+/// `portcullis_garden::is_valid_fqdn`; duplicated here to keep config dependency-
+/// free): 1..=253 chars, dot-separated 1..=63-char labels of `[A-Za-z0-9-]`, no
+/// label edge `-`, no empty labels.
+fn is_valid_garden_fqdn(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 /// Apply a single `option <key> <value>` to the config, parsing typed fields.
@@ -663,6 +694,25 @@ config portcullis 'main'
         assert_eq!(d.default_quota_mb, 0);
         assert_eq!(d.default_rate_kbps, 2048);
         assert!(d.garden_fqdn.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_injection_garden_fqdn() {
+        // P0 #1 (config path): a garden_fqdn with a newline/space/`#` is rejected
+        // at load, so it can never reach the dnsmasq conf.
+        let bad = Config {
+            store_id: "S".into(),
+            garden_fqdn: vec!["ok.example".into(), "evil\nserver=/./6.6.6.6".into()],
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
+        // Clean list validates.
+        let good = Config {
+            store_id: "S".into(),
+            garden_fqdn: vec!["portal.wifihub.vn".into(), "cdn.wifihub.vn".into()],
+            ..Config::default()
+        };
+        assert!(good.validate().is_ok());
     }
 
     #[test]

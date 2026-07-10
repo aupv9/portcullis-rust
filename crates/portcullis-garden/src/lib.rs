@@ -126,16 +126,42 @@ impl GardenConfig {
     /// entries dropped. Keeping this pure (no I/O) makes [`render_dnsmasq`]
     /// byte-stable across runs, which is what lets [`reconcile`] be idempotent.
     fn normalised_fqdns(&self) -> Vec<&str> {
+        // Filter to VALID hostnames (P0 #1). Each entry is written verbatim into a
+        // dnsmasq `ipset=/<fqdn>/...` / `nftset=` directive; a value containing a
+        // newline, space, `#`, or `/` would inject an arbitrary dnsmasq directive
+        // (e.g. a rogue `server=`) or produce a malformed line dnsmasq treats as
+        // FATAL — crashing DNS for the whole LAN. This is the SINK guard: no matter
+        // the source (SetGarden RPC, UCI `list garden_fqdn`, config), a bad entry
+        // never reaches the conf. Loud rejection also happens at config-validate.
         let mut v: Vec<&str> = self
             .fqdns
             .iter()
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+            .filter(|s| is_valid_fqdn(s))
             .collect();
         v.sort_unstable();
         v.dedup();
         v
     }
+}
+
+/// A syntactically valid DNS hostname safe to embed in a dnsmasq set directive:
+/// 1..=253 chars, dot-separated labels of 1..=63 chars from `[A-Za-z0-9-]`, no
+/// label starting/ending with `-`, no empty labels (so no leading/trailing/double
+/// dot). This rejects every dnsmasq-directive-injection / conf-corruption vector
+/// (newline, space, `#`, `/`, `=`) since none are in the allowed charset.
+pub fn is_valid_fqdn(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 /// Render the dnsmasq garden directives for the given garden config (TDD §7.3) —
@@ -228,9 +254,19 @@ pub async fn reconcile(path: impl AsRef<Path>, cfg: &GardenConfig) -> Result<boo
         }
     }
 
-    tokio::fs::write(path, desired.as_bytes())
+    // Write atomically: a plain `fs::write` truncates-then-fills in place, so a
+    // dnsmasq reload/restart (a SEPARATE process — e.g. the wireless push's
+    // `dnsmasq restart`) that reads the file mid-write could see a truncated,
+    // half-written directive → parse error → FATAL → whole-LAN DNS loss (P1 #9).
+    // Write a temp sibling then `rename` (atomic on the same filesystem): a reader
+    // sees either the old file or the complete new one, never a partial line.
+    let tmp = path.with_extension("conf.tmp");
+    tokio::fs::write(&tmp, desired.as_bytes())
         .await
-        .map_err(|e| Error::Io(format!("writing garden config {}: {e}", path.display())))?;
+        .map_err(|e| Error::Io(format!("writing garden config {}: {e}", tmp.display())))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|e| Error::Io(format!("renaming garden config into {}: {e}", path.display())))?;
 
     Ok(true)
 }
@@ -423,5 +459,44 @@ mod tests {
         assert!(!reconcile(&path, &cfg2).await.unwrap());
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn is_valid_fqdn_accepts_hostnames_rejects_injection() {
+        for good in ["portal.wifihub.vn", "a.example", "cdn-1.example.co", "x", "otp.gateway"] {
+            assert!(is_valid_fqdn(good), "should accept {good:?}");
+        }
+        for bad in [
+            "",
+            "  ",
+            "evil\nconf-file=/etc/passwd",    // newline → directive injection
+            "foo bar.example",               // space
+            "a/b.example",                    // slash (directive separator)
+            "has#hash.example",              // '#'
+            "server=/./6.6.6.6",             // '=' + '/'
+            "-lead.example",                 // label edge '-'
+            "trail-.example",
+            "double..dot",                   // empty label
+            ".leading",
+            "trailing.",
+        ] {
+            assert!(!is_valid_fqdn(bad), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn render_drops_injection_fqdns_so_conf_cannot_be_corrupted() {
+        // P0 #1: an injection-bearing FQDN must never reach the rendered conf.
+        let cfg = GardenConfig::with_fqdns([
+            "good.example",
+            "evil\nserver=/./6.6.6.6", // would inject a rogue upstream if emitted
+            "bad host.example",
+        ]);
+        let out = render_dnsmasq(&cfg);
+        assert!(out.contains("good.example"), "valid entry kept: {out:?}");
+        assert!(!out.contains("evil"), "injection entry must be dropped: {out:?}");
+        assert!(!out.contains("server="), "no injected directive: {out:?}");
+        // Exactly two lines (the two set directives), no injected extra line.
+        assert_eq!(out.lines().count(), 2, "conf must stay 2 directives: {out:?}");
     }
 }

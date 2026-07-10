@@ -310,6 +310,31 @@ impl FirewallBackend for IpsetIptablesBackend {
         Self::run(&self.ipset_bin, &["del", "-exist", IPSET_AUTH, &mac]).await
     }
 
+    async fn add_garden(&self, ips: &[std::net::IpAddr]) -> Result<()> {
+        // Engine-resolver garden top-up: for each resolved garden IP, `ipset add
+        // -exist` it into the family-matching set (`-exist` = idempotent, and a
+        // re-add never errors). ADDITIVE only — never flushes, so it composes with
+        // the dnsmasq-populated path and never disturbs adopted state.
+        //
+        // Fail-OPEN per element (invariant carve-out, mirrored on the trait): a
+        // single bad add is logged and skipped, never aborts the batch and never
+        // returns an error. Unlike auth (a firewall mutation that MUST apply), a
+        // missed garden IP only means one captive-portal asset isn't pre-allowed
+        // — it can never block a client. The whole method returns Ok(()).
+        for ip in ips {
+            let addr = ip.to_string();
+            let set = if ip.is_ipv4() { IPSET_G4 } else { IPSET_G6 };
+            if let Err(e) = Self::run(&self.ipset_bin, &["add", "-exist", set, &addr]).await {
+                tracing::debug!(
+                    target: "portcullis_nft",
+                    %addr, set, error = %e,
+                    "garden ipset add failed; skipping (fail-open, best-effort allowlist)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn list_auth(&self) -> Result<Vec<AuthElement>> {
         let out = Self::run_stdout(&self.ipset_bin, &["list", IPSET_AUTH]).await?;
         Ok(parse_ipset_list(&out))
@@ -612,6 +637,55 @@ zz:zz:zz:zz:zz:zz timeout 5
         assert!(matches!(err, Error::Backend(_)), "got {err:?}");
     }
 
+    #[tokio::test]
+    async fn add_garden_routes_each_ip_to_its_family_set() {
+        // Engine-resolver garden: v4 IPs go to `wifihub_g4`, v6 to `wifihub_g6`,
+        // each via `ipset add -exist <set> <ip>` (idempotent, additive, no flush).
+        use std::net::IpAddr;
+        let (ipset, ilog, _dir) = fake_ipset_log("garden-add");
+        let backend = IpsetIptablesBackend::with_bins(&ipset, "/bin/true", "/bin/true");
+
+        let ips: Vec<IpAddr> = vec![
+            "1.2.3.4".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+            "5.6.7.8".parse().unwrap(),
+        ];
+        backend.add_garden(&ips).await.unwrap();
+
+        let calls = lines(&ilog);
+        assert!(
+            calls.iter().any(|l| l == "add -exist wifihub_g4 1.2.3.4"),
+            "v4 must land in wifihub_g4: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|l| l == "add -exist wifihub_g4 5.6.7.8"),
+            "v4 must land in wifihub_g4: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|l| l == "add -exist wifihub_g6 2606:4700:4700::1111"),
+            "v6 must land in wifihub_g6: {calls:?}"
+        );
+        // Never touches the auth set or flushes anything.
+        assert!(!calls.iter().any(|l| l.contains(IPSET_AUTH)));
+        assert!(!calls.iter().any(|l| l.contains("flush")));
+    }
+
+    #[tokio::test]
+    async fn add_garden_is_fail_open_per_element_and_never_errors() {
+        // A failing `ipset` (every add exits non-zero) must NOT surface an error
+        // from add_garden — it's a best-effort allowlist top-up, fail-open per
+        // element (unlike add_auth, which is a fail-closed enforcement mutation).
+        use std::net::IpAddr;
+        let backend = IpsetIptablesBackend::with_bins("/bin/false", "/bin/true", "/bin/true");
+        let ips: Vec<IpAddr> = vec!["1.2.3.4".parse().unwrap()];
+        backend.add_garden(&ips).await.unwrap(); // Ok despite the failing binary.
+
+        // Empty input is a clean no-op.
+        backend.add_garden(&[]).await.unwrap();
+    }
+
     /// A fake `ipset` binary: `add -exist <set> <mac> timeout <n>` appends a
     /// member line, `del -exist <set> <mac>` removes it, `list <set>` prints a
     /// realistic `Members:`-tailed dump. Members are stored in a sibling file so
@@ -664,6 +738,27 @@ exit 0
         std::fs::write(&script, body).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         (script.display().to_string(), dir)
+    }
+
+    /// A fake `ipset` binary that records every invocation's argv (one line per
+    /// call) into a log file and exits 0. For asserting the EXACT `ipset add`
+    /// argv `add_garden` issues (family set + address), without kernel state.
+    /// Returns `(bin, log, dir)`, mirroring `fake_iptables`.
+    fn fake_ipset_log(tag: &str) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portcullis-ipset-log-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ipset.log");
+        std::fs::write(&log, "").unwrap();
+        let script = dir.join("ipset");
+        let body = format!("#!/bin/sh\necho \"$@\" >> \"{log}\"\nexit 0\n", log = log.display());
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), log, dir)
     }
 
     /// A fake `iptables`/`ip6tables` binary that records every invocation's argv

@@ -40,6 +40,22 @@ pub trait FirewallBackend: Send + Sync {
     async fn set_gated_ifaces(&self, _ifaces: Vec<String>) -> Result<()> {
         Ok(())
     }
+
+    /// Add resolved walled-garden IPs to the garden sets (the "engine-resolver
+    /// garden", used when dnsmasq lacks the `ipset=` directive so the garden
+    /// sets can't be populated by DNS — see the daemon's compose loop). Each IP
+    /// lands in the family-matching set (`wifihub_g4`/`wifihub_g6`), additive and
+    /// idempotent — it NEVER flushes the set (the sets are shared with the
+    /// dnsmasq-populated path and with authorized state adoption). Fail-OPEN per
+    /// element (a bad add is logged and skipped, never an error): this is a
+    /// best-effort allowlist top-up, not enforcement — a missed garden IP only
+    /// means one captive-portal asset isn't pre-allowed, it never blocks a client.
+    /// Default is a no-op (the nft backend and [`MockBackend`] don't need it —
+    /// the nft path populates the garden via dnsmasq `nftset=`); the ipset
+    /// backend overrides it.
+    async fn add_garden(&self, _ips: &[std::net::IpAddr]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A mutation recorded by [`MockBackend`], for test assertions.

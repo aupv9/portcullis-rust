@@ -134,6 +134,13 @@ pub struct WirelessMarker {
     /// Owned section keys present after apply (the desired set). Rollback deletes
     /// those NOT in `snapshot.existing_sections` (i.e. the ones this apply added).
     pub current_sections: Vec<String>,
+    /// Bridge ifaces of the GATED SSIDs in this push (the enforcement scope to
+    /// persist on confirm). Persisted so a daemon restart mid-window can confirm
+    /// WITHOUT the desired-state (which the marker does not carry) yet still write
+    /// the correct committed-gated set — instead of an empty one that would silently
+    /// un-gate every captive SSID (P0 #2). Safe to comma-join: bridge names are
+    /// validated `is_uci_ident` (no commas / control chars).
+    pub gated_ifaces: Vec<String>,
     pub deadline_unix: i64,
     pub snapshot: Snapshot,
 }
@@ -144,6 +151,7 @@ impl WirelessMarker {
         s.push_str(&format!("config_version={}\n", self.config_version));
         s.push_str(&format!("radios={}\n", self.radios.join(",")));
         s.push_str(&format!("current_sections={}\n", self.current_sections.join(",")));
+        s.push_str(&format!("gated_ifaces={}\n", self.gated_ifaces.join(",")));
         s.push_str(&format!("deadline_unix={}\n", self.deadline_unix));
         s.push_str("---\n");
         s.push_str(&self.snapshot.to_text());
@@ -155,6 +163,7 @@ impl WirelessMarker {
         let mut config_version = String::new();
         let mut radios = Vec::new();
         let mut current_sections = Vec::new();
+        let mut gated_ifaces = Vec::new();
         let mut deadline_unix = None;
         for line in head.lines() {
             let (k, v) = line.split_once('=')?;
@@ -167,6 +176,10 @@ impl WirelessMarker {
                     current_sections =
                         v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
                 }
+                "gated_ifaces" => {
+                    gated_ifaces =
+                        v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                }
                 "deadline_unix" => deadline_unix = v.parse().ok(),
                 _ => {}
             }
@@ -175,6 +188,7 @@ impl WirelessMarker {
             config_version,
             radios,
             current_sections,
+            gated_ifaces,
             deadline_unix: deadline_unix?,
             snapshot: Snapshot::from_text(body),
         })
@@ -295,6 +309,9 @@ impl<R: CommandRunner> ProvisionMachine<R> {
                         tracing::debug!(cmd = ?cmd, error = %e, "uci delete of absent section ignored");
                         continue;
                     }
+                    // Staged sets so far are uncommitted — drop them so they can't
+                    // be flushed later by an external `uci commit` (P0 #3).
+                    self.revert_owned().await;
                     return Err(e);
                 }
             }
@@ -310,25 +327,42 @@ impl<R: CommandRunner> ProvisionMachine<R> {
             match self.runner.run(UCI, &["commit", cfg]).await {
                 Ok(_) => {}
                 Err(_) if cfg == "sqm" => {} // optional (sqm-scripts may be absent)
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A commit failed mid-sequence: earlier configs may already be
+                    // committed, the rest are still STAGED in /tmp/.uci. Drop the
+                    // staged remainder so a LATER external `uci commit` (RUTOS
+                    // config-manager, an admin) can't flush them and resurrect a
+                    // config we're abandoning (P0 #3). The caller rolls back
+                    // whatever DID commit.
+                    self.revert_owned().await;
+                    return Err(e);
+                }
             }
         }
-        self.runner.run(INIT_NETWORK, &["reload"]).await?;
-        self.runner.run(INIT_FIREWALL, &["reload"]).await?;
-        // Reload each affected radio with escalating recovery so a radio is NEVER
-        // left dark (RC4). Previously a single failing `wifi reload <r>` aborted the
-        // whole sequence with `?`, leaving that radio — and EVERY SSID on it,
-        // including the admin/management SSID — down until a reboot. Now every radio
-        // is attempted; a persistent failure escalates to a hard `wifi up <r>`;
-        // dnsmasq restarts regardless; the first unrecoverable error is surfaced (so
-        // the caller still rolls back), but the radios have already been forced up.
+        // Run the WHOLE reload sequence AND the liveness check even if a step
+        // fails — the first error is surfaced only at the end (so the caller still
+        // rolls back), but every radio is force-up'd and the ubus liveness recovery
+        // ALWAYS runs. A bare `?` here (as before) let a non-zero `dnsmasq restart`
+        // — which happens on trivial, non-fatal conditions on RutOS — skip the
+        // dark-radio recovery entirely AND spuriously roll back a healthy apply
+        // (P0 #4).
         let mut first_err: Option<ProvisionError> = None;
+        if let Err(e) = self.runner.run(INIT_NETWORK, &["reload"]).await {
+            first_err.get_or_insert(e);
+        }
+        if let Err(e) = self.runner.run(INIT_FIREWALL, &["reload"]).await {
+            first_err.get_or_insert(e);
+        }
+        // Each affected radio with escalating recovery so a radio is NEVER left
+        // dark (RC4): `wifi reload <r>` → retry → hard `wifi up <r>`.
         for r in radios {
             if let Err(e) = self.reload_radio_resilient(r).await {
                 first_err.get_or_insert(e);
             }
         }
-        self.runner.run(INIT_DNSMASQ, &["restart"]).await?;
+        if let Err(e) = self.runner.run(INIT_DNSMASQ, &["restart"]).await {
+            first_err.get_or_insert(e);
+        }
         // Reload SQM after the interfaces are up so per-SSID shapers attach to live
         // bridges (F9). Best-effort: a device without sqm-scripts has no init script,
         // and a missing shaper must never fail an otherwise-valid wireless apply.
@@ -375,6 +409,19 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         } else {
             tracing::error!(radios = ?still_down, "radios remain down after `wifi up`; will roll back");
             Some(ProvisionError::Apply(format!("radios down after reload: {}", still_down.join(","))))
+        }
+    }
+
+    /// Drop any STAGED (uncommitted) `uci` deltas on the owned configs
+    /// (best-effort). Called on every bail-out BEFORE a successful `uci commit`, so
+    /// a failed/partial apply never leaves deltas in `/tmp/.uci` that a LATER
+    /// external `uci commit` (RUTOS config-manager, an admin) would silently flush,
+    /// resurrecting a config this engine abandoned (P0 #3). `uci revert <cfg>` only
+    /// touches STAGED state, never the committed config, so it cannot undo changes
+    /// that already committed — those are the caller's rollback's job.
+    async fn revert_owned(&self) {
+        for cfg in OWNED_CONFIGS {
+            let _ = self.runner.run(UCI, &["revert", cfg]).await;
         }
     }
 
@@ -659,6 +706,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dnsmasq_restart_failure_still_runs_liveness_check() {
+        // P0 #4: a non-zero `dnsmasq restart` must NOT short-circuit the sequence
+        // before the ubus liveness recovery. The error is surfaced (caller rolls
+        // back) but recover_dark_radios still runs.
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "/etc/init.d/dnsmasq" && args == ["restart"] {
+                Err(ProvisionError::Apply("dnsmasq exited 1 (non-fatal warning)".into()))
+            } else {
+                Ok(Vec::new()) // ubus status empty → no radio judged down
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        // dnsmasq failed → error surfaced.
+        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Apply(_)));
+        // ...but the ubus liveness check STILL ran (previously the bare `?` returned first).
+        let flat = m.runner().flat();
+        assert!(
+            flat.iter().any(|(p, a)| p == "ubus" && a == "call network.wireless status"),
+            "liveness must run even when dnsmasq restart fails: {flat:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_failure_reverts_staged_deltas() {
+        // P0 #3: a failed `uci commit` must `uci revert` the owned configs so no
+        // staged delta is left for a later external commit to flush.
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args == ["commit", "firewall"] {
+                Err(ProvisionError::Apply("commit firewall: flash busy".into()))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Apply(_)));
+        let flat = m.runner().flat();
+        // revert_owned ran: at least one `uci revert <cfg>` was issued.
+        assert!(
+            flat.iter().any(|(p, a)| p == "uci" && a.starts_with("revert ")),
+            "commit failure must revert staged deltas: {flat:?}"
+        );
+        // And no reload sequence ran (we bailed at commit).
+        assert!(!flat.iter().any(|(p, _)| p == "/sbin/wifi"), "must not reload after commit failure: {flat:?}");
+    }
+
+    #[tokio::test]
+    async fn apply_set_failure_reverts_staged_deltas() {
+        // P0 #3 (apply side): a failing `uci set` mid-batch reverts before returning.
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args.first() == Some(&"set") {
+                Err(ProvisionError::Apply("uci set rejected".into()))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let batch =
+            vec![UciCmd::Set { key: "wireless.pc_x_ap0".into(), value: "wifi-iface".into() }];
+        let err = m.apply_wireless(&batch, false, &["radio0".to_string()]).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Apply(_)));
+        let flat = m.runner().flat();
+        assert!(flat.iter().any(|(p, a)| p == "uci" && a.starts_with("revert ")), "{flat:?}");
+    }
+
+    #[tokio::test]
     async fn reload_retries_then_escalates_to_wifi_up_when_reload_fails() {
         // RC4 anti-dark: a failing `wifi reload <r>` must not leave the radio down.
         // It retries once, then hard-brings-up the radio with a SCOPED `wifi up <r>`.
@@ -906,6 +1023,7 @@ mod tests {
             config_version: "cfg-7".into(),
             radios: vec!["radio0".into(), "radio1".into()],
             current_sections: vec!["network.pc_public_if".into(), "network.pc_public_dev".into()],
+            gated_ifaces: vec!["br-public".into()],
             deadline_unix: 1_700_000_000,
             snapshot: snap,
         };

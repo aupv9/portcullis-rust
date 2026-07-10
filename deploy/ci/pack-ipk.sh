@@ -98,20 +98,13 @@ if [ -f "$LIB/portcullis-enroll.init" ]; then
 	cp "$LIB/portcullis-enroll.init" /etc/init.d/portcullis-enroll && chmod 0755 /etc/init.d/portcullis-enroll
 	[ -f /etc/portcullis/bootstrap.conf ] || { cp "$LIB/bootstrap.conf.default" /etc/portcullis/bootstrap.conf && chmod 0644 /etc/portcullis/bootstrap.conf; }
 fi
-mkdir -p /tmp/portcullis /etc/dnsmasq.d
-# Walled garden needs dnsmasq-full: `ipset=` crashes a stock/slim dnsmasq and
-# takes DNS down for the whole LAN. Only wire it when dnsmasq supports ipset.
-DNSMASQ_VER="$(dnsmasq --version 2>/dev/null)"
-case "$DNSMASQ_VER" in
-	*no-ipset*) echo "portcullis: stock dnsmasq (no ipset) — skipping walled-garden; install dnsmasq-full to enable" >&2 ;;
-	*ipset*)
-		if [ ! -f /etc/dnsmasq.d/portcullis-garden.conf ]; then
-			echo 'ipset=/portal.wifihub.vn/cdn.wifihub.vn/otp.gateway/pay.example/wifihub_g4,wifihub_g6' \
-				> /etc/dnsmasq.d/portcullis-garden.conf
-			/etc/init.d/dnsmasq reload 2>/dev/null || true
-		fi ;;
-	*) echo "portcullis: could not probe dnsmasq ipset support — skipping walled-garden" >&2 ;;
-esac
+mkdir -p /tmp/portcullis
+# Walled garden: the ENGINE owns the dnsmasq garden conf at runtime — it probes
+# dnsmasq for ipset/nftset support before writing, picks the set family matching
+# the active firewall backend (a hardcoded `ipset=` seed here disagrees with an
+# nft backend and silently empties the garden), validates FQDNs, and writes
+# atomically. A postinst seed is unnecessary (no engine yet = no gate) and its
+# fixed family causes drift, so we no longer write one. See audit #5/#6.
 /etc/init.d/portcullis enable 2>/dev/null || true
 [ -f /etc/init.d/portcullis-enroll ] && /etc/init.d/portcullis-enroll enable 2>/dev/null || true
 exit 0

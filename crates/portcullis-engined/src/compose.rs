@@ -347,6 +347,39 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
                 }
             }
         }));
+    } else if garden_backend == portcullis_garden::GardenBackend::Ipset {
+        // ENGINE-RESOLVER GARDEN: stock dnsmasq can't populate the garden ipsets
+        // (no `ipset=` directive — writing it is fatal and takes LAN DNS down, so
+        // the guard above kept us out of the dnsmasq path). Instead the engine
+        // resolves each garden FQDN itself — via the SAME system resolver (the
+        // router's dnsmasq) that clients use, so we land the same IP(s) they will —
+        // and tops up `wifihub_g4`/`wifihub_g6` directly. The gate then RETURNs
+        // that dst for pre-auth clients (portal/OTP/pay reachable) while DNS stays
+        // untouched. Only meaningful on the ipset backend; the nft-without-nftset
+        // case falls through to the DISABLED branch below.
+        let fqdns = controller.watch_garden().borrow().clone();
+        tracing::info!(
+            fqdns = fqdns.len(),
+            "dnsmasq lacks ipset; using engine-resolver garden \
+             (resolving fqdns into wifihub_g4/g6)"
+        );
+        // Belt-and-suspenders: drop any stale `ipset=` conf a prior run/version
+        // left, so a leftover directive can never bite a later stock dnsmasq.
+        remove_stale_garden_conf();
+
+        let writer = writer.clone();
+        let mut garden_rx = controller.watch_garden();
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(GARDEN_TICK);
+            loop {
+                let fqdns = garden_rx.borrow_and_update().clone();
+                resolve_garden_into_sets(&*writer, &fqdns).await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    r = garden_rx.changed() => { if r.is_err() { break; } }
+                }
+            }
+        }));
     } else {
         tracing::warn!(
             backend = ?garden_backend,
@@ -356,13 +389,7 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
              LAN DNS down. Enforcement still works; garden domains just aren't pre-allowed."
         );
         // Drop any stale garden conf so the next dnsmasq (re)start doesn't choke.
-        match std::fs::remove_file(GARDEN_CONF_PATH) {
-            Ok(()) => tracing::info!(path = GARDEN_CONF_PATH, "removed stale garden conf"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(path = GARDEN_CONF_PATH, error = %e, "could not remove stale garden conf")
-            }
-        }
+        remove_stale_garden_conf();
     }
 
     // 8b. Enforcement toggle (G3b/G8): a CP `SetEnforcement(false)` removes the
@@ -680,6 +707,72 @@ fn dnsmasq_advertises(version_text: &str, want: &str) -> bool {
         .any(|tok| tok == want)
 }
 
+/// Reduce the `SocketAddr`s `tokio::net::lookup_host` returns for a set of garden
+/// FQDNs down to a deduped, order-stable list of unique `IpAddr`s (v4 and v6 both
+/// kept — the ipset backend routes each to its family set). `lookup_host` appends
+/// the resolver's A + AAAA records (and can repeat an address across FQDNs that
+/// share a CDN), so dedup keeps the per-tick `ipset add` batch minimal. Pure →
+/// unit-testable without real DNS (the resolver task calls this on its results).
+fn dedup_garden_ips(addrs: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<std::net::IpAddr> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for sa in addrs {
+        let ip = sa.ip();
+        if seen.insert(ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// One engine-resolver garden pass: resolve every garden FQDN via the system
+/// resolver (async, non-blocking — the daemon is a current-thread runtime), dedup
+/// the results, and hand them to the writer's `add_garden` (which routes each IP
+/// to its family ipset). STRICTLY fail-open: a per-FQDN resolution failure
+/// (NXDOMAIN, timeout, no records) is logged and skipped — never crashes the task,
+/// never blocks the others; an empty result set is simply a no-op tick.
+///
+/// Port 0 is a placeholder (`lookup_host` requires a port; we only want the IPs).
+async fn resolve_garden_into_sets(writer: &dyn RulesetWriter, fqdns: &[String]) {
+    let mut all: Vec<std::net::SocketAddr> = Vec::new();
+    for fqdn in fqdns {
+        let fqdn = fqdn.trim();
+        if fqdn.is_empty() {
+            continue;
+        }
+        match tokio::net::lookup_host((fqdn, 0u16)).await {
+            Ok(addrs) => all.extend(addrs),
+            Err(e) => {
+                tracing::debug!(fqdn, error = %e, "garden FQDN resolve failed; skipping (fail-open)")
+            }
+        }
+    }
+    let ips = dedup_garden_ips(all);
+    if ips.is_empty() {
+        return;
+    }
+    // add_garden is itself best-effort (per-element fail-open on the backend); a
+    // whole-call error here is still non-fatal — log and move on to the next tick.
+    if let Err(e) = writer.add_garden(&ips).await {
+        tracing::warn!(count = ips.len(), error = %e, "engine-resolver garden add failed; will retry next tick");
+    } else {
+        tracing::debug!(count = ips.len(), "engine-resolver garden updated wifihub_g4/g6");
+    }
+}
+
+/// Drop any stale `GARDEN_CONF_PATH` file so a leftover `ipset=`/`nftset=` conf a
+/// prior run or version wrote can never bite a later stock dnsmasq (fatal parse →
+/// LAN DNS down). Best-effort: a missing file is fine, any other error is logged.
+fn remove_stale_garden_conf() {
+    match std::fs::remove_file(GARDEN_CONF_PATH) {
+        Ok(()) => tracing::info!(path = GARDEN_CONF_PATH, "removed stale garden conf"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = GARDEN_CONF_PATH, error = %e, "could not remove stale garden conf")
+        }
+    }
+}
+
 /// Load the engine's **client** identity + the pinned control-plane **server**
 /// CA from [`TLS_DIR`] and build the mutual-TLS client config used to dial the
 /// control plane. Returns `Ok(None)` if the material isn't present yet (the
@@ -753,6 +846,34 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_garden_ips_splits_families_and_dedups_order_stable() {
+        use std::net::SocketAddr;
+        // Simulate what tokio::net::lookup_host returns across garden FQDNs: a mix
+        // of A/AAAA records with duplicates (CDN sharing / repeated lookups). The
+        // helper must keep BOTH families, dedup by IpAddr, and preserve first-seen
+        // order (so per-tick `ipset add` batches are minimal + deterministic).
+        let parse = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let addrs = vec![
+            parse("1.2.3.4:0"),
+            parse("[2606:4700::1]:443"), // same IP, different port -> one entry
+            parse("1.2.3.4:80"),         // dup v4
+            parse("[2606:4700::1]:0"),   // dup v6
+            parse("5.6.7.8:0"),
+        ];
+        let ips = dedup_garden_ips(addrs);
+        assert_eq!(
+            ips,
+            vec![
+                "1.2.3.4".parse::<std::net::IpAddr>().unwrap(),
+                "2606:4700::1".parse::<std::net::IpAddr>().unwrap(),
+                "5.6.7.8".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+        // Empty in -> empty out (a resolution tick with no records is a clean no-op).
+        assert!(dedup_garden_ips(Vec::<SocketAddr>::new()).is_empty());
+    }
 
     #[test]
     fn dnsmasq_advertises_enabled_but_not_negated() {
