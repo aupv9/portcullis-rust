@@ -2,7 +2,11 @@
 //! (TDD §7.2).
 //!
 //! Output shape:
-//! `https://<portal>/splash?mac=<mac>&store=<store>&ts=<ts>&sig=<sig>`
+//! `https://<portal>/portal?mac=<mac>&nas_id=<store>&ts=<ts>&sig=<sig>`
+//!
+//! The path (`/portal`) and the `nas_id` query key match the FE captive portal
+//! (`app/portal`) + the CP's `/api/captive/auth/instant` contract; the `ts`/`sig`
+//! pair is the HMAC the CP verifies before granting (invariant #7).
 //!
 //! Every query value is percent-encoded so a hostile `store_id` (the only field
 //! that isn't already a constrained shape — MAC is `[0-9a-f:]`, ts is digits,
@@ -47,9 +51,9 @@ fn to_hex_upper(nibble: u8) -> char {
 }
 
 /// Normalize the portal base so the result is always exactly
-/// `<scheme>://<host>[/path]` with no trailing slash, then append `/splash?...`.
+/// `<scheme>://<host>[/path]` with no trailing slash, then append `/portal?...`.
 ///
-/// A trailing slash on `portal_base` would otherwise produce `//splash`.
+/// A trailing slash on `portal_base` would otherwise produce `//portal`.
 fn normalized_base(portal_base: &str) -> &str {
     portal_base.trim_end_matches('/')
 }
@@ -66,7 +70,7 @@ pub fn build_location(
     sig: &str,
 ) -> String {
     format!(
-        "{base}/splash?mac={mac}&store={store}&ts={ts}&sig={sig}",
+        "{base}/portal?mac={mac}&nas_id={store}&ts={ts}&sig={sig}",
         base = normalized_base(portal_base),
         mac = encode_query_value(&mac.to_canonical()),
         store = encode_query_value(store_id),
@@ -94,15 +98,15 @@ mod tests {
         );
         assert_eq!(
             got,
-            "https://portal.wifihub.vn/splash?mac=aa%3Abb%3Acc%3Add%3Aee%3Aff&store=store-42&ts=1700000000&sig=deadbeef"
+            "https://portal.wifihub.vn/portal?mac=aa%3Abb%3Acc%3Add%3Aee%3Aff&nas_id=store-42&ts=1700000000&sig=deadbeef"
         );
     }
 
     #[test]
     fn trailing_slash_on_base_is_normalized() {
         let got = build_location("https://portal.example/", &mac(), "s", 0, "ab");
-        assert!(got.starts_with("https://portal.example/splash?"));
-        assert!(!got.contains("//splash"));
+        assert!(got.starts_with("https://portal.example/portal?"));
+        assert!(!got.contains("//portal?"));
     }
 
     #[test]
@@ -116,9 +120,9 @@ mod tests {
         assert!(!got.contains('#'));
         assert!(!got.contains('\r'));
         assert!(!got.contains('\n'));
-        assert!(got.contains("store=x%26grant%3D1%23frag%0D%0ASet-Cookie%3A%20a%3Db"));
+        assert!(got.contains("nas_id=x%26grant%3D1%23frag%0D%0ASet-Cookie%3A%20a%3Db"));
         // Exactly the four params we intend.
-        assert_eq!(got.matches("&store=").count(), 1);
+        assert_eq!(got.matches("&nas_id=").count(), 1);
         assert_eq!(got.matches("&grant=").count(), 0);
     }
 

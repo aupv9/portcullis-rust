@@ -4,7 +4,7 @@
 //! any unauthenticated client on the SSID. Its entire job is to look up the
 //! client's MAC from the kernel neighbour table, sign `<mac>|<store>|<ts>` with
 //! the per-store HMAC key, and answer **one** thing — a `302` to the portal
-//! splash URL. It serves no static files, no other routes, no info leak.
+//! URL. It serves no static files, no other routes, no info leak.
 //!
 //! Security posture (cf. openNDS CVE-2023-38314, a NULL-deref DoS from a missing
 //! query param):
@@ -47,7 +47,7 @@ pub use resolver::{IpNeighResolver, MockNeighResolver};
 /// output").
 #[derive(Clone)]
 pub struct RedirectConfig {
-    /// e.g. `https://portal.wifihub.vn` (no trailing `/splash`).
+    /// e.g. `https://portal.wifihub.vn` (no trailing `/portal`).
     pub portal_base_url: String,
     /// This router's store identifier, included in the signed tuple.
     pub store_id: String,
@@ -282,8 +282,8 @@ mod tests {
 
         match outcome {
             RedirectOutcome::Redirect { location } => {
-                assert!(location.starts_with("https://portal.wifihub.vn/splash?"));
-                assert!(location.contains("store=store-42"));
+                assert!(location.starts_with("https://portal.wifihub.vn/portal?"));
+                assert!(location.contains("nas_id=store-42"));
                 assert!(location.contains("ts=1700000000"));
                 // The embedded signature must verify against the same key/tuple.
                 let sig = location.rsplit("sig=").next().expect("sig param present");
