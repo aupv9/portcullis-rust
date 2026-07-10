@@ -318,7 +318,16 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     //    backend (G2). The FQDN list comes from the runtime controller (G3b) so a
     //    CP `SetGarden` takes effect live; it also reconciles every GARDEN_TICK to
     //    repair external drift.
-    {
+    //
+    //    GUARD (fixes the v0.10.0 field regression): only sync dnsmasq if the
+    //    local dnsmasq actually understands the directive family we'd emit. A
+    //    stock/slim dnsmasq (the RutOS default, no dnsmasq-full) has no
+    //    `ipset`/`nftset` support and treats such a line as a FATAL config error
+    //    — it then refuses to start and takes the ENTIRE LAN's DNS down. When the
+    //    directive is unsupported we DISABLE the garden and drop any stale conf a
+    //    prior run/version left, so the next dnsmasq (re)start stays clean.
+    //    Install dnsmasq-full to turn the garden on.
+    if probe_dnsmasq_garden("dnsmasq", garden_backend) {
         let mut garden_rx = controller.watch_garden();
         tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(GARDEN_TICK);
@@ -338,6 +347,22 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
                 }
             }
         }));
+    } else {
+        tracing::warn!(
+            backend = ?garden_backend,
+            path = GARDEN_CONF_PATH,
+            "dnsmasq lacks ipset/nftset support (install dnsmasq-full); walled-garden DISABLED — \
+             not writing the garden conf, which a stock dnsmasq treats as fatal and would take \
+             LAN DNS down. Enforcement still works; garden domains just aren't pre-allowed."
+        );
+        // Drop any stale garden conf so the next dnsmasq (re)start doesn't choke.
+        match std::fs::remove_file(GARDEN_CONF_PATH) {
+            Ok(()) => tracing::info!(path = GARDEN_CONF_PATH, "removed stale garden conf"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = GARDEN_CONF_PATH, error = %e, "could not remove stale garden conf")
+            }
+        }
     }
 
     // 8b. Enforcement toggle (G3b/G8): a CP `SetEnforcement(false)` removes the
@@ -618,6 +643,43 @@ fn probe_nft_nat(program: &str) -> bool {
     nat_ok
 }
 
+/// Probe whether the local dnsmasq understands the set directive the chosen
+/// garden backend emits (`ipset` for the ipset backend, `nftset` for nft).
+///
+/// `dnsmasq --version` prints a "Compile time options:" line listing each enabled
+/// option, or its `no-<opt>` negation on a slim build. We enable the garden ONLY
+/// on a positive token match: a missing binary, an unreadable version, or an
+/// explicit `no-ipset` all return false. This is the guard that stops the engine
+/// from handing a stock/slim dnsmasq (the RutOS default) an `ipset=` line it
+/// treats as a FATAL error — which aborts dnsmasq and takes the whole LAN's DNS
+/// down. Install dnsmasq-full to flip this on.
+fn probe_dnsmasq_garden(program: &str, backend: portcullis_garden::GardenBackend) -> bool {
+    let want = match backend {
+        portcullis_garden::GardenBackend::Ipset => "ipset",
+        portcullis_garden::GardenBackend::Nft => "nftset",
+    };
+    let out = match std::process::Command::new(program).arg("--version").output() {
+        Ok(o) => o,
+        Err(_) => return false, // no dnsmasq to probe → stay safe, don't write
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dnsmasq_advertises(&text, want)
+}
+
+/// True if a dnsmasq `--version` blob advertises `want` (e.g. "ipset"/"nftset")
+/// as an ENABLED compile option. Options are whitespace-separated tokens and the
+/// disabled form is `no-<opt>`, so an exact-token match makes `no-ipset` (a slim
+/// build) correctly fail to satisfy `ipset`. Pure → unit-testable without dnsmasq.
+fn dnsmasq_advertises(version_text: &str, want: &str) -> bool {
+    version_text
+        .split(|c: char| c.is_whitespace())
+        .any(|tok| tok == want)
+}
+
 /// Load the engine's **client** identity + the pinned control-plane **server**
 /// CA from [`TLS_DIR`] and build the mutual-TLS client config used to dial the
 /// control plane. Returns `Ok(None)` if the material isn't present yet (the
@@ -691,6 +753,26 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dnsmasq_advertises_enabled_but_not_negated() {
+        // dnsmasq-full: `ipset`/`nftset` present as bare tokens.
+        let full = "Dnsmasq version 2.90\n\
+             Compile time options: IPv6 GNU-getopt DBus DHCP TFTP ipset nftset auth DNSSEC\n";
+        assert!(dnsmasq_advertises(full, "ipset"));
+        assert!(dnsmasq_advertises(full, "nftset"));
+
+        // Stock/slim dnsmasq: the `no-ipset` negation must NOT satisfy `ipset`
+        // (this is the exact case that took LAN DNS down in the field).
+        let slim = "Dnsmasq version 2.90\n\
+             Compile time options: IPv6 GNU-getopt DHCP TFTP no-ipset no-nftset auth\n";
+        assert!(!dnsmasq_advertises(slim, "ipset"));
+        assert!(!dnsmasq_advertises(slim, "nftset"));
+
+        // Missing/garbage version output → not advertised (stay safe, don't write).
+        assert!(!dnsmasq_advertises("", "ipset"));
+        assert!(!dnsmasq_advertises("totally unrelated text", "ipset"));
+    }
 
     /// Fake `nft`: logs each invocation's args and exits 0, except (when
     /// `fail_on_chain`) any command mentioning `chain` — mimicking a kernel
