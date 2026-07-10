@@ -124,13 +124,16 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     //     provision fault never drops an authorized client. Spawned BEFORE the
     //     control channel so its handle + status stream can be wired in.
     let (provisioner, wireless_status_rx, provision_join) =
-        portcullis_provision::run_provision_subsystem(
+        portcullis_provision::run_provision_subsystem_with_policy(
             portcullis_provision::ProcessRunner,
             portcullis_provision::DEFAULT_STATE_DIR,
             // The redirect-responder port opened by the per-SSID portal firewall
             // rule so pre-auth guests can reach the captive redirect. LOCAL engine
             // setting, not on the wire.
             cfg.responder_port,
+            // Layer A: radios the CP may not place owned SSIDs on (admin radio).
+            // Empty by default — opt-in per deployment.
+            cfg.wireless_protected_radios.clone(),
         );
     let provisioner: Arc<dyn Provisioner> = Arc::new(provisioner);
     tasks.push(provision_join);

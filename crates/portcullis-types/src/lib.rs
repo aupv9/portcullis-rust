@@ -773,6 +773,18 @@ pub struct SsidSpec {
     /// Firewall zone this SSID forwards out through, e.g. `wan` (must NOT be
     /// `lan`). Empty => the engine default (`wan`).
     pub egress_zone: String,
+    /// Max associated stations (`maxassoc`); `0` = unlimited.
+    pub max_clients: u32,
+    /// MAC access policy: `""`/`"disable"` = off, `"allow"` = allow-list,
+    /// `"deny"` = deny-list. Applied with `mac_list`.
+    pub mac_policy: String,
+    /// MACs for the allow/deny list (lowercase `aa:bb:cc:dd:ee:ff`).
+    pub mac_list: Vec<String>,
+    /// Per-SSID download cap (kbit, to client / ingress); `0` = unlimited. Rendered
+    /// as an `sqm` `queue` section on this SSID's bridge (needs sqm-scripts + cake).
+    pub rate_down_kbps: u32,
+    /// Per-SSID upload cap (kbit, from client / egress); `0` = unlimited.
+    pub rate_up_kbps: u32,
 }
 
 impl std::fmt::Debug for SsidSpec {
@@ -794,6 +806,11 @@ impl std::fmt::Debug for SsidSpec {
             .field("dhcp_leasetime", &self.dhcp_leasetime)
             .field("dhcp_disabled", &self.dhcp_disabled)
             .field("egress_zone", &self.egress_zone)
+            .field("max_clients", &self.max_clients)
+            .field("mac_policy", &self.mac_policy)
+            .field("mac_list", &self.mac_list)
+            .field("rate_down_kbps", &self.rate_down_kbps)
+            .field("rate_up_kbps", &self.rate_up_kbps)
             .finish()
     }
 }

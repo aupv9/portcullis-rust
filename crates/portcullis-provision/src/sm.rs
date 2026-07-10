@@ -39,9 +39,11 @@ pub const DEFAULT_STATE_DIR: &str = "/tmp/portcullis/provision";
 /// the reload path where order matters).
 const UCI: &str = "uci";
 const WIFI: &str = "/sbin/wifi";
+const UBUS: &str = "ubus";
 const INIT_NETWORK: &str = "/etc/init.d/network";
 const INIT_FIREWALL: &str = "/etc/init.d/firewall";
 const INIT_DNSMASQ: &str = "/etc/init.d/dnsmasq";
+const INIT_SQM: &str = "/etc/init.d/sqm";
 
 /// A captured snapshot of the owned sections' prior state: the `uci show` option
 /// lines that existed BEFORE apply, plus the set of section keys that existed so
@@ -49,10 +51,15 @@ const INIT_DNSMASQ: &str = "/etc/init.d/dnsmasq";
 /// their prior option values).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Prior `key=value` for every owned option line present before apply, e.g.
-    /// `network.hotspot.ipaddr` -> `10.0.0.1`. Section-decl lines (`network.hotspot`
-    /// -> `interface`) are included too so a full re-apply reproduces them.
+    /// Prior `key=value` for every owned SCALAR option line present before apply,
+    /// e.g. `network.hotspot.ipaddr` -> `10.0.0.1`. Section-decl lines
+    /// (`network.hotspot` -> `interface`) are included too so a full re-apply
+    /// reproduces them. LIST options are captured in `prior_lists`, not here.
     pub prior: BTreeMap<String, String>,
+    /// Prior UCI LIST options (e.g. `wireless.pc_x_ap0.maclist` -> [mac, mac]).
+    /// Restored on rollback via `uci delete` + `uci add_list` per element, which a
+    /// scalar `uci set` can't round-trip. Serialized as `key+=value` lines.
+    pub prior_lists: BTreeMap<String, Vec<String>>,
     /// Owned SECTION keys (of the four in [`OWNED`]) that existed before apply.
     /// Rollback deletes any owned section NOT in this set (we created it), and
     /// restores the option values of sections that ARE in it.
@@ -74,6 +81,15 @@ impl Snapshot {
             s.push_str(v);
             s.push('\n');
         }
+        // List options: one `key+=value` line per element (deterministic order).
+        for (k, vals) in &self.prior_lists {
+            for v in vals {
+                s.push_str(k);
+                s.push_str("+=");
+                s.push_str(v);
+                s.push('\n');
+            }
+        }
         s
     }
 
@@ -93,7 +109,12 @@ impl Snapshot {
                 continue;
             }
             if let Some((k, v)) = line.split_once('=') {
-                snap.prior.insert(k.to_string(), v.to_string());
+                // `key+=value` (trailing `+` on the key) marks a LIST element.
+                if let Some(list_key) = k.strip_suffix('+') {
+                    snap.prior_lists.entry(list_key.to_string()).or_default().push(v.to_string());
+                } else {
+                    snap.prior.insert(k.to_string(), v.to_string());
+                }
             }
         }
         snap
@@ -221,7 +242,13 @@ impl<R: CommandRunner> ProvisionMachine<R> {
     pub async fn snapshot_wireless(&self) -> Result<Snapshot, ProvisionError> {
         let mut snap = Snapshot::default();
         for cfg in OWNED_CONFIGS {
-            let out = self.runner.run(UCI, &["show", cfg]).await?;
+            // `sqm` is optional: a device without sqm-scripts has no /etc/config/sqm,
+            // so `uci show sqm` errors — tolerate it (nothing owned to snapshot there).
+            let out = match self.runner.run(UCI, &["show", cfg]).await {
+                Ok(o) => o,
+                Err(_) if cfg == "sqm" => continue,
+                Err(e) => return Err(e),
+            };
             let text = String::from_utf8_lossy(&out);
             for line in text.lines() {
                 let line = line.trim();
@@ -232,12 +259,18 @@ impl<R: CommandRunner> ProvisionMachine<R> {
                 if !uci::is_owned_wireless_section(key) {
                     continue; // guardrail: only owned wireless sections enter
                 }
-                let val = unquote(raw_val);
                 // A section decl line has exactly one `.` (`config.section`).
                 if key.matches('.').count() == 1 && !snap.existing_sections.iter().any(|s| s == key) {
                     snap.existing_sections.push(key.to_string());
                 }
-                snap.prior.insert(key.to_string(), val);
+                // LIST options (only `maclist` is owned) render as one `uci show`
+                // line with space-separated quoted elements: `…maclist='aa' 'bb'`.
+                // Capture them list-aware so rollback can replay them via add_list.
+                if key.ends_with(".maclist") {
+                    snap.prior_lists.insert(key.to_string(), parse_uci_list(raw_val));
+                } else {
+                    snap.prior.insert(key.to_string(), unquote(raw_val));
+                }
             }
         }
         Ok(snap)
@@ -274,15 +307,101 @@ impl<R: CommandRunner> ProvisionMachine<R> {
     /// [`Self::apply_wireless`] + [`Self::rollback_to`].
     async fn commit_and_reload_multi(&self, radios: &[String]) -> Result<(), ProvisionError> {
         for cfg in OWNED_CONFIGS {
-            self.runner.run(UCI, &["commit", cfg]).await?;
+            match self.runner.run(UCI, &["commit", cfg]).await {
+                Ok(_) => {}
+                Err(_) if cfg == "sqm" => {} // optional (sqm-scripts may be absent)
+                Err(e) => return Err(e),
+            }
         }
         self.runner.run(INIT_NETWORK, &["reload"]).await?;
         self.runner.run(INIT_FIREWALL, &["reload"]).await?;
+        // Reload each affected radio with escalating recovery so a radio is NEVER
+        // left dark (RC4). Previously a single failing `wifi reload <r>` aborted the
+        // whole sequence with `?`, leaving that radio — and EVERY SSID on it,
+        // including the admin/management SSID — down until a reboot. Now every radio
+        // is attempted; a persistent failure escalates to a hard `wifi up <r>`;
+        // dnsmasq restarts regardless; the first unrecoverable error is surfaced (so
+        // the caller still rolls back), but the radios have already been forced up.
+        let mut first_err: Option<ProvisionError> = None;
         for r in radios {
-            self.runner.run(WIFI, &["reload", r]).await?;
+            if let Err(e) = self.reload_radio_resilient(r).await {
+                first_err.get_or_insert(e);
+            }
         }
         self.runner.run(INIT_DNSMASQ, &["restart"]).await?;
-        Ok(())
+        // Reload SQM after the interfaces are up so per-SSID shapers attach to live
+        // bridges (F9). Best-effort: a device without sqm-scripts has no init script,
+        // and a missing shaper must never fail an otherwise-valid wireless apply.
+        let _ = self.runner.run(INIT_SQM, &["reload"]).await;
+        // D2 — post-reload liveness. `wifi reload <r>` can exit 0 while hostapd
+        // silently failed to bring the radio up (a merged config the structural
+        // validation couldn't foresee), leaving it dark despite a clean exit code —
+        // the one gap the exit-code recovery above cannot see. Confirm via ubus and
+        // hard bring-up anything reported down; a radio STILL down after that
+        // surfaces an error so the caller rolls back (removing the bad config
+        // recovers the radio). Strictly fail-open (see [`recover_dark_radios`]).
+        if let Some(e) = self.recover_dark_radios(radios).await {
+            first_err.get_or_insert(e);
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// D2 liveness recovery. Reads `ubus call network.wireless status`; for each of
+    /// `radios` explicitly reported down, forces a scoped `wifi up <r>`; then
+    /// re-reads and returns an error naming any radio STILL down (so the caller
+    /// rolls back). Fail-OPEN at every step — a failed/absent/unparseable ubus call
+    /// returns `None` (no radio is ever judged down from noise, so a ubus schema
+    /// drift can only make us MISS a dark radio, never falsely roll back a healthy
+    /// push). See [`radios_reported_down`].
+    async fn recover_dark_radios(&self, radios: &[String]) -> Option<ProvisionError> {
+        let status = self.runner.run(UBUS, &["call", "network.wireless", "status"]).await.ok()?;
+        let down = radios_reported_down(&String::from_utf8_lossy(&status), radios);
+        if down.is_empty() {
+            return None;
+        }
+        for r in &down {
+            tracing::warn!(radio = %r, "radio reported down after a clean `wifi reload`; forcing `wifi up`");
+            let _ = self.runner.run(WIFI, &["up", r]).await;
+        }
+        // Re-verify: only a radio STILL down after the forced bring-up is a real
+        // fault worth rolling back for (the forced `wifi up` may have fixed it).
+        let status2 = self.runner.run(UBUS, &["call", "network.wireless", "status"]).await.ok()?;
+        let still_down = radios_reported_down(&String::from_utf8_lossy(&status2), radios);
+        if still_down.is_empty() {
+            None
+        } else {
+            tracing::error!(radios = ?still_down, "radios remain down after `wifi up`; will roll back");
+            Some(ProvisionError::Apply(format!("radios down after reload: {}", still_down.join(","))))
+        }
+    }
+
+    /// Bring one radio back up, never leaving it dark (RC4). Tries `wifi reload
+    /// <r>`; on failure retries once (transient netifd/hostapd bring-up races are
+    /// common on a busy router); on a persistent failure escalates to a hard `wifi
+    /// up <r>` — SCOPED to the radio, never a bare `wifi` (which would also touch
+    /// the control/admin radio). Returns `Err` only when even the hard bring-up
+    /// fails (a genuine hardware/driver fault, beyond software recovery).
+    async fn reload_radio_resilient(&self, radio: &str) -> Result<(), ProvisionError> {
+        match self.runner.run(WIFI, &["reload", radio]).await {
+            Ok(_) => return Ok(()),
+            Err(e) => tracing::warn!(radio, error = %e, "wifi reload failed; retrying once"),
+        }
+        match self.runner.run(WIFI, &["reload", radio]).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(radio, error = %e, "wifi reload retry failed; escalating to `wifi up` (anti-dark)");
+            }
+        }
+        match self.runner.run(WIFI, &["up", radio]).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::error!(radio, error = %e, "radio could not be brought up even with `wifi up`");
+                Err(e)
+            }
+        }
     }
 
     /// Roll back to `snapshot`: delete the owned sections present now
@@ -303,6 +422,15 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         for (key, val) in &snapshot.prior {
             let set = format!("{key}={val}");
             let _ = self.runner.run(UCI, &["set", &set]).await; // best-effort restore
+        }
+        // Restore LIST options: clear whatever the failed apply left, then re-append
+        // each prior element (a scalar `uci set` can't reconstruct a UCI list).
+        for (key, vals) in &snapshot.prior_lists {
+            let _ = self.runner.run(UCI, &["delete", key]).await; // best-effort clear
+            for v in vals {
+                let add = format!("{key}={v}");
+                let _ = self.runner.run(UCI, &["add_list", &add]).await;
+            }
         }
         self.commit_and_reload_multi(radios)
             .await
@@ -352,6 +480,14 @@ impl<R: CommandRunner> ProvisionMachine<R> {
             .await
             .map_err(|e| ProvisionError::Io(format!("write {}: {e}", path.display())))
     }
+}
+
+/// Parse a `uci show` LIST value into its elements. `uci show` renders a list as
+/// space-separated single-quoted tokens: `'aa:bb:cc:dd:ee:ff' 'ff:ee:dd:cc:bb:aa'`.
+/// List elements owned here (MACs) contain no spaces, so whitespace-splitting then
+/// unquoting each token is unambiguous.
+fn parse_uci_list(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(unquote).filter(|s| !s.is_empty()).collect()
 }
 
 /// Strip a single layer of UCI single/double quotes from a `uci show` value.
@@ -417,6 +553,28 @@ pub fn snapshot_radios(snapshot: &Snapshot) -> Vec<String> {
     out
 }
 
+/// The radios in `radios` that `ubus call network.wireless status` explicitly
+/// reports as NOT up (a device object with `"up": false`). Pure + fail-open: an
+/// unparseable or unexpectedly-shaped payload yields an EMPTY list — a "down"
+/// verdict is only ever produced from an explicit `up == false`, so a ubus schema
+/// drift can make the liveness check MISS a dark radio but never manufacture a
+/// false one (which would roll back a healthy push). Keyed by wifi-device name
+/// (`radio0`/`radio1`…), matching the engine's radio identifiers.
+pub fn radios_reported_down(status_json: &str, radios: &[String]) -> Vec<String> {
+    let v: serde_json::Value = match serde_json::from_str(status_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    radios
+        .iter()
+        .filter(|r| {
+            v.get(r.as_str()).and_then(|d| d.get("up")).and_then(serde_json::Value::as_bool)
+                == Some(false)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +592,11 @@ mod tests {
         };
         snap.prior.insert("network.hotspot".into(), "interface".into());
         snap.prior.insert("network.hotspot.ipaddr".into(), "10.0.0.1".into());
+        // include a LIST option to prove prior_lists round-trips via `key+=value`.
+        snap.prior_lists.insert(
+            "wireless.pc_home_ap0.maclist".into(),
+            vec!["aa:bb:cc:dd:ee:ff".into(), "11:22:33:44:55:66".into()],
+        );
         let text = snap.to_text();
         assert_eq!(Snapshot::from_text(&text), snap);
     }
@@ -496,6 +659,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_retries_then_escalates_to_wifi_up_when_reload_fails() {
+        // RC4 anti-dark: a failing `wifi reload <r>` must not leave the radio down.
+        // It retries once, then hard-brings-up the radio with a SCOPED `wifi up <r>`.
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "/sbin/wifi" && args.first() == Some(&"reload") {
+                Err(ProvisionError::Apply("hostapd rejected config".into()))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        // `wifi up` succeeds → the radio recovers → apply reports success overall.
+        m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap();
+        let flat = m.runner().flat();
+        let reloads = flat.iter().filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0").count();
+        assert_eq!(reloads, 2, "reload should be retried exactly once: {flat:?}");
+        assert!(
+            flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())),
+            "must escalate to a scoped `wifi up radio0`: {flat:?}"
+        );
+        // NEVER a bare `wifi reload` / `wifi up` (all radios) — stays scoped.
+        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && (a == "reload" || a == "up")));
+        // dnsmasq is still restarted despite the reload trouble.
+        assert!(flat.contains(&("/etc/init.d/dnsmasq".to_string(), "restart".to_string())));
+    }
+
+    #[tokio::test]
+    async fn reload_surfaces_error_only_when_even_wifi_up_fails() {
+        // A genuine hardware/driver fault: reload + retry + `wifi up` all fail. We
+        // did everything possible to keep the radio up, so the error is surfaced
+        // (the caller then rolls back) — but recovery WAS attempted.
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, _a| {
+            if prog == "/sbin/wifi" {
+                Err(ProvisionError::Apply("radio hardware fault".into()))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Apply(_)));
+        let flat = m.runner().flat();
+        // All three recovery rungs were tried before giving up.
+        assert_eq!(flat.iter().filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0").count(), 2);
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())));
+    }
+
+    #[tokio::test]
+    async fn rollback_recovers_radio_when_first_reload_fails() {
+        // RC4: even on the rollback path, a flaky first `wifi reload` must escalate
+        // so the radio is not abandoned dark. Here reload fails once then succeeds.
+        let dir = temp_dir();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a2 = attempts.clone();
+        let runner = RecordingRunner::with_responder(move |prog, args| {
+            if prog == "/sbin/wifi" && args.first() == Some(&"reload") {
+                let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    return Err(ProvisionError::Apply("transient reload race".into()));
+                }
+            }
+            Ok(Vec::new())
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let snap = Snapshot::default();
+        m.rollback_to(&snap, &["network.pc_x_if".to_string()], &["radio0".to_string()])
+            .await
+            .unwrap();
+        let flat = m.runner().flat();
+        // Retried the reload (2 attempts); no `wifi up` needed (2nd reload succeeded).
+        assert_eq!(flat.iter().filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0").count(), 2);
+        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "up radio0"));
+    }
+
+    #[test]
+    fn radios_reported_down_only_flags_explicit_up_false() {
+        let js = r#"{"radio0":{"up":false},"radio1":{"up":true}}"#;
+        let radios = vec!["radio0".to_string(), "radio1".to_string()];
+        assert_eq!(radios_reported_down(js, &radios), vec!["radio0".to_string()]);
+        // Fail-open: unparseable / absent / missing-`up` never yields a "down".
+        assert!(radios_reported_down("", &radios).is_empty());
+        assert!(radios_reported_down("not json", &radios).is_empty());
+        assert!(radios_reported_down(r#"{"radio0":{"up":true}}"#, &radios).is_empty());
+        assert!(radios_reported_down(r#"{}"#, &radios).is_empty());
+        assert!(radios_reported_down(r#"{"radio0":{}}"#, &radios).is_empty());
+    }
+
+    #[tokio::test]
+    async fn liveness_rolls_back_when_radio_dark_despite_clean_reload() {
+        // RC2/RC4 gap: `wifi reload` exits 0 but hostapd silently failed → the
+        // radio is dark. ubus reports it down; a forced `wifi up` doesn't fix it
+        // (bad config) → an error is surfaced so the caller rolls back.
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "ubus" && args == ["call", "network.wireless", "status"] {
+                Ok(br#"{"radio0":{"up":false}}"#.to_vec()) // persistently down
+            } else {
+                Ok(Vec::new()) // wifi reload / wifi up / uci / init.d all "succeed"
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Apply(_)), "want Apply err, got {err:?}");
+        let flat = m.runner().flat();
+        // The clean reload exited 0, so recovery is driven purely by the liveness
+        // check: it forced a `wifi up radio0` and queried ubus twice.
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())), "{flat:?}");
+        assert_eq!(
+            flat.iter().filter(|(p, a)| p == "ubus" && a == "call network.wireless status").count(),
+            2,
+            "expected a verify-recover-reverify pair: {flat:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_recovers_without_rollback_when_wifi_up_fixes_it() {
+        // The forced `wifi up` brings the radio back: ubus says down first, up on
+        // re-check → no error, the good push stands (no spurious rollback).
+        let dir = temp_dir();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let runner = RecordingRunner::with_responder(move |prog, args| {
+            if prog == "ubus" && args == ["call", "network.wireless", "status"] {
+                let n = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    return Ok(br#"{"radio0":{"up":false}}"#.to_vec()); // first: dark
+                }
+                return Ok(br#"{"radio0":{"up":true}}"#.to_vec()); // after wifi up: alive
+            }
+            Ok(Vec::new())
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap();
+        let flat = m.runner().flat();
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())), "{flat:?}");
+    }
+
+    #[tokio::test]
     async fn rollback_to_deletes_added_and_restores_prior() {
         let dir = temp_dir();
         let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
@@ -519,6 +822,75 @@ mod tests {
         assert!(!flat.contains(&("uci".to_string(), "delete network.pc_home_if".to_string())));
         assert!(flat.contains(&("uci".to_string(), "set network.pc_home_if.ipaddr=10.1.0.1".to_string())));
         assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
+    }
+
+    // F7: `uci show` renders a maclist on one line with quoted elements; the
+    // snapshot must capture it list-aware (into prior_lists, not prior).
+    #[tokio::test]
+    async fn snapshot_wireless_captures_maclist_as_list() {
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args.first() == Some(&"show") && args.get(1) == Some(&"wireless") {
+                Ok(b"wireless.pc_home_ap0=wifi-iface\nwireless.pc_home_ap0.macfilter='deny'\nwireless.pc_home_ap0.maclist='aa:bb:cc:dd:ee:ff' '11:22:33:44:55:66'\n".to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let snap = m.snapshot_wireless().await.unwrap();
+        assert_eq!(snap.prior.get("wireless.pc_home_ap0.macfilter").map(String::as_str), Some("deny"));
+        assert_eq!(
+            snap.prior_lists.get("wireless.pc_home_ap0.maclist"),
+            Some(&vec!["aa:bb:cc:dd:ee:ff".to_string(), "11:22:33:44:55:66".to_string()]),
+        );
+        // the list key must NOT leak into the scalar map
+        assert!(!snap.prior.contains_key("wireless.pc_home_ap0.maclist"));
+    }
+
+    // F9: a device without sqm-scripts has no /etc/config/sqm, so `uci show sqm`
+    // errors — the snapshot must tolerate it (not abort the whole apply).
+    #[tokio::test]
+    async fn snapshot_wireless_tolerates_missing_sqm() {
+        let dir = temp_dir();
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args.first() == Some(&"show") {
+                match args.get(1).copied().unwrap_or("") {
+                    "sqm" => Err(ProvisionError::Apply("uci: Entry not found".into())),
+                    "wireless" => Ok(b"wireless.pc_home_ap0=wifi-iface\n".to_vec()),
+                    _ => Ok(Vec::new()),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let m = ProvisionMachine::new(runner, dir.path(), 8080);
+        let snap = m.snapshot_wireless().await.expect("missing sqm must not fail snapshot");
+        assert!(snap.existing_sections.iter().any(|s| s == "wireless.pc_home_ap0"));
+    }
+
+    // F7: rollback restores a prior list via delete + add_list per element (a
+    // scalar `uci set` can't reconstruct a UCI list).
+    #[tokio::test]
+    async fn rollback_restores_prior_list_via_add_list() {
+        let dir = temp_dir();
+        let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
+        let mut snap = Snapshot {
+            existing_sections: vec!["wireless.pc_home_ap0".to_string()],
+            ..Default::default()
+        };
+        snap.prior.insert("wireless.pc_home_ap0".to_string(), "wifi-iface".to_string());
+        snap.prior_lists.insert(
+            "wireless.pc_home_ap0.maclist".to_string(),
+            vec!["aa:bb:cc:dd:ee:ff".to_string(), "11:22:33:44:55:66".to_string()],
+        );
+        m.rollback_to(&snap, &["wireless.pc_home_ap0".to_string()], &["radio0".to_string()])
+            .await
+            .unwrap();
+        let flat = m.runner().flat();
+        // clear the list, then append each prior element
+        assert!(flat.contains(&("uci".to_string(), "delete wireless.pc_home_ap0.maclist".to_string())));
+        assert!(flat.contains(&("uci".to_string(), "add_list wireless.pc_home_ap0.maclist=aa:bb:cc:dd:ee:ff".to_string())));
+        assert!(flat.contains(&("uci".to_string(), "add_list wireless.pc_home_ap0.maclist=11:22:33:44:55:66".to_string())));
     }
 
     #[tokio::test]

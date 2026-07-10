@@ -39,7 +39,7 @@ pub mod runner;
 pub mod sm;
 pub mod uci;
 
-pub use handle::{run_provision_subsystem, ProvisionHandle};
+pub use handle::{run_provision_subsystem, run_provision_subsystem_with_policy, ProvisionHandle};
 pub use runner::{CommandRunner, ProcessRunner};
 pub use sm::{read_committed_gated, ProvisionMachine, DEFAULT_STATE_DIR};
 pub use uci::{render_wireless, validate_wireless, UciCmd};

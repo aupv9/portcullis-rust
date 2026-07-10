@@ -374,6 +374,14 @@ message WirelessSsid {
   bool   gated       = 8;  // true = portcullis captive-gates the resulting iface
   WirelessNetwork  network  = 9;
   WirelessFirewall firewall = 10;
+  // Phase 2 capacity/access-control (all optional; 0/empty = feature off):
+  uint32 max_clients = 11; // maxassoc — max associated stations (0 = unlimited)
+  string mac_policy  = 12; // "" | "disable" | "allow" (allow-list) | "deny" (deny-list)
+  repeated string mac_list = 13; // MAC addresses for allow/deny (lowercase aa:bb:..)
+  // Per-SSID bandwidth cap (SQM on the SSID's bridge). 0 = unlimited in that
+  // direction. download = to client (ingress); upload = from client (egress).
+  uint32 rate_down_kbps = 14;
+  uint32 rate_up_kbps   = 15;
 }
 
 // Full declarative desired-state of the engine's owned SSIDs. The engine diffs

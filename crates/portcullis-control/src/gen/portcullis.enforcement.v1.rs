@@ -586,6 +586,21 @@ pub struct WirelessSsid {
     pub network: ::core::option::Option<WirelessNetwork>,
     #[prost(message, optional, tag="10")]
     pub firewall: ::core::option::Option<WirelessFirewall>,
+    /// maxassoc — max associated stations (0 = unlimited)
+    #[prost(uint32, tag="11")]
+    pub max_clients: u32,
+    /// "" | "disable" | "allow" (allow-list) | "deny" (deny-list)
+    #[prost(string, tag="12")]
+    pub mac_policy: ::prost::alloc::string::String,
+    /// MAC addresses for allow/deny (lowercase aa:bb:..)
+    #[prost(string, repeated, tag="13")]
+    pub mac_list: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Per-SSID bandwidth cap (SQM). 0 = unlimited. download = to client (ingress).
+    #[prost(uint32, tag="14")]
+    pub rate_down_kbps: u32,
+    /// upload = from client (egress).
+    #[prost(uint32, tag="15")]
+    pub rate_up_kbps: u32,
 }
 /// Full declarative desired-state of the engine's owned SSIDs. The engine diffs
 /// this against its currently-owned sections and applies the minimal set/delete.
