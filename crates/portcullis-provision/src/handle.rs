@@ -109,6 +109,10 @@ struct WirelessPending {
     config_version: String,
     radios: Vec<String>,
     current_sections: Vec<String>,
+    /// Gated-SSID bridge ifaces (enforcement scope) — persisted in the marker so a
+    /// confirm after a mid-window restart writes the correct committed-gated set
+    /// even though `desired` is not reconstructed (P0 #2).
+    gated_ifaces: Vec<String>,
     per_ssid: Vec<SsidResult>,
     deadline: Instant,
     snapshot: Snapshot,
@@ -306,10 +310,16 @@ impl<R: CommandRunner> ProvisionActor<R> {
         let window = sm::confirm_window_secs(state.confirm_timeout_secs);
         let deadline = Instant::now() + window;
         let deadline_unix = unix_now() + window.as_secs() as i64;
+        // Gated-SSID bridge ifaces = the enforcement scope this push commits. Carry
+        // it in the marker AND the pending so a restart-then-confirm writes the
+        // RIGHT committed-gated set, not an empty one (P0 #2).
+        let gated_ifaces: Vec<String> =
+            state.ssids.iter().filter(|s| s.gated).map(|s| s.bridge_name.clone()).collect();
         let marker = WirelessMarker {
             config_version: state.config_version.clone(),
             radios: radios.clone(),
             current_sections: current_sections.clone(),
+            gated_ifaces: gated_ifaces.clone(),
             deadline_unix,
             snapshot: snapshot.clone(),
         };
@@ -335,6 +345,7 @@ impl<R: CommandRunner> ProvisionActor<R> {
             config_version: state.config_version.clone(),
             radios,
             current_sections,
+            gated_ifaces,
             per_ssid,
             deadline,
             snapshot,
@@ -350,15 +361,12 @@ impl<R: CommandRunner> ProvisionActor<R> {
             Some(p) if p.config_version == config_version => {
                 let _ = self.machine.clear_wireless_marker().await;
                 // Persist the committed gated-SSID ifaces (F2) so a daemon restart
-                // re-scopes enforcement before the CP reconnects. Best-effort.
-                let gated: Vec<String> = p
-                    .desired
-                    .ssids
-                    .iter()
-                    .filter(|s| s.gated)
-                    .map(|s| s.bridge_name.clone())
-                    .collect();
-                if let Err(e) = self.machine.write_committed_gated(&gated).await {
+                // re-scopes enforcement before the CP reconnects. Sourced from the
+                // pending's `gated_ifaces` (carried in the marker), NOT re-derived
+                // from `desired` — which is empty on a resumed-after-restart push, so
+                // deriving would write an empty set and silently un-gate every
+                // captive SSID (P0 #2). Best-effort.
+                if let Err(e) = self.machine.write_committed_gated(&p.gated_ifaces).await {
                     tracing::warn!(error = %e, "could not persist committed gated ifaces (boot re-scope only)");
                 }
                 self.last_committed = Some(p.desired);
@@ -437,13 +445,17 @@ impl<R: CommandRunner> ProvisionActor<R> {
                 config_version: marker.config_version,
                 radios: marker.radios,
                 current_sections: marker.current_sections,
+                // Reconstructed from the marker (P0 #2): a confirm after this resume
+                // writes the correct committed-gated set, not an empty one.
+                gated_ifaces: marker.gated_ifaces,
                 per_ssid: Vec::new(),
                 deadline: Instant::now() + remaining,
                 snapshot: marker.snapshot,
-                // The desired state isn't persisted in the marker; a resumed push
-                // that then confirms records an empty last-committed (the CP
+                // The full desired state isn't persisted in the marker; a resumed
+                // push that then confirms records an empty last-committed (the CP
                 // re-pushes if it needs introspection). The rollback path (the
-                // common resume outcome) doesn't need it.
+                // common resume outcome) doesn't need it, and the gated-iface scope
+                // — the one thing a confirm MUST get right — is carried above.
                 desired: WirelessDesiredState::default(),
             });
         }
@@ -712,6 +724,39 @@ mod tests {
         // wstate = [public (gated), home (not gated)] → only br-public is gated.
         let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
         assert_eq!(gated, vec!["br-public".to_string()]);
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_confirm_persists_gated_ifaces_not_empty() {
+        // P0 #2: a push confirmed AFTER a mid-window restart must still write the
+        // correct committed-gated set (carried in the marker), NOT an empty one —
+        // an empty set would silently un-gate every captive SSID (unauth internet).
+        let dir = tempfile::tempdir().unwrap();
+
+        // Incarnation A: apply a gated SSID, reach AppliedPending, then "crash"
+        // (drop) WITHOUT confirming. The marker (with gated_ifaces) persists.
+        {
+            let (handle, mut wrx, join) =
+                run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+            handle.set_wireless(wstate("cfg-resume", 600)).await.unwrap();
+            assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+            drop(handle);
+            let _ = join.await;
+        }
+
+        // Incarnation B: fresh actor, same tmpfs dir → resumes the pending from the
+        // marker. A confirm now must persist the gated ifaces from the marker.
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+        handle.confirm_wireless("cfg-resume").await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+
+        // The scope survived the restart — NOT wiped to empty.
+        let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
+        assert_eq!(gated, vec!["br-public".to_string()], "resumed confirm must not wipe the gated scope");
 
         drop(handle);
         let _ = join.await;

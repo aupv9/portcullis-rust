@@ -385,6 +385,19 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             state.confirm_timeout_secs
         ));
     }
+    // config_version is written verbatim into the tmpfs commit-confirm marker as a
+    // line-based `config_version=<v>` head line (and the marker uses `\n---\n` as
+    // its head/body separator). A `\n` or `---` in the value would inject/forge
+    // marker lines (e.g. a bogus `deadline_unix`) or shift the snapshot boundary,
+    // corrupting crash-recovery rollback. Reject control chars + bound the length
+    // (P1 #8). Validated before the teardown-all early return — a teardown still
+    // persists a marker keyed by config_version.
+    if state.config_version.chars().count() > 128 {
+        return bad(format!("config_version too long ({} chars, max 128)", state.config_version.chars().count()));
+    }
+    if state.config_version.chars().any(|c| c.is_control()) {
+        return bad("config_version must not contain control characters".to_string());
+    }
     if state.ssids.is_empty() {
         return Ok(()); // teardown-all
     }
@@ -509,10 +522,22 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
         subnets.push((net, bcast, s));
 
         if !ssid.dhcp_disabled {
-            let start: u32 = ssid.dhcp_start.trim().parse().map_err(|_| {
+            // Validate the RAW values — render emits them VERBATIM (uci.rs ~231-233).
+            // A prior version validated `.trim().parse()` but rendered the untrimmed
+            // string, so `dhcp_start="10\n"` PASSED validation yet wrote a newline
+            // into UCI, corrupting the line-based rollback marker round-trip (P1 #7).
+            // Digits-only rejects any whitespace/control/sign.
+            let is_digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+            if !is_digits(&ssid.dhcp_start) {
+                return bad(format!("dhcp_start '{}' for slug '{s}' must be digits only", ssid.dhcp_start));
+            }
+            if !is_digits(&ssid.dhcp_limit) {
+                return bad(format!("dhcp_limit '{}' for slug '{s}' must be digits only", ssid.dhcp_limit));
+            }
+            let start: u32 = ssid.dhcp_start.parse().map_err(|_| {
                 ProvisionError::Invalid(format!("dhcp_start '{}' for slug '{s}' not a number", ssid.dhcp_start))
             })?;
-            let limit: u32 = ssid.dhcp_limit.trim().parse().map_err(|_| {
+            let limit: u32 = ssid.dhcp_limit.parse().map_err(|_| {
                 ProvisionError::Invalid(format!("dhcp_limit '{}' for slug '{s}' not a number", ssid.dhcp_limit))
             })?;
             if start == 0 || start > 65535 {
@@ -521,7 +546,11 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             if limit == 0 || limit > 65535 {
                 return bad(format!("dhcp_limit out of range (1..=65535) for slug '{s}': {limit}"));
             }
-            if !is_leasetime(&ssid.dhcp_leasetime) {
+            // leasetime is rendered raw too; `is_leasetime` trims internally, which
+            // would mask a trailing newline — so reject whitespace/control up front.
+            if ssid.dhcp_leasetime.chars().any(|c| c.is_whitespace() || c.is_control())
+                || !is_leasetime(&ssid.dhcp_leasetime)
+            {
                 return bad(format!("dhcp_leasetime '{}' for slug '{s}' is invalid", ssid.dhcp_leasetime));
             }
         }
@@ -959,6 +988,38 @@ mod tests {
         let mut st = wstate(vec![ssid_on("public", true, 0)]);
         st.confirm_timeout_secs = 5; // below MIN 15
         assert!(validate_wireless(&st).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_config_version_control_chars() {
+        // P1 #8: a `\n`/`---` in config_version could inject/forge lines in the
+        // line-based tmpfs commit-confirm marker → corrupt crash-recovery rollback.
+        let mut st = wstate(vec![ssid_on("public", true, 0)]);
+        st.config_version = "v1\ndeadline_unix=0".into();
+        assert!(validate_wireless(&st).is_err());
+        // A clean version still passes.
+        st.config_version = "cfg-2026-07-10-abc".into();
+        validate_wireless(&st).unwrap();
+    }
+
+    #[test]
+    fn validate_wireless_rejects_dhcp_fields_with_whitespace() {
+        // P1 #7: DHCP fields are rendered VERBATIM, so a trailing newline that a
+        // `.trim().parse()` would have masked must be rejected (marker corruption).
+        let mut a = ssid_on("public", true, 0);
+        a.dhcp_start = "10\n".into();
+        assert!(validate_wireless(&wstate(vec![a])).is_err());
+
+        let mut b = ssid_on("staff", false, 1);
+        b.dhcp_limit = " 200".into();
+        assert!(validate_wireless(&wstate(vec![b])).is_err());
+
+        let mut c = ssid_on("guest", true, 2);
+        c.dhcp_leasetime = "2h\n".into();
+        assert!(validate_wireless(&wstate(vec![c])).is_err());
+
+        // The clean baseline still passes (regression guard).
+        validate_wireless(&wstate(vec![ssid_on("ok", true, 3)])).unwrap();
     }
 
     #[test]

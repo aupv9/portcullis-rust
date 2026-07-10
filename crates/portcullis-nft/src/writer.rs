@@ -42,6 +42,10 @@ enum Command {
         ifaces: Vec<String>,
         reply: oneshot::Sender<Result<()>>,
     },
+    AddGarden {
+        ips: Vec<std::net::IpAddr>,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Cloneable handle to the writer actor. Implements [`RulesetWriter`].
@@ -88,6 +92,11 @@ impl RulesetWriter for WriterHandle {
 
     async fn set_gated_ifaces(&self, ifaces: Vec<String>) -> Result<()> {
         self.call(|reply| Command::SetGatedIfaces { ifaces, reply }).await
+    }
+
+    async fn add_garden(&self, ips: &[std::net::IpAddr]) -> Result<()> {
+        let ips = ips.to_vec();
+        self.call(|reply| Command::AddGarden { ips, reply }).await
     }
 }
 
@@ -160,6 +169,15 @@ impl WriterActor {
                 }
                 Command::SetGatedIfaces { ifaces, reply } => {
                     let r = retry_once(|| self.backend.set_gated_ifaces(ifaces.clone())).await;
+                    self.count_err(&r);
+                    let _ = reply.send(r);
+                }
+                Command::AddGarden { ips, reply } => {
+                    // add_garden is itself fail-open per element (Ok even when an
+                    // individual ipset add fails), so retry_once here just covers a
+                    // transient whole-call spawn error; a genuine failure is not a
+                    // fail-closed enforcement fault.
+                    let r = retry_once(|| self.backend.add_garden(&ips)).await;
                     self.count_err(&r);
                     let _ = reply.send(r);
                 }
