@@ -1,0 +1,4 @@
+# Build-time golden-image overlay (Image Builder FILES=). Holds per-batch secrets
+# (bootstrap.conf FLEET_SECRET) — NEVER commit. The tracked template lives at
+# deploy/config/bootstrap.conf; this dir is filled per batch at bake time.
+files/

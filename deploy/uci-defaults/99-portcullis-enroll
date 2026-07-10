@@ -1,0 +1,8 @@
+#!/bin/sh
+# First-boot hook: enable the ZTP claim agent so it runs on this boot (and every
+# boot until the device has enrolled). OpenWrt runs uci-defaults once, then deletes
+# this file. The agent itself is idempotent (no-op once /etc/portcullis/enrolled).
+/etc/init.d/portcullis-enroll enable 2>/dev/null || true
+# Kick it now so a first boot claims without waiting for a reboot.
+/etc/init.d/portcullis-enroll start 2>/dev/null || true
+exit 0

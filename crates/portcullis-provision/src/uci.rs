@@ -17,9 +17,11 @@
 use portcullis_types::{ProvisionError, SsidSpec, WirelessDesiredState};
 
 /// The UCI `config`s (top-level files) the reload touches. Commit order:
-/// `uci commit network wireless dhcp firewall` (firewall last — its zone
-/// references the `hotspot` interface, so the interface must be committed first).
-pub const OWNED_CONFIGS: [&str; 4] = ["network", "wireless", "dhcp", "firewall"];
+/// `uci commit network wireless dhcp firewall sqm` (firewall before sqm; sqm
+/// references the SSID's bridge interface). `sqm` is OPTIONAL — a device without
+/// sqm-scripts has no /etc/config/sqm, so its show/commit are tolerated as no-ops
+/// (see snapshot_wireless / commit_and_reload_multi).
+pub const OWNED_CONFIGS: [&str; 5] = ["network", "wireless", "dhcp", "firewall", "sqm"];
 
 /// The WAN firewall zone the hotspot forwards out through. On RUTOS (RUT200/
 /// RUTM11) the default WAN zone is named `wan` and already carries `masq '1'`
@@ -43,6 +45,10 @@ pub const MAX_CONFIRM_TIMEOUT_SECS: u32 = 600;
 pub enum UciCmd {
     /// `uci set <key>=<value>`   (`<key>` is `config.section` or `config.section.option`).
     Set { key: String, value: String },
+    /// `uci add_list <key>=<value>` — append one element to a UCI list option
+    /// (e.g. `wireless.<iface>.maclist`). The section is always freshly recreated
+    /// each apply (delete-then-set), so appends never accumulate stale entries.
+    AddList { key: String, value: String },
     /// `uci delete <key>`  (best-effort; a missing section is not an error on teardown).
     Delete { key: String },
 }
@@ -54,12 +60,16 @@ impl UciCmd {
     fn delete(key: impl Into<String>) -> Self {
         UciCmd::Delete { key: key.into() }
     }
+    fn add_list(key: impl Into<String>, value: impl Into<String>) -> Self {
+        UciCmd::AddList { key: key.into(), value: value.into() }
+    }
 
     /// The explicit argv (excluding the `uci` program itself) for this command.
     /// A `set` is `["set", "key=value"]`; a `delete` is `["delete", "key"]`.
     pub fn argv(&self) -> Vec<String> {
         match self {
             UciCmd::Set { key, value } => vec!["set".to_string(), format!("{key}={value}")],
+            UciCmd::AddList { key, value } => vec!["add_list".to_string(), format!("{key}={value}")],
             UciCmd::Delete { key } => vec!["delete".to_string(), key.clone()],
         }
     }
@@ -87,9 +97,19 @@ pub const DEFAULT_RADIO: &str = "radio0";
 pub const WIRELESS_OWNER: &str = "portcullis-wireless";
 /// Name prefix on every owned wireless section (the ownership marker in the name).
 pub const WIRELESS_SECTION_PREFIX: &str = "pc_";
-/// Max SSID `wifi-iface`s the engine will place on one radio (mt76 VIF headroom;
-/// the admin SSID already consumes one).
-pub const MAX_SSIDS_PER_RADIO: usize = 8;
+/// Max CP-managed SSID `wifi-iface`s the engine will place on one radio (the
+/// admin/management SSID already consumes one VIF on top of this).
+///
+/// Conservative on purpose (RC2): a structurally-valid push that asks for more
+/// BSSIDs than the mt76 chip can actually instantiate makes `wifi reload` bring
+/// the radio up with ZERO interfaces — darkening every SSID on it, admin
+/// included. Validation can't probe the driver, so the cap is the guard. Kept at
+/// a value comfortably within the mt76 parts on the RUTM11/RUT200 rather than the
+/// theoretical maximum. Exceeding it is a clean fail-open REJECT (nothing is
+/// applied — no outage), so if a deployment's hardware provably supports more,
+/// raising this constant is safe. Validate the real per-band limit on-device
+/// (`iwinfo <phy> info`) before doing so.
+pub const MAX_SSIDS_PER_RADIO: usize = 4;
 /// Max radios one SSID may span (teardown deletes `pc_<slug>_ap0..apN`).
 pub const MAX_RADIOS_PER_SSID: usize = 4;
 /// Slugs the CP may not use (would confuse with core networks / the hotspot path).
@@ -170,6 +190,36 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         if spec.hidden {
             c.push(UciCmd::set(format!("{ap}.hidden"), "1"));
         }
+        // PMF (ieee80211w): WPA3-SAE mandates it (2 = required); sae-mixed makes it
+        // optional (1) so legacy WPA2 clients still associate. psk2/open leave it
+        // unset (hostapd default off). Correctness fix — SAE without PMF is invalid.
+        match enc {
+            "sae" => c.push(UciCmd::set(format!("{ap}.ieee80211w"), "2")),
+            "sae-mixed" => c.push(UciCmd::set(format!("{ap}.ieee80211w"), "1")),
+            _ => {}
+        }
+        // maxassoc: cap associated stations per AP (0 = unlimited => unset).
+        if spec.max_clients > 0 {
+            c.push(UciCmd::set(format!("{ap}.maxassoc"), spec.max_clients.to_string()));
+        }
+        // MAC access-control (hostapd macfilter): "allow" = only listed MACs may
+        // associate; "deny" = listed MACs are blocked. maclist is a UCI *list* —
+        // one add_list per MAC. The whole section is recreated each apply (delete-
+        // then-set), so appends never accumulate; rollback restores prior lists via
+        // Snapshot::prior_lists. Empty policy / empty list => no filter.
+        if !spec.mac_list.is_empty() {
+            let filter = match spec.mac_policy.as_str() {
+                "allow" => Some("allow"),
+                "deny" => Some("deny"),
+                _ => None,
+            };
+            if let Some(filter) = filter {
+                c.push(UciCmd::set(format!("{ap}.macfilter"), filter));
+                for m in &spec.mac_list {
+                    c.push(UciCmd::add_list(format!("{ap}.maclist"), m.to_lowercase()));
+                }
+            }
+        }
         c.push(UciCmd::set(format!("{ap}.owner"), WIRELESS_OWNER));
     }
 
@@ -234,6 +284,22 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         c.push(UciCmd::set(format!("{rp}.owner"), WIRELESS_OWNER));
     }
 
+    // sqm.pc_<s> = queue  (F9: per-SSID bandwidth cap on this SSID's bridge). Only
+    // when a cap is set; 0 in a direction = unlimited (SQM treats 0 as "no shaping"
+    // for that leg). `cake` + piece_of_cake.qos is a simple single-tier shaper.
+    // Needs sqm-scripts + a cake/fq_codel qdisc on the device (golden-image dep).
+    if spec.rate_down_kbps > 0 || spec.rate_up_kbps > 0 {
+        let q = format!("sqm.pc_{s}");
+        c.push(UciCmd::set(&q, "queue"));
+        c.push(UciCmd::set(format!("{q}.interface"), &spec.bridge_name));
+        c.push(UciCmd::set(format!("{q}.enabled"), "1"));
+        c.push(UciCmd::set(format!("{q}.download"), spec.rate_down_kbps.to_string())); // to client (ingress)
+        c.push(UciCmd::set(format!("{q}.upload"), spec.rate_up_kbps.to_string())); // from client (egress)
+        c.push(UciCmd::set(format!("{q}.qdisc"), "cake"));
+        c.push(UciCmd::set(format!("{q}.script"), "piece_of_cake.qos"));
+        c.push(UciCmd::set(format!("{q}.owner"), WIRELESS_OWNER));
+    }
+
     c
 }
 
@@ -280,12 +346,20 @@ pub fn render_ssid_teardown(slug: &str) -> Vec<UciCmd> {
     c.push(UciCmd::delete(format!("firewall.pc_{s}_fwd")));
     c.push(UciCmd::delete(format!("firewall.pc_{s}_zone")));
     c.push(UciCmd::delete(format!("dhcp.pc_{s}")));
+    c.push(UciCmd::delete(format!("sqm.pc_{s}")));
     for i in 0..MAX_RADIOS_PER_SSID {
         c.push(UciCmd::delete(format!("wireless.pc_{s}_ap{i}")));
     }
     c.push(UciCmd::delete(format!("network.pc_{s}_if")));
     c.push(UciCmd::delete(format!("network.pc_{s}_dev")));
     c
+}
+
+/// A MAC address in `aa:bb:cc:dd:ee:ff` form (case-insensitive): six colon-
+/// separated pairs of hex digits.
+fn is_mac_addr(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6 && parts.iter().all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A slug: `[a-z0-9_]` (lowercase only), 1..=16 chars.
@@ -373,6 +447,24 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             }
         }
 
+        // MAC access-control (F7). Policy must be a known value; allow/deny needs a
+        // non-empty list of well-formed MACs (each element becomes a maclist entry
+        // via add_list). Reject up front so a bad ACL writes nothing.
+        match ssid.mac_policy.as_str() {
+            "" | "disable" => {}
+            "allow" | "deny" => {
+                if ssid.mac_list.is_empty() {
+                    return bad(format!("mac_policy '{}' for slug '{s}' requires a non-empty mac_list", ssid.mac_policy));
+                }
+                for m in &ssid.mac_list {
+                    if !is_mac_addr(m) {
+                        return bad(format!("mac_list entry '{m}' for slug '{s}' is not a MAC (aa:bb:cc:dd:ee:ff)"));
+                    }
+                }
+            }
+            other => return bad(format!("mac_policy '{other}' for slug '{s}' unsupported (allow|deny|disable)")),
+        }
+
         // Validate the RAW bridge_name (is_uci_ident already rejects whitespace)
         // so validation matches what render_ssid / rescope emit verbatim.
         let br = ssid.bridge_name.as_str();
@@ -441,6 +533,34 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
         }
     }
 
+    Ok(())
+}
+
+/// Reject a desired-state that places any owned SSID on a PROTECTED radio (the
+/// admin/management radio an operator marked off-limits via config). `wifi reload
+/// <radio>` rebuilds the WHOLE radio, so an owned SSID sharing the admin radio
+/// makes every apply/rollback bounce the admin SSID; forbidding the overlap keeps
+/// the protected radio untouched. An SSID with no explicit `radios` defaults to
+/// [`DEFAULT_RADIO`], so if that is protected the operator must name another radio
+/// explicitly. Fail-open REJECT (nothing applied). Empty `protected` = no-op
+/// (default), preserving the current behaviour on single-radio routers.
+pub fn validate_protected_radios(
+    state: &WirelessDesiredState,
+    protected: &[String],
+) -> Result<(), ProvisionError> {
+    if protected.is_empty() {
+        return Ok(());
+    }
+    for ssid in &state.ssids {
+        for r in effective_radios(ssid) {
+            if protected.iter().any(|p| p.as_str() == r) {
+                return Err(ProvisionError::Invalid(format!(
+                    "slug '{}' targets protected radio '{r}' (admin/management radio); assign it to a non-protected radio",
+                    ssid.slug
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -544,6 +664,11 @@ mod tests {
             dhcp_leasetime: "2h".into(),
             dhcp_disabled: false,
             egress_zone: String::new(),
+            max_clients: 0,
+            mac_policy: String::new(),
+            mac_list: Vec::new(),
+            rate_down_kbps: 0,
+            rate_up_kbps: 0,
         }
     }
 
@@ -613,6 +738,108 @@ mod tests {
         assert!(has_set(&cmds, "wireless.pc_public_ap1.device", "radio1"));
     }
 
+    // Phase 2 (F5): PMF is derived from encryption — SAE required, mixed optional,
+    // psk2/open unset.
+    #[test]
+    fn render_ssid_pmf_ieee80211w_by_encryption() {
+        let mut sae = valid_ssid("s3", false);
+        sae.encryption = "sae".into();
+        assert!(has_set(&render_ssid(&sae, 8080), "wireless.pc_s3_ap0.ieee80211w", "2"));
+
+        let mut mixed = valid_ssid("mx", false);
+        mixed.encryption = "sae-mixed".into();
+        assert!(has_set(&render_ssid(&mixed, 8080), "wireless.pc_mx_ap0.ieee80211w", "1"));
+
+        // psk2 and open never set PMF.
+        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "wireless.pc_home_ap0.ieee80211w"));
+        assert!(!has_key(&render_ssid(&valid_ssid("public", true), 8080), "wireless.pc_public_ap0.ieee80211w"));
+    }
+
+    // Phase 2 (F6): maxassoc set only when max_clients > 0.
+    #[test]
+    fn render_ssid_maxassoc_when_capped() {
+        let mut capped = valid_ssid("home", false);
+        capped.max_clients = 32;
+        assert!(has_set(&render_ssid(&capped, 8080), "wireless.pc_home_ap0.maxassoc", "32"));
+        // unlimited (0) => unset
+        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "wireless.pc_home_ap0.maxassoc"));
+    }
+
+    fn has_add_list(cmds: &[UciCmd], key: &str, value: &str) -> bool {
+        cmds.iter().any(|c| *c == UciCmd::add_list(key, value))
+    }
+
+    // Phase 2 (F7): MAC ACL renders macfilter + one lowercased add_list per MAC.
+    #[test]
+    fn render_ssid_mac_deny_list() {
+        let mut s = valid_ssid("home", false);
+        s.mac_policy = "deny".into();
+        s.mac_list = vec!["AA:BB:CC:DD:EE:FF".into(), "11:22:33:44:55:66".into()];
+        let cmds = render_ssid(&s, 8080);
+        assert!(has_set(&cmds, "wireless.pc_home_ap0.macfilter", "deny"));
+        assert!(has_add_list(&cmds, "wireless.pc_home_ap0.maclist", "aa:bb:cc:dd:ee:ff")); // lowercased
+        assert!(has_add_list(&cmds, "wireless.pc_home_ap0.maclist", "11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn render_ssid_no_mac_filter_when_policy_off() {
+        // empty policy => neither macfilter nor maclist
+        let cmds = render_ssid(&valid_ssid("home", false), 8080);
+        assert!(!has_key(&cmds, "wireless.pc_home_ap0.macfilter"));
+        assert!(!has_key(&cmds, "wireless.pc_home_ap0.maclist"));
+    }
+
+    fn wstate1(s: SsidSpec) -> WirelessDesiredState {
+        WirelessDesiredState { config_version: "cfg".into(), ssids: vec![s], confirm_timeout_secs: 0 }
+    }
+
+    // Phase 3 (F9): a rate cap renders an sqm `queue` section on the SSID's bridge.
+    #[test]
+    fn render_ssid_sqm_when_rate_capped() {
+        let mut s = valid_ssid("home", false);
+        s.rate_down_kbps = 20000;
+        s.rate_up_kbps = 5000;
+        let cmds = render_ssid(&s, 8080);
+        assert!(has_set(&cmds, "sqm.pc_home", "queue"));
+        assert!(has_set(&cmds, "sqm.pc_home.interface", "br-home"));
+        assert!(has_set(&cmds, "sqm.pc_home.enabled", "1"));
+        assert!(has_set(&cmds, "sqm.pc_home.download", "20000"));
+        assert!(has_set(&cmds, "sqm.pc_home.upload", "5000"));
+        assert!(has_set(&cmds, "sqm.pc_home.owner", WIRELESS_OWNER));
+    }
+
+    #[test]
+    fn render_ssid_no_sqm_when_uncapped() {
+        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "sqm.pc_home"));
+    }
+
+    #[test]
+    fn teardown_removes_sqm_section() {
+        assert!(render_ssid_teardown("home").iter().any(|c| *c == UciCmd::delete("sqm.pc_home")));
+    }
+
+    #[test]
+    fn validate_wireless_rejects_bad_mac_and_empty_list() {
+        // allow/deny with an empty list is rejected
+        let mut empty = valid_ssid("home", false);
+        empty.mac_policy = "allow".into();
+        assert!(validate_wireless(&wstate1(empty)).is_err());
+        // malformed MAC is rejected
+        let mut bad = valid_ssid("home", false);
+        bad.mac_policy = "deny".into();
+        bad.mac_list = vec!["not-a-mac".into()];
+        assert!(validate_wireless(&wstate1(bad)).is_err());
+        // unknown policy rejected
+        let mut unknown = valid_ssid("home", false);
+        unknown.mac_policy = "whitelist".into();
+        assert!(validate_wireless(&wstate1(unknown)).is_err());
+        // valid deny-list passes
+        let mut ok = valid_ssid("home", false);
+        ok.mac_policy = "deny".into();
+        ok.mac_list = vec!["aa:bb:cc:dd:ee:ff".into()];
+        assert!(validate_wireless(&wstate1(ok)).is_ok());
+    }
+
     #[test]
     fn render_ssid_egress_zone_overrides_wan() {
         let mut s = valid_ssid("public", true);
@@ -638,6 +865,36 @@ mod tests {
     #[test]
     fn validate_wireless_empty_is_teardown_ok() {
         validate_wireless(&wstate(vec![])).unwrap();
+    }
+
+    #[test]
+    fn validate_protected_radios_empty_is_noop() {
+        // Default (no protected radios) never rejects — preserves current behaviour.
+        let st = wstate(vec![ssid_on("public", true, 0)]); // defaults to radio0
+        validate_protected_radios(&st, &[]).unwrap();
+    }
+
+    #[test]
+    fn validate_protected_radios_rejects_ssid_on_admin_radio() {
+        // An SSID with no explicit radios defaults to radio0; protecting radio0
+        // rejects it (operator must move it to another radio explicitly).
+        let st = wstate(vec![ssid_on("public", true, 0)]);
+        let err = validate_protected_radios(&st, &["radio0".to_string()]).unwrap_err();
+        assert!(matches!(err, ProvisionError::Invalid(_)));
+
+        // Explicitly targeting the protected radio is also rejected.
+        let mut s = ssid_on("staff", false, 1);
+        s.radios = vec!["radio0".into()];
+        let err = validate_protected_radios(&wstate(vec![s]), &["radio0".to_string()]).unwrap_err();
+        assert!(matches!(err, ProvisionError::Invalid(_)));
+    }
+
+    #[test]
+    fn validate_protected_radios_allows_ssid_on_free_radio() {
+        // Guest on radio1 while radio0 is protected → accepted.
+        let mut s = ssid_on("public", true, 0);
+        s.radios = vec!["radio1".into()];
+        validate_protected_radios(&wstate(vec![s]), &["radio0".to_string()]).unwrap();
     }
 
     #[test]

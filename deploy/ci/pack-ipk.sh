@@ -44,6 +44,11 @@ install -d "$DATA/usr/sbin" "$DATA/usr/lib/portcullis"
 install -m0755 "$BIN"                          "$DATA/usr/sbin/portcullis"
 install -m0755 "$DEPLOY_DIR/portcullis.init"   "$DATA/usr/lib/portcullis/portcullis.init"
 install -m0644 "$DEPLOY_DIR/config/portcullis" "$DATA/usr/lib/portcullis/config.default"
+# Self-hosted ZTP first-boot claim agent + its batch config (the postinst deploys
+# them into /etc; bootstrap.conf is a conffile so an operator-filled fleet secret
+# survives upgrades).
+install -m0755 "$DEPLOY_DIR/portcullis-enroll.init" "$DATA/usr/lib/portcullis/portcullis-enroll.init"
+install -m0644 "$DEPLOY_DIR/config/bootstrap.conf"  "$DATA/usr/lib/portcullis/bootstrap.conf.default"
 
 # --- control metadata ---
 install -d "$CTRL"
@@ -54,7 +59,13 @@ Architecture: ${ARCH}
 Maintainer: The portcullis authors
 Section: net
 Priority: optional
-Depends: ipset, iptables, ip6tables, kmod-ipt-ipset
+# NOTE (F9 per-SSID QoS): SQM shaping is OPT-IN, not a hard dep — forcing
+# sqm-scripts + kmod-sched-cake onto every device (RUT200 flash budget) is wrong
+# for an optional feature. The engine degrades gracefully when they're absent
+# (snapshot/commit/reload tolerate a missing /etc/config/sqm; a cap set on such a
+# device simply doesn't shape). On devices that USE per-SSID caps, install:
+#   opkg install sqm-scripts kmod-sched-cake
+Depends: ipset, iptables, ip6tables, kmod-ipt-ipset, conntrack-tools, curl, ca-bundle, openssl-util
 Description: Per-store captive-portal edge enforcement engine. Holds the internet
  gate shut until the WiFi Hub control plane authorizes a client, then enforces,
  meters, and expires that grant via ipset + iptables (TDD 17 option B).
@@ -66,9 +77,27 @@ cat > "$CTRL/postinst" <<'EOF'
 LIB=/usr/local/usr/lib/portcullis
 [ -d "$LIB" ] || LIB=/usr/lib/portcullis            # generic OpenWrt (dest=/)
 # busybox on RutOS has no `install`; use cp + chmod.
-mkdir -p /etc/init.d /etc/config
-cp "$LIB/portcullis.init" /etc/init.d/portcullis && chmod 0755 /etc/init.d/portcullis
+mkdir -p /etc/init.d /etc/config /etc/portcullis
+# RutOS installs package files under the /usr/local overlay, so the daemon binary
+# lands at /usr/local/usr/sbin/portcullis (NOT /usr/sbin — that path is read-only
+# squashfs). Point the init's PROG at the real path, and run as ROOT (strip the
+# user/capabilities params): procd's non-root capability path does not grant an
+# effective CAP_NET_ADMIN for the ipset/iptables netlink calls on RutOS.
+BIN=/usr/local/usr/sbin/portcullis
+[ -x "$BIN" ] || BIN=/usr/sbin/portcullis
+sed -e "s#^PROG=.*#PROG=$BIN#" \
+    -e "/^USER=/d" \
+    -e "/procd_set_param user /d" \
+    -e "/procd_set_param capabilities /d" \
+    "$LIB/portcullis.init" > /etc/init.d/portcullis
+chmod 0755 /etc/init.d/portcullis
 [ -f /etc/config/portcullis ] || { cp "$LIB/config.default" /etc/config/portcullis && chmod 0644 /etc/config/portcullis; }
+# Self-hosted ZTP first-boot claim agent (+ batch config conffile). Enabled below
+# so it runs on boot (before the engine, START=94) until the device has enrolled.
+if [ -f "$LIB/portcullis-enroll.init" ]; then
+	cp "$LIB/portcullis-enroll.init" /etc/init.d/portcullis-enroll && chmod 0755 /etc/init.d/portcullis-enroll
+	[ -f /etc/portcullis/bootstrap.conf ] || { cp "$LIB/bootstrap.conf.default" /etc/portcullis/bootstrap.conf && chmod 0644 /etc/portcullis/bootstrap.conf; }
+fi
 mkdir -p /tmp/portcullis /etc/dnsmasq.d
 # Walled garden needs dnsmasq-full: `ipset=` crashes a stock/slim dnsmasq and
 # takes DNS down for the whole LAN. Only wire it when dnsmasq supports ipset.
@@ -84,6 +113,7 @@ case "$DNSMASQ_VER" in
 	*) echo "portcullis: could not probe dnsmasq ipset support — skipping walled-garden" >&2 ;;
 esac
 /etc/init.d/portcullis enable 2>/dev/null || true
+[ -f /etc/init.d/portcullis-enroll ] && /etc/init.d/portcullis-enroll enable 2>/dev/null || true
 exit 0
 EOF
 chmod 0755 "$CTRL/postinst"
@@ -94,6 +124,9 @@ cat > "$CTRL/prerm" <<'EOF'
 /etc/init.d/portcullis stop 2>/dev/null || true
 /etc/init.d/portcullis disable 2>/dev/null || true
 rm -f /etc/init.d/portcullis
+/etc/init.d/portcullis-enroll stop 2>/dev/null || true
+/etc/init.d/portcullis-enroll disable 2>/dev/null || true
+rm -f /etc/init.d/portcullis-enroll
 exit 0
 EOF
 chmod 0755 "$CTRL/prerm"

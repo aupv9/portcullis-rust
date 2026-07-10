@@ -33,8 +33,11 @@ define Package/portcullis
   CATEGORY:=Network
   TITLE:=Per-store captive-portal edge enforcement engine
   URL:=https://github.com/aupv9/portcullis-rust
-  # Runtime deps: the nftables backend + dnsmasq nftset support (§5.2, §7.3).
-  DEPENDS:=+nftables +kmod-nft-core +kmod-nft-nat +dnsmasq-full
+  # Runtime deps: the nftables backend + dnsmasq nftset support (§5.2, §7.3),
+  # plus the ZTP first-boot claim agent's tools (curl for the HTTPS claim POST,
+  # openssl-util for the HMAC signature, ca-bundle for TLS trust) so a golden
+  # image can self-enroll with NO opkg/internet at install time.
+  DEPENDS:=+nftables +kmod-nft-core +kmod-nft-nat +dnsmasq-full +curl +ca-bundle +openssl-util
 endef
 
 define Package/portcullis/description
@@ -66,6 +69,7 @@ endef
 
 define Package/portcullis/conffiles
 /etc/config/portcullis
+/etc/portcullis/bootstrap.conf
 endef
 
 define Package/portcullis/install
@@ -76,15 +80,22 @@ define Package/portcullis/install
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(CURDIR)/portcullis.init $(1)/etc/init.d/portcullis
+	# ZTP first-boot claim agent (self-hosted zero-touch onboarding).
+	$(INSTALL_BIN) $(CURDIR)/portcullis-enroll.init $(1)/etc/init.d/portcullis-enroll
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) $(CURDIR)/config/portcullis $(1)/etc/config/portcullis
+
+	# ZTP batch bootstrap config (CP domain + fleet secret; conffile, per-batch).
+	$(INSTALL_DIR) $(1)/etc/portcullis
+	$(INSTALL_CONF) $(CURDIR)/config/bootstrap.conf $(1)/etc/portcullis/bootstrap.conf
 
 	$(INSTALL_DIR) $(1)/etc/capabilities
 	$(INSTALL_DATA) $(CURDIR)/capabilities/portcullis.json $(1)/etc/capabilities/portcullis.json
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) $(CURDIR)/uci-defaults/99-portcullis $(1)/etc/uci-defaults/99-portcullis
+	$(INSTALL_BIN) $(CURDIR)/uci-defaults/99-portcullis-enroll $(1)/etc/uci-defaults/99-portcullis-enroll
 endef
 
 $(eval $(call BuildPackage,portcullis))

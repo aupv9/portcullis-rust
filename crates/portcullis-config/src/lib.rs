@@ -58,6 +58,16 @@ pub struct Config {
     #[serde(default = "default_keepalive_secs")]
     pub control_keepalive_secs: u64,
 
+    /// Radios the CP-managed wireless subsystem must NOT place owned SSIDs on
+    /// (typically the admin/management radio). A push naming any of these is
+    /// rejected up front, so `wifi reload <radio>` — which rebuilds the WHOLE radio
+    /// — can never bounce or dark the admin SSID sharing it. Empty (default) = no
+    /// protection, current behaviour. Opt-in per deployment: on a dual-band router
+    /// set e.g. `radio0` here and give guest SSIDs `radios=radio1`. Leave empty on
+    /// single-radio routers (no spare radio to move guests onto).
+    #[serde(default)]
+    pub wireless_protected_radios: Vec<String>,
+
     /// Path to the HMAC key file (§13 — the key lives outside this config).
     pub hmac_key_file: String,
 
@@ -175,6 +185,7 @@ impl Default for Config {
             cp_server_name: String::new(),
             control_reconnect_max_secs: default_reconnect_max_secs(),
             control_keepalive_secs: default_keepalive_secs(),
+            wireless_protected_radios: Vec::new(),
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
             responder_port: 8080,
             accounting_interval: 15,
@@ -278,6 +289,7 @@ impl Config {
                     let val = &tokens[1];
                     match key.as_str() {
                         "garden_fqdn" => cfg.garden_fqdn.push(val.clone()),
+                        "wireless_protected_radio" => cfg.wireless_protected_radios.push(val.clone()),
                         other => {
                             return Err(Error::Config(format!(
                                 "UCI line {}: unknown list key '{other}'",
@@ -610,6 +622,8 @@ config portcullis 'main'
             cp_server_name: String::new(),
             control_reconnect_max_secs: 60,
             control_keepalive_secs: 20,
+            // non-default so the roundtrip actually exercises the field.
+            wireless_protected_radios: vec!["radio0".to_string()],
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
             responder_port: 8080,
             accounting_interval: 15,

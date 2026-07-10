@@ -135,6 +135,23 @@ pub fn run_provision_subsystem<R>(
 where
     R: CommandRunner + 'static,
 {
+    run_provision_subsystem_with_policy(runner, state_dir, responder_port, Vec::new())
+}
+
+/// [`run_provision_subsystem`] plus the engine-local `protected_radios` policy
+/// (layer A): radios the CP may not place owned SSIDs on (the admin/management
+/// radio). An empty list is exactly [`run_provision_subsystem`]. Wired from
+/// [`portcullis_config::Config::wireless_protected_radios`] by the composition
+/// root; enforced by [`uci::validate_protected_radios`] before any apply.
+pub fn run_provision_subsystem_with_policy<R>(
+    runner: R,
+    state_dir: impl Into<std::path::PathBuf>,
+    responder_port: u16,
+    protected_radios: Vec<String>,
+) -> (ProvisionHandle, mpsc::Receiver<WirelessStatus>, tokio::task::JoinHandle<()>)
+where
+    R: CommandRunner + 'static,
+{
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (wireless_status_tx, wireless_status_rx) = mpsc::channel(STATUS_BUFFER);
     let machine = ProvisionMachine::new(runner, state_dir, responder_port);
@@ -144,6 +161,7 @@ where
         wireless_status_tx,
         pending_wireless: None,
         last_committed: None,
+        protected_radios,
     };
     let join = tokio::spawn(actor.run());
     (ProvisionHandle { tx: cmd_tx }, wireless_status_rx, join)
@@ -157,6 +175,9 @@ struct ProvisionActor<R: CommandRunner> {
     pending_wireless: Option<WirelessPending>,
     /// Last COMMITTED wireless desired-state (served by `get_wireless`).
     last_committed: Option<WirelessDesiredState>,
+    /// Layer A: radios owned SSIDs may not target (admin/management radio).
+    /// Empty = no restriction. Enforced in [`Self::handle_set_wireless`].
+    protected_radios: Vec<String>,
 }
 
 impl<R: CommandRunner> ProvisionActor<R> {
@@ -220,6 +241,9 @@ impl<R: CommandRunner> ProvisionActor<R> {
     ) -> Result<(), ProvisionError> {
         // Validate FIRST — a bad desired-state writes nothing (fail-OPEN reject).
         uci::validate_wireless(&state)?;
+        // Layer A: never let an owned SSID land on a protected (admin) radio, so a
+        // `wifi reload <radio>` can't bounce/dark the admin SSID. No-op when unset.
+        uci::validate_protected_radios(&state, &self.protected_radios)?;
 
         // One pending push at a time — can't honour two watchdogs / rollback
         // safety nets at once.
@@ -475,6 +499,11 @@ mod tests {
             dhcp_leasetime: "2h".into(),
             dhcp_disabled: false,
             egress_zone: String::new(),
+            max_clients: 0,
+            mac_policy: String::new(),
+            mac_list: Vec::new(),
+            rate_down_kbps: 0,
+            rate_up_kbps: 0,
         }
     }
 
@@ -564,6 +593,52 @@ mod tests {
         assert!(matches!(err, ProvisionError::Invalid(_)));
         // Nothing applied, no status.
         assert!(wdrain(&mut wrx).is_empty());
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_rejects_ssid_on_protected_radio() {
+        // Layer A: with radio0 protected (the admin radio), a push whose SSIDs land
+        // on radio0 is rejected up front — nothing applied, no reload/bounce.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = RecordingRunner::new();
+        let (handle, mut wrx, join) = run_provision_subsystem_with_policy(
+            runner.clone(),
+            dir.path().to_path_buf(),
+            8080,
+            vec!["radio0".to_string()],
+        );
+
+        // wstate SSIDs default to radio0 → hits the protected radio → rejected.
+        let err = handle.set_wireless(wstate("cfg-prot", 90)).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Invalid(_)));
+        assert!(wdrain(&mut wrx).is_empty(), "rejected push must apply nothing");
+        // Not a single uci/wifi command ran — the guard is pre-apply.
+        assert!(runner.flat().is_empty(), "protected-radio reject must touch nothing: {:?}", runner.flat());
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_accepts_ssid_on_unprotected_radio() {
+        // Same protection, but the SSIDs sit on radio1 → accepted (applies + arms).
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut wrx, join) = run_provision_subsystem_with_policy(
+            RecordingRunner::new(),
+            dir.path().to_path_buf(),
+            8080,
+            vec!["radio0".to_string()],
+        );
+
+        let mut st = wstate("cfg-ok", 90);
+        for s in &mut st.ssids {
+            s.radios = vec!["radio1".into()];
+        }
+        handle.set_wireless(st).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
 
         drop(handle);
         let _ = join.await;

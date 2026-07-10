@@ -1,0 +1,151 @@
+#!/bin/sh /etc/rc.common
+# portcullis-enroll — self-hosted Zero-Touch Provisioning first-boot claim agent.
+#
+# Runs at boot BEFORE the engine (START=94 < portcullis START=95). On a fresh
+# golden-image device it self-claims by SERIAL + a fleet-secret HMAC, writes the
+# per-store mTLS bundle + UCI, then (re)starts the engine — no SSH, no token, no
+# opkg (the engine .ipk is pre-installed in the image).
+#
+# Idempotent: no-op once /etc/portcullis/enrolled exists. Runs the claim in the
+# background with capped backoff and retries FOREVER, so it converges whether the
+# CP has the serial registered before or after the device is powered on.
+#
+# Batch config (NOT per-device) lives in /etc/portcullis/bootstrap.conf:
+#   CP_DOMAIN, CP_RESOLVE_IP, CLAIM_URL, FLEET_SECRET, WAN_IF
+# Mirrors the claim path in the CP's enroll.sh (server repo), minus the opkg step.
+
+START=94
+STOP=99
+# rc.common: run on boot.
+BOOT=1
+
+MARKER=/etc/portcullis/enrolled
+CONF=/etc/portcullis/bootstrap.conf
+TLSDIR=/etc/portcullis/tls
+LOG_TAG=portcullis-enroll
+
+log() { logger -t "$LOG_TAG" "$*"; }
+
+# jsonfilter (libubox, present on all RUTOS/OpenWrt) parses the bundle; jq fallback.
+jget() {
+	if command -v jsonfilter >/dev/null 2>&1; then
+		printf '%s' "$B" | jsonfilter -e "@.$1" 2>/dev/null
+	else
+		printf '%s' "$B" | jq -r ".$1 // empty" 2>/dev/null
+	fi
+}
+
+read_serial() {
+	# Teltonika manufacturer serial (10 digits). mnf_info uses getopt FLAGS, not
+	# subcommands (verified on RUTM11: `mnf_info -s` → 6008120919; `mnf_info sn`
+	# just prints usage). --sn is the long form.
+	s=$(mnf_info -s 2>/dev/null | grep -oE '[0-9]{10}' | head -1)
+	[ -n "$s" ] || s=$(mnf_info --sn 2>/dev/null | grep -oE '[0-9]{10}' | head -1)
+	printf '%s' "$s"
+}
+
+read_mac() {
+	# WAN MAC for the claim (audit). RUTM11's WAN port is the netdev named `wan`
+	# (DSA switch layout — there is NO eth1); derive it from UCI, fall back to the
+	# configured WAN_IF, then to the manufacturer Eth MAC (iface-independent).
+	dev=$(uci -q get network.wan.device 2>/dev/null)
+	[ -n "$dev" ] || dev="${WAN_IF:-wan}"
+	if [ -e "/sys/class/net/$dev/address" ]; then
+		cat "/sys/class/net/$dev/address" | tr 'A-Z' 'a-z'
+	else
+		mnf_info -t 2>/dev/null | sed 's/../&:/g; s/:$//' | tr 'A-Z' 'a-z'
+	fi
+}
+
+try_claim() {
+	SERIAL=$(read_serial)
+	echo "$SERIAL" | grep -qE '^[0-9]{10}$' || { log "no 10-digit serial from mnf_info yet"; return 1; }
+	MAC=$(read_mac)
+	TS=$(date +%s)
+	SIG=$(printf '%s' "$SERIAL|$MAC|$TS" | openssl dgst -sha256 -hmac "$FLEET_SECRET" 2>/dev/null | awk '{print $NF}')
+	[ -n "$SIG" ] || { log "openssl HMAC failed"; return 1; }
+
+	B=$(curl -fsSk -X POST "$CLAIM_URL" -H 'Content-Type: application/json' \
+		-d "{\"serial\":\"$SERIAL\",\"mac\":\"$MAC\",\"ts\":\"$TS\",\"sig\":\"$SIG\"}" 2>/dev/null)
+	NAS=$(jget nas_id)
+	[ -n "$B" ] && [ -n "$NAS" ] || { log "claim rejected/empty (serial=$SERIAL — registered & provisioning? clock synced?)"; return 1; }
+
+	# 1) mTLS client identity + redirect HMAC key.
+	mkdir -p "$TLSDIR"
+	jget client_cert_pem > "$TLSDIR/client.crt"
+	jget client_key_pem  > "$TLSDIR/client.key"
+	jget cp_server_ca    > "$TLSDIR/cp-ca.crt"
+	jget hmac_key        > /etc/portcullis/hmac.key
+	chmod 600 "$TLSDIR/client.key" /etc/portcullis/hmac.key
+	chown -R portcullis:portcullis /etc/portcullis 2>/dev/null || true
+
+	# 2) Local resolver pin (dev/LAN without real DNS) so the engine can re-dial
+	#    the CP domain on every reconnect.
+	RIP=$(jget cp_resolve_ip); CPNAME=$(jget cp_server_name)
+	if [ -n "$RIP" ] && [ -n "$CPNAME" ]; then
+		ESC=$(echo "$CPNAME" | sed 's/\./\\./g')
+		sed -i "/[[:space:]]${ESC}\$/d" /etc/hosts 2>/dev/null || true
+		echo "$RIP $CPNAME" >> /etc/hosts
+		/etc/init.d/dnsmasq restart 2>/dev/null || true
+	fi
+
+	# 3) Engine UCI (control_endpoint etc.). /etc/config/portcullis ships in the image.
+	CP=$(jget cp_server)
+	uci -q set portcullis.main.store_id="$NAS"
+	[ -n "$CP" ]     && uci -q set portcullis.main.control_endpoint="$CP"
+	[ -n "$CPNAME" ] && uci -q set portcullis.main.cp_server_name="$CPNAME"
+	uci -q set portcullis.main.cp_server_ca_file="$TLSDIR/cp-ca.crt"
+	uci -q set portcullis.main.hmac_key_file='/etc/portcullis/hmac.key'
+	uci -q commit portcullis
+
+	# 4) SSID (best-effort) onto the first wifi-iface.
+	SSID=$(jget ssid)
+	if [ -n "$SSID" ]; then
+		IF=$(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface/\1/p' | head -1)
+		[ -n "$IF" ] && { uci -q set "wireless.$IF.ssid=$SSID"; uci -q commit wireless; wifi reload 2>/dev/null || true; }
+	fi
+
+	# 5) Done — mark enrolled and (re)start the engine so it dials the Attach edge.
+	touch "$MARKER"
+	/etc/init.d/portcullis enable 2>/dev/null || true
+	/etc/init.d/portcullis restart 2>/dev/null || /etc/init.d/portcullis start 2>/dev/null || true
+	log "enrolled nas_id=$NAS — engine dialing ${CP:-control_endpoint}"
+	return 0
+}
+
+enroll_loop() {
+	n=0
+	while [ ! -f "$MARKER" ]; do
+		try_claim && break
+		n=$((n + 1)); [ "$n" -gt 6 ] && n=6
+		sleep $((n * 10))   # 10,20,…,60s capped — retry until the CP has the serial
+	done
+}
+
+start() {
+	[ -f "$MARKER" ] && return 0
+	[ -f "$CONF" ] || { log "no $CONF — not a ZTP image; skip"; return 0; }
+	# shellcheck source=/dev/null
+	. "$CONF"
+	[ -n "${FLEET_SECRET:-}" ] || { log "FLEET_SECRET empty in $CONF; skip"; return 0; }
+	[ -n "${CLAIM_URL:-}" ] || CLAIM_URL="https://${CP_DOMAIN:-cp.wifihub.internal}/api/enroll/claim"
+	command -v openssl >/dev/null 2>&1 || { log "openssl missing; cannot claim"; return 0; }
+	# Dev/LAN without real DNS: pre-pin CP_DOMAIN -> CP_RESOLVE_IP so the FIRST claim
+	# POST can resolve the domain (try_claim re-pins the same value from the bundle
+	# after it succeeds). No-op in prod (CP_RESOLVE_IP empty -> real DNS resolves it).
+	# Without this the very first claim can't resolve the domain and the loop spins.
+	if [ -n "${CP_RESOLVE_IP:-}" ] && [ -n "${CP_DOMAIN:-}" ]; then
+		ESC=$(echo "$CP_DOMAIN" | sed 's/\./\\./g')
+		grep -q "[[:space:]]${ESC}\$" /etc/hosts 2>/dev/null || {
+			echo "$CP_RESOLVE_IP $CP_DOMAIN" >> /etc/hosts
+			/etc/init.d/dnsmasq restart 2>/dev/null || true
+			log "pre-pinned $CP_DOMAIN -> $CP_RESOLVE_IP for first-claim DNS"
+		}
+	fi
+	# Background so boot isn't blocked by the retry loop.
+	( enroll_loop ) &
+}
+
+boot() {
+	start
+}

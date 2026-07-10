@@ -300,6 +300,11 @@ pub fn wireless_ssid_from_pb(s: pb::WirelessSsid) -> SsidSpec {
         dhcp_leasetime: net.dhcp_leasetime,
         dhcp_disabled: net.dhcp_disabled,
         egress_zone: fw.egress_zone,
+        max_clients: s.max_clients,
+        mac_policy: s.mac_policy,
+        mac_list: s.mac_list,
+        rate_down_kbps: s.rate_down_kbps,
+        rate_up_kbps: s.rate_up_kbps,
     }
 }
 
@@ -363,6 +368,11 @@ fn ssid_spec_to_pb_redacted(s: &SsidSpec) -> pb::WirelessSsid {
             dhcp_disabled: s.dhcp_disabled,
         }),
         firewall: Some(pb::WirelessFirewall { egress_zone: s.egress_zone.clone() }),
+        max_clients: s.max_clients,
+        mac_policy: s.mac_policy.clone(),
+        mac_list: s.mac_list.clone(),
+        rate_down_kbps: s.rate_down_kbps,
+        rate_up_kbps: s.rate_up_kbps,
     }
 }
 
@@ -595,6 +605,11 @@ mod tests {
                 dhcp_disabled: false,
             }),
             firewall: Some(pb::WirelessFirewall { egress_zone: "wan".into() }),
+            max_clients: 0,
+            mac_policy: String::new(),
+            mac_list: Vec::new(),
+            rate_down_kbps: 0,
+            rate_up_kbps: 0,
         }
     }
 
@@ -639,6 +654,11 @@ mod tests {
                 dhcp_leasetime: "2h".into(),
                 dhcp_disabled: false,
                 egress_zone: String::new(),
+                max_clients: 0,
+                mac_policy: String::new(),
+                mac_list: Vec::new(),
+                rate_down_kbps: 0,
+                rate_up_kbps: 0,
             }],
         };
         let pb = wireless_config_to_pb(&state);
