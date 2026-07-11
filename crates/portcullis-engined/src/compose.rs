@@ -82,6 +82,16 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     };
     w.mgr.set_reaper(reaper.clone());
 
+    // 4c-ii. Optional 802.11 deauth on revoke (L2 companion to the L3 revoke).
+    //     The L3 revoke gates the client but leaves the phone associated
+    //     ("connected, no internet"); when the CP sets `deauth` on a revoke the
+    //     engine ALSO asks hostapd (over ubus) to deauthenticate the client so it
+    //     re-onboards into the portal cleanly. Constructed unconditionally: it is
+    //     purely best-effort (a device without ubus/hostapd is a no-op Ok) and
+    //     only fires when a revoke frame opts in — never touches the L3 gate.
+    let deauth: Arc<dyn portcullis_types::Deauthenticator> =
+        Arc::new(portcullis_accounting::UbusDeauth::default());
+
     // 4d. Bandwidth shaper (G5): per-session tc/HTB cap, scoped to a LAN egress
     //     iface via config. Off → NoopShaper (grants carry rate_bps but no cap is
     //     applied). The `shaper` capability is advertised (GetEngineInfo) only
@@ -196,6 +206,9 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
                 writer: writer.clone(),
                 // G3/G4: config-push + introspection dispatch target.
                 engine_control,
+                // Optional 802.11 deauth on revoke (best-effort; fires only when a
+                // Revoke frame sets `deauth`). Never affects the L3 gate.
+                deauth: deauth.clone(),
             };
             let enforcer = w.mgr.clone() as Arc<dyn Enforcer>;
             let events = w.event_tx.clone();
