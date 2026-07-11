@@ -230,10 +230,22 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     }
 
     // 6. :8080 redirect responder (§7.2). Reads the per-store HMAC key.
-    let hmac_key = std::fs::read(&cfg.hmac_key_file).unwrap_or_else(|e| {
-        tracing::warn!(path = %cfg.hmac_key_file, error = %e, "HMAC key unreadable");
-        Vec::new()
-    });
+    // Trim trailing whitespace: enroll/file writers append a newline, but the
+    // control plane keys the redirect-sig HMAC on the bare 64-hex string (no
+    // newline, straight from the DB). Signing over the extra '\n' makes EVERY
+    // engine signature mismatch the CP's verification → 401 "bad signature" →
+    // no captive grant. Sign over exactly the bytes the CP stores.
+    let hmac_key = std::fs::read(&cfg.hmac_key_file)
+        .map(|mut b| {
+            while b.last().is_some_and(|c| c.is_ascii_whitespace()) {
+                b.pop();
+            }
+            b
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(path = %cfg.hmac_key_file, error = %e, "HMAC key unreadable");
+            Vec::new()
+        });
     let portal_url =
         std::env::var("PORTCULLIS_PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
     match portcullis_redirect::RedirectConfig::new(
