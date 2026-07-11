@@ -2,6 +2,8 @@
 # Build artifacts (the workspace uses a single target dir at the root).
 /target
 **/target/
+# Packaged .ipk output (produced by deploy/ci/pack-ipk.sh).
+/dist/
 # Backups from rustfmt and friends.
 **/*.rs.bk
 # Cargo.lock IS committed — this workspace builds a binary/daemon, so a locked,

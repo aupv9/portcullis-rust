@@ -14,12 +14,14 @@
 //!   crashes the daemon and never fabricates data. The kernel set-element
 //!   `timeout` is the backstop that still expires sessions (TDD §11, no
 //!   fail-open).
-//! - The only kernel-touching parts (`conntrack -L`, `tc`) are behind traits and
-//!   shell out via `tokio::process::Command`; tests use mocks.
+//! - The only kernel-touching parts (`conntrack -L`, `tc`, hostapd via `ubus`)
+//!   are behind traits and shell out via `tokio::process::Command`; tests use
+//!   mocks.
 
 #![forbid(unsafe_code)]
 
 mod conntrack;
+mod deauth;
 mod metering;
 mod mock;
 mod reaper;
@@ -28,10 +30,12 @@ mod shaper;
 // Re-export the port we implement so downstream code can refer to it via this
 // crate, and the sink/resolver ports we consume.
 pub use portcullis_types::{
-    CounterSource, FlowReaper, MeteringSink, NeighResolver, NoopReaper, NoopShaper, Shaper,
+    CounterSource, Deauthenticator, FlowReaper, MeteringSink, NeighResolver, NoopDeauth,
+    NoopReaper, NoopShaper, Shaper,
 };
 
 pub use conntrack::{parse_conntrack, ConntrackCli, ConntrackReader, ConntrackSource};
+pub use deauth::UbusDeauth;
 pub use metering::{run_metering_loop, DEFAULT_INTERVAL};
 pub use mock::MockCounterSource;
 pub use reaper::{reap_orphan_flows, run_reap_loop, ConntrackReaper};

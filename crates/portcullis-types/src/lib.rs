@@ -521,6 +521,38 @@ impl FlowReaper for NoopReaper {
     }
 }
 
+/// Send an 802.11 deauthentication to a client so it drops off Wi-Fi and
+/// re-associates into the captive portal cleanly. Optional companion to the L3
+/// revoke (removing a MAC from `@auth` + reaping conntrack): the L3 revoke leaves
+/// the phone associated ("connected, no internet") until the OS re-probes the
+/// portal — a deauth makes it re-onboard immediately. Implemented by
+/// `portcullis-accounting`'s `UbusDeauth` (drives hostapd over ubus); injected
+/// into the revoke path and used only when the control plane sets `deauth`.
+///
+/// Best-effort, like [`FlowReaper`]: a deauth failure is a *bonus that didn't
+/// land*, never a fail-open — it must NOT abort or fail the L3 revoke, which has
+/// already severed the client at the gate. "Client not associated" is `Ok(())`,
+/// not an error.
+#[async_trait]
+pub trait Deauthenticator: Send + Sync {
+    /// Deauthenticate `mac` off Wi-Fi (best-effort). `Ok(())` when the deauth was
+    /// dispatched (or the client wasn't associated / no hostapd is present);
+    /// `Err` only on a genuine tooling failure the caller degrades over.
+    async fn deauth(&self, mac: MacAddr) -> Result<()>;
+}
+
+/// No-op deauthenticator — the default when deauth-on-revoke is disabled or in
+/// tests (mirrors [`NoopReaper`]). Every deauth is a successful `Ok(())`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopDeauth;
+
+#[async_trait]
+impl Deauthenticator for NoopDeauth {
+    async fn deauth(&self, _mac: MacAddr) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Apply / clear a per-client bandwidth cap (tc/HTB, G5). Implemented by
 /// `portcullis-accounting`'s `TcShaper`; injected into the SessionManager, which
 /// applies on grant and clears on revoke/expiry. `rate_bps == 0` means unlimited

@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use futures::SinkExt;
 use portcullis_types::{
-    EngineControl, Enforcer, ProvisionState, Provisioner, RulesetWriter, SessionEvent,
-    WirelessStatus,
+    Deauthenticator, EngineControl, Enforcer, ProvisionState, Provisioner, RulesetWriter,
+    SessionEvent, WirelessStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
@@ -76,6 +76,12 @@ pub struct ControlChannelConfig {
     /// tier's default ttl/quota through it. Fail-closed: a rejected `Set*` is
     /// answered `ok:false` (never a silent accept).
     pub engine_control: Arc<dyn EngineControl>,
+    /// Optional 802.11 deauth on revoke. When a `Revoke` carries `deauth = true`,
+    /// this is invoked AFTER a successful L3 revoke to drop the client off Wi-Fi
+    /// (via hostapd/ubus) so it re-onboards into the portal cleanly. Purely
+    /// additive/best-effort: a deauth failure is logged and the revoke still acks
+    /// ok — the L3 gate has already closed. `deauth = false` never touches this.
+    pub deauth: Arc<dyn Deauthenticator>,
 }
 
 /// Run the control channel until `events` is closed (engine shutting down).
@@ -182,7 +188,7 @@ where
         tokio::select! {
             msg = inbound.message() => match msg {
                 Ok(Some(ctrl)) => {
-                    for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner, &cfg.engine_control).await {
+                    for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner, &cfg.engine_control, &cfg.deauth).await {
                         if out_tx.send(out).await.is_err() {
                             return Ok(()); // outbound half gone; reconnect
                         }
@@ -240,6 +246,7 @@ async fn handle_control_frame(
     enforcer: &Arc<dyn Enforcer>,
     provisioner: &Arc<dyn Provisioner>,
     engine_control: &Arc<dyn EngineControl>,
+    deauth_svc: &Arc<dyn Deauthenticator>,
 ) -> Vec<pb::EngineFrame> {
     let cid = ctrl.correlation_id;
     let Some(msg) = ctrl.msg else {
@@ -270,7 +277,19 @@ async fn handle_control_frame(
                 Ok(mac) => {
                     let reason = convert::revoke_reason_from_pb(r.reason());
                     match enforcer.revoke(mac, reason).await {
-                        Ok(()) => ok_ack(),
+                        Ok(()) => {
+                            // L3 revoke landed (gate closed, conntrack reaped). If the
+                            // CP asked for it, ALSO deauth the client off Wi-Fi so it
+                            // re-onboards into the portal cleanly. Purely additive and
+                            // best-effort: a deauth failure is logged and we STILL ack
+                            // ok — never fail the succeeded L3 revoke on a bonus L2 step.
+                            if r.deauth {
+                                if let Err(e) = deauth_svc.deauth(mac).await {
+                                    tracing::warn!(%mac, error = %e, "deauth on revoke failed; L3 revoke still succeeded");
+                                }
+                            }
+                            ok_ack()
+                        }
                         Err(e) => ack_err(e),
                     }
                 }
@@ -659,6 +678,47 @@ mod tests {
         Arc::new(MockControl::default()) as Arc<dyn EngineControl>
     }
 
+    /// A [`Deauthenticator`] test double: records every MAC it's asked to deauth
+    /// (so tests can assert it was/wasn't called and with what), and can be made to
+    /// error to prove the revoke ack stays ok when deauth fails (best-effort).
+    #[derive(Default)]
+    struct RecordingDeauth {
+        calls: std::sync::Mutex<Vec<MacAddr>>,
+        fail: bool,
+    }
+    impl RecordingDeauth {
+        fn failing() -> Self {
+            RecordingDeauth { calls: std::sync::Mutex::new(Vec::new()), fail: true }
+        }
+    }
+    #[async_trait::async_trait]
+    impl portcullis_types::Deauthenticator for RecordingDeauth {
+        async fn deauth(&self, mac: MacAddr) -> PResult<()> {
+            self.calls.lock().unwrap().push(mac);
+            if self.fail {
+                return Err(Error::Other("ubus boom".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A no-op deauth arc for tests that don't exercise the deauth path.
+    fn da() -> Arc<dyn portcullis_types::Deauthenticator> {
+        Arc::new(portcullis_types::NoopDeauth) as Arc<dyn portcullis_types::Deauthenticator>
+    }
+
+    /// Build a `Revoke` control frame, optionally requesting an 802.11 deauth.
+    fn revoke_ctrl(cid: u64, mac: &str, deauth: bool) -> pb::ControlFrame {
+        pb::ControlFrame {
+            correlation_id: cid,
+            msg: Some(control_frame::Msg::Revoke(pb::RevokeRequest {
+                client_mac: mac.into(),
+                reason: pb::RevokeReason::RevokeQuota as i32,
+                deauth,
+            })),
+        }
+    }
+
     fn grant_ctrl(cid: u64, mac: &str) -> pb::ControlFrame {
         pb::ControlFrame {
             correlation_id: cid,
@@ -684,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn grant_frame_acks_ok_and_echoes_correlation() {
-        let out = handle_control_frame(grant_ctrl(7, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(grant_ctrl(7, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].correlation_id, 7);
         let ack = ack_of(&out[0]);
@@ -694,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_grant_acks_error_not_silent_accept() {
-        let out = handle_control_frame(grant_ctrl(1, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(grant_ctrl(1, "aa:bb:cc:dd:ee:ff"), &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         let ack = ack_of(&out[0]);
         assert!(!ack.ok);
         assert!(!ack.message.is_empty());
@@ -702,23 +762,89 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_mac_grant_acks_error() {
-        let out = handle_control_frame(grant_ctrl(1, "garbage"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(grant_ctrl(1, "garbage"), &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         let ack = ack_of(&out[0]);
         assert!(!ack.ok);
     }
 
     #[tokio::test]
     async fn revoke_frame_acks() {
-        let ctrl = pb::ControlFrame {
-            correlation_id: 3,
-            msg: Some(control_frame::Msg::Revoke(pb::RevokeRequest {
-                client_mac: "aa:bb:cc:dd:ee:ff".into(),
-                reason: pb::RevokeReason::RevokeQuota as i32,
-            })),
-        };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let ctrl = revoke_ctrl(3, "aa:bb:cc:dd:ee:ff", false);
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert_eq!(out[0].correlation_id, 3);
         assert!(ack_of(&out[0]).ok);
+    }
+
+    // ---- optional 802.11 deauth on revoke (L2 companion to the L3 revoke) ----
+
+    #[tokio::test]
+    async fn revoke_without_deauth_flag_does_not_deauth() {
+        // deauth = false: the L3 revoke acks ok and the deauth service is NEVER
+        // touched (identical to the pre-deauth behaviour).
+        let deauth = Arc::new(RecordingDeauth::default());
+        let out = handle_control_frame(
+            revoke_ctrl(3, "aa:bb:cc:dd:ee:ff", false),
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &(deauth.clone() as Arc<dyn portcullis_types::Deauthenticator>),
+        )
+        .await;
+        assert!(ack_of(&out[0]).ok, "L3 revoke still acks ok");
+        assert!(deauth.calls.lock().unwrap().is_empty(), "deauth must NOT be called when the flag is false");
+    }
+
+    #[tokio::test]
+    async fn revoke_with_deauth_flag_deauths_the_mac_once() {
+        // deauth = true after a SUCCESSFUL revoke: the deauth fires exactly once
+        // with the revoked MAC, and the ack is still ok.
+        let deauth = Arc::new(RecordingDeauth::default());
+        let out = handle_control_frame(
+            revoke_ctrl(3, "aa:bb:cc:dd:ee:ff", true),
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &(deauth.clone() as Arc<dyn portcullis_types::Deauthenticator>),
+        )
+        .await;
+        assert!(ack_of(&out[0]).ok, "revoke acks ok");
+        let calls = deauth.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "deauth called exactly once");
+        assert_eq!(calls[0], "aa:bb:cc:dd:ee:ff".parse().unwrap(), "deauth targets the revoked MAC");
+    }
+
+    #[tokio::test]
+    async fn revoke_deauth_failure_still_acks_ok() {
+        // A deauth error is a bonus that didn't land — the L3 revoke already
+        // succeeded, so the ack MUST stay ok (best-effort, never fail-open).
+        let deauth = Arc::new(RecordingDeauth::failing());
+        let out = handle_control_frame(
+            revoke_ctrl(3, "aa:bb:cc:dd:ee:ff", true),
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &(deauth.clone() as Arc<dyn portcullis_types::Deauthenticator>),
+        )
+        .await;
+        assert!(ack_of(&out[0]).ok, "a failed deauth must NOT flip the successful L3 revoke ack");
+        assert_eq!(deauth.calls.lock().unwrap().len(), 1, "deauth was attempted");
+    }
+
+    #[tokio::test]
+    async fn failed_revoke_with_deauth_flag_does_not_deauth() {
+        // The L3 revoke FAILED, so there is nothing to deauth — the deauth service
+        // must not be called, and the ack reports the failure (never a silent ok).
+        let deauth = Arc::new(RecordingDeauth::default());
+        let out = handle_control_frame(
+            revoke_ctrl(3, "aa:bb:cc:dd:ee:ff", true),
+            &(MockEnforcer::failing() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &(deauth.clone() as Arc<dyn portcullis_types::Deauthenticator>),
+        )
+        .await;
+        assert!(!ack_of(&out[0]).ok, "a failed L3 revoke must ack error");
+        assert!(deauth.calls.lock().unwrap().is_empty(), "no deauth when the L3 revoke itself failed");
     }
 
     #[tokio::test]
@@ -727,7 +853,7 @@ mod tests {
             correlation_id: 5,
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Session(_))));
         match &out[1].msg {
@@ -743,7 +869,7 @@ mod tests {
             correlation_id: 5,
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert_eq!(out.len(), 1);
         match &out[0].msg {
             Some(engine_frame::Msg::ListEnd(le)) => assert!(!le.ok),
@@ -757,7 +883,7 @@ mod tests {
             correlation_id: 9,
             msg: Some(control_frame::Msg::List(pb::ListRequest { page_size: 0, page_token: String::new() })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         // 2 sessions + 1 list_end
         assert_eq!(out.len(), 3);
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Session(_))));
@@ -771,7 +897,7 @@ mod tests {
             correlation_id: 2,
             msg: Some(control_frame::Msg::Ping(pb::Ping { ts_unix: 100 })),
         };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         match &out[0].msg {
             Some(engine_frame::Msg::Health(h)) => assert!(h.backend_ok),
             other => panic!("expected Health, got {other:?}"),
@@ -781,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn empty_frame_is_ignored_no_panic() {
         let ctrl = pb::ControlFrame { correlation_id: 0, msg: None };
-        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert!(out.is_empty());
     }
 
@@ -794,14 +920,14 @@ mod tests {
             correlation_id: 4,
             msg: Some(control_frame::Msg::ProvisionHotspot(pb::ProvisionHotspotRequest::default())),
         };
-        let out = handle_control_frame(hotspot, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(hotspot, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert!(!ack_of(&out[0]).ok, "ProvisionHotspot must be rejected (deprecated)");
 
         let confirm = pb::ControlFrame {
             correlation_id: 5,
             msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest::default())),
         };
-        let out = handle_control_frame(confirm, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec()).await;
+        let out = handle_control_frame(confirm, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert!(!ack_of(&out[0]).ok, "ConfirmProvision must be rejected (deprecated)");
     }
 
@@ -846,6 +972,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &(MockProvisioner::ok() as Arc<dyn Provisioner>),
             &ec(),
+            &da(),
         )
         .await;
         assert_eq!(out[0].correlation_id, 9);
@@ -867,6 +994,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &(MockProvisioner::failing() as Arc<dyn Provisioner>),
             &ec(),
+            &da(),
         )
         .await;
         assert!(!ack_of(&out[0]).ok, "a rejected wireless push must ack error, never silent-accept");
@@ -883,6 +1011,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &(MockProvisioner::ok() as Arc<dyn Provisioner>),
             &ec(),
+            &da(),
         )
         .await;
         assert_eq!(out.len(), 1);
@@ -914,6 +1043,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &prov(),
             &(control.clone() as Arc<dyn EngineControl>),
+            &da(),
         )
         .await;
         assert!(ack_of(&out[0]).ok);
@@ -938,6 +1068,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &prov(),
             &ec(),
+            &da(),
         )
         .await;
         assert!(!ack_of(&out[0]).ok, "out-of-bounds params must ack error");
@@ -955,6 +1086,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &prov(),
             &(control.clone() as Arc<dyn EngineControl>),
+            &da(),
         )
         .await;
         assert!(ack_of(&out[0]).ok);
@@ -972,6 +1104,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &prov(),
             &ec(),
+            &da(),
         )
         .await;
         assert_eq!(out[0].correlation_id, 4);
@@ -992,6 +1125,7 @@ mod tests {
             &(MockEnforcer::ok() as Arc<dyn Enforcer>),
             &prov(),
             &ec(),
+            &da(),
         )
         .await;
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Metrics(_))));

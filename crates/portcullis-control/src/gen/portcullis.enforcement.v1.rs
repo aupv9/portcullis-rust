@@ -202,6 +202,13 @@ pub struct RevokeRequest {
     pub client_mac: ::prost::alloc::string::String,
     #[prost(enumeration="RevokeReason", tag="2")]
     pub reason: i32,
+    /// When true, after gating the client at L3 (remove from @auth + reap
+    /// conntrack) the engine ALSO sends an 802.11 deauth so the device drops off
+    /// Wi-Fi and reconnects into the captive portal, instead of sitting in the
+    /// "connected but no internet" limbo. Best-effort / L2 — never blocks the L3
+    /// revoke. Old engines ignore this field (proto3 forward-compat).
+    #[prost(bool, tag="3")]
+    pub deauth: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -586,6 +593,8 @@ pub struct WirelessSsid {
     pub network: ::core::option::Option<WirelessNetwork>,
     #[prost(message, optional, tag="10")]
     pub firewall: ::core::option::Option<WirelessFirewall>,
+    /// Phase 2 capacity/access-control (all optional; 0/empty = feature off):
+    ///
     /// maxassoc — max associated stations (0 = unlimited)
     #[prost(uint32, tag="11")]
     pub max_clients: u32,
@@ -595,10 +604,10 @@ pub struct WirelessSsid {
     /// MAC addresses for allow/deny (lowercase aa:bb:..)
     #[prost(string, repeated, tag="13")]
     pub mac_list: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Per-SSID bandwidth cap (SQM). 0 = unlimited. download = to client (ingress).
+    /// Per-SSID bandwidth cap (SQM on the SSID's bridge). 0 = unlimited in that
+    /// direction. download = to client (ingress); upload = from client (egress).
     #[prost(uint32, tag="14")]
     pub rate_down_kbps: u32,
-    /// upload = from client (egress).
     #[prost(uint32, tag="15")]
     pub rate_up_kbps: u32,
 }

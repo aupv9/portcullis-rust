@@ -152,6 +152,12 @@ enum RevokeReason {
 message RevokeRequest {
   string       client_mac = 1;
   RevokeReason reason     = 2;
+  // When true, after gating the client at L3 (remove from @auth + reap
+  // conntrack) the engine ALSO sends an 802.11 deauth so the device drops off
+  // Wi-Fi and reconnects into the captive portal, instead of sitting in the
+  // "connected but no internet" limbo. Best-effort / L2 — never blocks the L3
+  // revoke. Old engines ignore this field (proto3 forward-compat).
+  bool         deauth     = 3;
 }
 
 message Ack {

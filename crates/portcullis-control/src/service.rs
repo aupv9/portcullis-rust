@@ -530,6 +530,7 @@ mod tests {
             .revoke_session(Request::new(pb::RevokeRequest {
                 client_mac: "aa:bb:cc:dd:ee:ff".into(),
                 reason: pb::RevokeReason::RevokeQuota as i32,
+                deauth: false,
             }))
             .await
             .unwrap()
@@ -541,6 +542,7 @@ mod tests {
             .revoke_session(Request::new(pb::RevokeRequest {
                 client_mac: "aa:bb:cc:dd:ee:ff".into(),
                 reason: pb::RevokeReason::RevokeAdmin as i32,
+                deauth: false,
             }))
             .await
             .unwrap_err();
