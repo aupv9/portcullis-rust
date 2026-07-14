@@ -388,6 +388,10 @@ message WirelessSsid {
   // direction. download = to client (ingress); upload = from client (egress).
   uint32 rate_down_kbps = 14;
   uint32 rate_up_kbps   = 15;
+  // Phase 3 SSID fields (all optional; empty/false = engine default):
+  string mode        = 16;   // "ap" (default) | "mesh" (future; rejected by validation for now)
+  bool   ieee80211r  = 17;   // Fast Transition
+  string ieee80211w  = 18;   // PMF: "" off | "1" optional | "2" required
 }
 
 // Full declarative desired-state of the engine's owned SSIDs. The engine diffs

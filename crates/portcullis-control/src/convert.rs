@@ -305,6 +305,9 @@ pub fn wireless_ssid_from_pb(s: pb::WirelessSsid) -> SsidSpec {
         mac_list: s.mac_list,
         rate_down_kbps: s.rate_down_kbps,
         rate_up_kbps: s.rate_up_kbps,
+        mode: s.mode,
+        ieee80211r: s.ieee80211r,
+        ieee80211w: s.ieee80211w,
     }
 }
 
@@ -373,6 +376,9 @@ fn ssid_spec_to_pb_redacted(s: &SsidSpec) -> pb::WirelessSsid {
         mac_list: s.mac_list.clone(),
         rate_down_kbps: s.rate_down_kbps,
         rate_up_kbps: s.rate_up_kbps,
+        mode: s.mode.clone(),
+        ieee80211r: s.ieee80211r,
+        ieee80211w: s.ieee80211w.clone(),
     }
 }
 
@@ -610,6 +616,9 @@ mod tests {
             mac_list: Vec::new(),
             rate_down_kbps: 0,
             rate_up_kbps: 0,
+            mode: String::new(),
+            ieee80211r: false,
+            ieee80211w: String::new(),
         }
     }
 
@@ -659,6 +668,9 @@ mod tests {
                 mac_list: Vec::new(),
                 rate_down_kbps: 0,
                 rate_up_kbps: 0,
+                mode: String::new(),
+                ieee80211r: false,
+                ieee80211w: String::new(),
             }],
         };
         let pb = wireless_config_to_pb(&state);

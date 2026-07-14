@@ -179,7 +179,10 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         let ap = format!("wireless.pc_{s}_ap{i}");
         c.push(UciCmd::set(&ap, "wifi-iface"));
         c.push(UciCmd::set(format!("{ap}.device"), *radio));
-        c.push(UciCmd::set(format!("{ap}.mode"), "ap"));
+        // wifi-iface mode: `""` => `"ap"` (validation rejects anything but "ap"
+        // today; "mesh" is plumbed but deferred).
+        let mode = if spec.mode.is_empty() { "ap" } else { spec.mode.as_str() };
+        c.push(UciCmd::set(format!("{ap}.mode"), mode));
         c.push(UciCmd::set(format!("{ap}.network"), &iface));
         c.push(UciCmd::set(format!("{ap}.ssid"), &spec.ssid));
         c.push(UciCmd::set(format!("{ap}.encryption"), enc));
@@ -197,6 +200,16 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
             "sae" => c.push(UciCmd::set(format!("{ap}.ieee80211w"), "2")),
             "sae-mixed" => c.push(UciCmd::set(format!("{ap}.ieee80211w"), "1")),
             _ => {}
+        }
+        // Phase 3: an explicit ieee80211w spec value OVERRIDES the encryption
+        // default above (a later `set` on the same key wins in the applied
+        // batch). "" = no override (keep the encryption-derived default).
+        if !spec.ieee80211w.is_empty() {
+            c.push(UciCmd::set(format!("{ap}.ieee80211w"), spec.ieee80211w.as_str()));
+        }
+        // Phase 3: 802.11r Fast Transition.
+        if spec.ieee80211r {
+            c.push(UciCmd::set(format!("{ap}.ieee80211r"), "1"));
         }
         // maxassoc: cap associated stations per AP (0 = unlimited => unset).
         if spec.max_clients > 0 {
@@ -460,6 +473,27 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             }
         }
 
+        // Phase 3: wireless mode. `""` => `"ap"` (the only supported value).
+        // `"mesh"` is plumbed through proto/domain/render but DEFERRED — reject
+        // it (and anything else) here so a mesh push never applies.
+        let mode = if ssid.mode.is_empty() { "ap" } else { ssid.mode.as_str() };
+        if mode != "ap" {
+            return bad(format!("mode '{mode}' for slug '{s}' chưa hỗ trợ (chỉ 'ap')"));
+        }
+        // Belt-and-suspenders: a gated captive SSID must never be a mesh node
+        // (mesh has no client iface to gate). Redundant with the check above
+        // while mesh is rejected outright, but keeps the invariant explicit.
+        if ssid.gated && mode == "mesh" {
+            return bad(format!("gated SSID '{s}' cannot use mode 'mesh'"));
+        }
+        // Phase 3: PMF (ieee80211w) override must be a valid hostapd value.
+        if !matches!(ssid.ieee80211w.as_str(), "" | "1" | "2") {
+            return bad(format!(
+                "ieee80211w '{}' for slug '{s}' invalid (chỉ '' | '1' | '2')",
+                ssid.ieee80211w
+            ));
+        }
+
         // MAC access-control (F7). Policy must be a known value; allow/deny needs a
         // non-empty list of well-formed MACs (each element becomes a maclist entry
         // via add_list). Reject up front so a bad ACL writes nothing.
@@ -698,6 +732,9 @@ mod tests {
             mac_list: Vec::new(),
             rate_down_kbps: 0,
             rate_up_kbps: 0,
+            mode: String::new(),
+            ieee80211r: false,
+            ieee80211w: String::new(),
         }
     }
 
@@ -784,6 +821,60 @@ mod tests {
         assert!(!has_key(&render_ssid(&valid_ssid("public", true), 8080), "wireless.pc_public_ap0.ieee80211w"));
     }
 
+    // Phase 3 (F-mode): mode defaults to "ap" when unset; a set value renders
+    // verbatim (only "ap" survives validate today, but render is spec-driven).
+    #[test]
+    fn render_ssid_mode_defaults_to_ap() {
+        // unset => "ap"
+        let cmds = render_ssid(&valid_ssid("public", true), 8080);
+        assert!(has_set(&cmds, "wireless.pc_public_ap0.mode", "ap"));
+        // explicit "ap" => "ap"
+        let mut ap = valid_ssid("home", false);
+        ap.mode = "ap".into();
+        assert!(has_set(&render_ssid(&ap, 8080), "wireless.pc_home_ap0.mode", "ap"));
+    }
+
+    // Phase 3 (F-11r): ieee80211r=true emits `ieee80211r '1'`; false emits nothing.
+    #[test]
+    fn render_ssid_ieee80211r_fast_transition() {
+        let mut ft = valid_ssid("home", false);
+        ft.ieee80211r = true;
+        assert!(has_set(&render_ssid(&ft, 8080), "wireless.pc_home_ap0.ieee80211r", "1"));
+        // default (false) => no key.
+        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "wireless.pc_home_ap0.ieee80211r"));
+    }
+
+    // Phase 3 (F-11w): an explicit ieee80211w spec value OVERRIDES the
+    // encryption-derived default (the later `set` in the batch wins on-device).
+    #[test]
+    fn render_ssid_ieee80211w_spec_overrides_encryption() {
+        // sae defaults to "2"; force "1" explicitly => last write is "1".
+        let mut sae = valid_ssid("s3", false);
+        sae.encryption = "sae".into();
+        sae.ieee80211w = "1".into();
+        let cmds = render_ssid(&sae, 8080);
+        // both the default and the override are present; the override is emitted last.
+        let last = cmds
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                UciCmd::Set { key, value } if key == "wireless.pc_s3_ap0.ieee80211w" => Some(value.clone()),
+                _ => None,
+            })
+            .expect("ieee80211w must be set");
+        assert_eq!(last, "1", "explicit ieee80211w overrides the sae default");
+
+        // On open encryption (no default), an explicit "2" is emitted.
+        let mut open = valid_ssid("public", true);
+        open.ieee80211w = "2".into();
+        assert!(has_set(&render_ssid(&open, 8080), "wireless.pc_public_ap0.ieee80211w", "2"));
+
+        // Empty override => encryption default preserved (sae => "2"), no extra write.
+        let mut plain_sae = valid_ssid("s3", false);
+        plain_sae.encryption = "sae".into();
+        assert!(has_set(&render_ssid(&plain_sae, 8080), "wireless.pc_s3_ap0.ieee80211w", "2"));
+    }
+
     // Phase 2 (F6): maxassoc set only when max_clients > 0.
     #[test]
     fn render_ssid_maxassoc_when_capped() {
@@ -867,6 +958,50 @@ mod tests {
         ok.mac_policy = "deny".into();
         ok.mac_list = vec!["aa:bb:cc:dd:ee:ff".into()];
         assert!(validate_wireless(&wstate1(ok)).is_ok());
+    }
+
+    // Phase 3: mode. "" and "ap" pass; "mesh" (deferred) and anything else are
+    // rejected.
+    #[test]
+    fn validate_wireless_mode_ap_ok_mesh_rejected() {
+        // unset (defaults to "ap") passes
+        assert!(validate_wireless(&wstate1(valid_ssid("home", false))).is_ok());
+        // explicit "ap" passes
+        let mut ap = valid_ssid("home", false);
+        ap.mode = "ap".into();
+        assert!(validate_wireless(&wstate1(ap)).is_ok());
+        // "mesh" is plumbed but rejected for now
+        let mut mesh = valid_ssid("home", false);
+        mesh.mode = "mesh".into();
+        assert!(validate_wireless(&wstate1(mesh)).is_err());
+        // any other value rejected
+        let mut bogus = valid_ssid("home", false);
+        bogus.mode = "sta".into();
+        assert!(validate_wireless(&wstate1(bogus)).is_err());
+    }
+
+    // Phase 3: a gated captive SSID cannot be mesh (belt-and-suspenders; also
+    // caught by the mode!="ap" reject).
+    #[test]
+    fn validate_wireless_rejects_gated_mesh() {
+        let mut s = valid_ssid("public", true); // gated
+        s.mode = "mesh".into();
+        assert!(validate_wireless(&wstate1(s)).is_err());
+    }
+
+    // Phase 3: ieee80211w override must be "" | "1" | "2".
+    #[test]
+    fn validate_wireless_ieee80211w_values() {
+        for v in ["", "1", "2"] {
+            let mut ok = valid_ssid("home", false);
+            ok.ieee80211w = v.into();
+            assert!(validate_wireless(&wstate1(ok)).is_ok(), "ieee80211w '{v}' should pass");
+        }
+        for v in ["3", "yes", "0x"] {
+            let mut bad = valid_ssid("home", false);
+            bad.ieee80211w = v.into();
+            assert!(validate_wireless(&wstate1(bad)).is_err(), "ieee80211w '{v}' should fail");
+        }
     }
 
     #[test]
