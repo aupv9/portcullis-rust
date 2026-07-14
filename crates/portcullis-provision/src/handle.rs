@@ -516,6 +516,9 @@ mod tests {
             mac_list: Vec::new(),
             rate_down_kbps: 0,
             rate_up_kbps: 0,
+            mode: String::new(),
+            ieee80211r: false,
+            ieee80211w: String::new(),
         }
     }
 

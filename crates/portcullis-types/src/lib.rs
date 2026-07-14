@@ -828,6 +828,14 @@ pub struct SsidSpec {
     pub rate_down_kbps: u32,
     /// Per-SSID upload cap (kbit, from client / egress); `0` = unlimited.
     pub rate_up_kbps: u32,
+    /// Wireless mode of the rendered `wifi-iface`. `""` => `"ap"` (the only
+    /// supported value today); `"mesh"` is plumbed but rejected by validation.
+    pub mode: String,
+    /// 802.11r Fast Transition (`ieee80211r`). `true` => emit `ieee80211r '1'`.
+    pub ieee80211r: bool,
+    /// 802.11w PMF override (`ieee80211w`): `""` off, `"1"` optional, `"2"`
+    /// required. When non-empty it OVERRIDES the encryption-derived default.
+    pub ieee80211w: String,
 }
 
 impl std::fmt::Debug for SsidSpec {
@@ -854,6 +862,9 @@ impl std::fmt::Debug for SsidSpec {
             .field("mac_list", &self.mac_list)
             .field("rate_down_kbps", &self.rate_down_kbps)
             .field("rate_up_kbps", &self.rate_up_kbps)
+            .field("mode", &self.mode)
+            .field("ieee80211r", &self.ieee80211r)
+            .field("ieee80211w", &self.ieee80211w)
             .finish()
     }
 }

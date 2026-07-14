@@ -610,6 +610,17 @@ pub struct WirelessSsid {
     pub rate_down_kbps: u32,
     #[prost(uint32, tag="15")]
     pub rate_up_kbps: u32,
+    /// Phase 3 SSID fields (all optional; empty/false = engine default):
+    ///
+    /// "ap" (default) | "mesh" (future; rejected by validation for now)
+    #[prost(string, tag="16")]
+    pub mode: ::prost::alloc::string::String,
+    /// Fast Transition
+    #[prost(bool, tag="17")]
+    pub ieee80211r: bool,
+    /// PMF: "" off | "1" optional | "2" required
+    #[prost(string, tag="18")]
+    pub ieee80211w: ::prost::alloc::string::String,
 }
 /// Full declarative desired-state of the engine's owned SSIDs. The engine diffs
 /// this against its currently-owned sections and applies the minimal set/delete.
