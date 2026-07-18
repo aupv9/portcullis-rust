@@ -879,6 +879,21 @@ fn redacted(secret: &str) -> &'static str {
     }
 }
 
+/// One permitted inter-SSID forwarding direction (P2 inter-SSID isolation
+/// policy). By default owned SSID zones CANNOT reach each other — fw3 denies
+/// inter-zone forwarding when no explicit `config forwarding` exists, and the
+/// engine renders none, so isolation is the default. Each `PeerAllow` opens
+/// EXACTLY ONE direction (`from_slug` → `to_slug`); add both to make a pair
+/// bidirectional. Both slugs MUST name owned SSIDs in the same desired-state
+/// (enforced by `validate_wireless`).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PeerAllow {
+    /// Source SSID slug — the traffic origin's firewall zone.
+    pub from_slug: String,
+    /// Destination SSID slug — the zone the source may forward into.
+    pub to_slug: String,
+}
+
 /// A full declarative desired-state push: the complete set of owned SSIDs. The
 /// engine diffs this against its currently-owned sections and applies the minimal
 /// set/delete. An empty `ssids` tears down ALL owned sections.
@@ -890,6 +905,10 @@ pub struct WirelessDesiredState {
     /// Local commit-confirm watchdog window; `0` = default (90 s), bounds
     /// `[15, 600]` (enforced during validation).
     pub confirm_timeout_secs: u32,
+    /// Inter-SSID allow-list (P2): permitted `from → to` forwarding directions
+    /// between owned SSID zones. Empty (the default) = every SSID fully isolated
+    /// from the others — identical to the pre-P2 behaviour. Purely additive.
+    pub peer_allows: Vec<PeerAllow>,
 }
 
 /// Per-SSID outcome within a [`WirelessStatus`].
@@ -910,6 +929,36 @@ pub struct WirelessStatus {
     pub state: ProvisionState,
     pub per_ssid: Vec<SsidResult>,
     pub message: String,
+}
+
+/// Observed on-air radio state of one gated SSID's VIF (P5 liveness). Unlike
+/// [`SsidResult`] (which reports the config-push OUTCOME), this reports the
+/// polled RADIO reality: is the SSID actually beaconing and how many stations.
+/// `portcullis-control` maps it to `pb::SsidLiveness`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SsidLiveness {
+    /// Owner-namespace slug (matches [`SsidResult::slug`] / the desired-state).
+    pub slug: String,
+    /// Observed VIF (e.g. `wlan0` / `phy0-ap0`), NOT the bridge iface.
+    pub iface: String,
+    /// hostapd state == ENABLED (the beacon is on the air).
+    pub broadcasting: bool,
+    /// Associated station count (assoclist length).
+    pub stations: u32,
+    /// Representative/strongest station signal in dBm (0 = unknown).
+    pub signal_dbm: i32,
+}
+
+/// A snapshot of on-air liveness across the engine's gated VIFs (P5). Pushed
+/// upward by the liveness poller; `portcullis-control` maps it to
+/// `pb::WirelessLiveness` and fans it into an unsolicited `EngineFrame`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WirelessLiveness {
+    /// The committed config this snapshot reflects (best-effort; may be empty).
+    pub config_version: String,
+    pub per_ssid: Vec<SsidLiveness>,
+    /// Engine wall-clock (unix secs) when the snapshot was taken.
+    pub ts_unix: i64,
 }
 
 /// Provision-subsystem errors (fail-OPEN: an error rolls back / leaves prior

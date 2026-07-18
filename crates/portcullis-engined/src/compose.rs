@@ -153,6 +153,33 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     // rollback works without the CP) and statuses simply buffer in the mpsc.
     let mut wireless_status_rx = Some(wireless_status_rx);
 
+    // 4c. On-air SSID liveness poller (P5) — a second ISOLATED, read-only task.
+    //     It periodically shells out (ubus/iwinfo/hostapd) to observe, per gated
+    //     VIF, whether the SSID is beaconing + its station count, and fans a
+    //     WirelessLiveness snapshot up the control channel. Purely observational:
+    //     it reads committed state from the provisioner and NEVER writes config
+    //     or touches enforcement, so it cannot affect a client's grant. Spawned
+    //     unconditionally (harmless off-device: the shell-outs just fail and the
+    //     snapshots go empty); the rx is moved into the channel task when TLS is
+    //     present, else buffers (superseded each tick anyway).
+    //     DEVICE-ONLY: ubus/iwinfo exist only on the RUTM11 — not runtime-tested here.
+    let (liveness_tx, liveness_rx) =
+        tokio::sync::mpsc::channel(portcullis_provision::LIVENESS_BUFFER);
+    {
+        let runner = Arc::new(portcullis_provision::ProcessRunner);
+        let prov = provisioner.clone();
+        tasks.push(tokio::spawn(async move {
+            portcullis_provision::run_liveness_poller(
+                runner,
+                prov,
+                liveness_tx,
+                portcullis_provision::DEFAULT_POLL_INTERVAL,
+            )
+            .await;
+        }));
+    }
+    let mut liveness_rx = Some(liveness_rx);
+
     // 4e. Runtime control state (F0): the CP-pushed config store + EngineControl
     //     controller. Built UNCONDITIONALLY (independent of CP connectivity) — it
     //     holds local runtime state and drives the effect loops (garden/enforcement
@@ -219,9 +246,11 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
             let wireless_rx = wireless_status_rx
                 .take()
                 .expect("wireless status receiver taken once");
+            // Move the P5 liveness stream in too (unsolicited periodic snapshots).
+            let liveness_rx = liveness_rx.take().expect("liveness receiver taken once");
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
-                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, move |up| {
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, liveness_rx, move |up| {
                     mgr.set_cp_connected(up);
                     if !up {
                         m.incr(Metric::CpDisconnect);

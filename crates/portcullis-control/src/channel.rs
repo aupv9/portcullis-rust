@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures::SinkExt;
 use portcullis_types::{
     Deauthenticator, EngineControl, Enforcer, ProvisionState, Provisioner, RulesetWriter,
-    SessionEvent, WirelessStatus,
+    SessionEvent, WirelessLiveness, WirelessStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
@@ -95,11 +95,18 @@ pub struct ControlChannelConfig {
 /// into outbound `EngineFrame`s. Held across reconnects like the event receiver
 /// — a status emitted while disconnected buffers in the mpsc; the control plane
 /// re-reads wireless state on reconnect regardless.
+///
+/// `liveness` is the P5 on-air liveness poller's upward mpsc: periodic
+/// [`WirelessLiveness`] snapshots are fanned into UNSOLICITED
+/// `EngineFrame::WirelessLiveness`. Purely observational — the channel just
+/// forwards them; a snapshot emitted while disconnected simply buffers (and the
+/// next tick supersedes it anyway).
 pub async fn run<F>(
     cfg: ControlChannelConfig,
     enforcer: Arc<dyn Enforcer>,
     events: broadcast::Sender<SessionEvent>,
     mut wireless_status: mpsc::Receiver<WirelessStatus>,
+    mut liveness: mpsc::Receiver<WirelessLiveness>,
     cp_state: F,
 ) where
     F: Fn(bool) + Send + Sync,
@@ -120,6 +127,7 @@ pub async fn run<F>(
             &enforcer,
             &mut rx,
             &mut wireless_status,
+            &mut liveness,
             &cp_state,
             &mut established,
         )
@@ -155,6 +163,7 @@ async fn connect_once<F>(
     enforcer: &Arc<dyn Enforcer>,
     rx: &mut broadcast::Receiver<SessionEvent>,
     wireless_status: &mut mpsc::Receiver<WirelessStatus>,
+    liveness: &mut mpsc::Receiver<WirelessLiveness>,
     cp_state: &F,
     established: &mut bool,
 ) -> portcullis_types::Result<()>
@@ -229,6 +238,21 @@ where
                 }
                 None => {
                     tracing::debug!("wireless status channel closed; stopping wireless fan-out");
+                    std::future::pending::<()>().await;
+                }
+            },
+            lv = liveness.recv() => match lv {
+                Some(snapshot) => {
+                    // P5: purely observational. Unsolicited (correlation_id 0);
+                    // the CP records the latest per store. Never re-scopes or
+                    // touches enforcement — it only reports on-air reality.
+                    let f = frame(0, engine_frame::Msg::WirelessLiveness(convert::wireless_liveness_to_pb(&snapshot)));
+                    if out_tx.send(f).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    tracing::debug!("liveness channel closed; stopping liveness fan-out");
                     std::future::pending::<()>().await;
                 }
             },
@@ -622,6 +646,7 @@ mod tests {
                 config_version: "cfg-live".into(),
                 ssids: Vec::new(),
                 confirm_timeout_secs: 0,
+                peer_allows: Vec::new(),
             })
         }
     }
@@ -965,6 +990,7 @@ mod tests {
                 config_version: "cfg-1".into(),
                 ssids: Vec::new(),
                 confirm_timeout_secs: 0,
+                peer_allows: Vec::new(),
             })),
         };
         let out = handle_control_frame(
@@ -987,6 +1013,7 @@ mod tests {
                 config_version: "cfg-x".into(),
                 ssids: Vec::new(),
                 confirm_timeout_secs: 0,
+                peer_allows: Vec::new(),
             })),
         };
         let out = handle_control_frame(
