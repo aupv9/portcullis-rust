@@ -246,6 +246,22 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         c.push(UciCmd::set(format!("{d}.leasetime"), &spec.dhcp_leasetime));
         c.push(UciCmd::set(format!("{d}.dhcpv6"), "disabled"));
         c.push(UciCmd::set(format!("{d}.owner"), WIRELESS_OWNER));
+
+        // dhcp.pc_<s>_host<i> = host  (P1 static leases: MAC -> fixed IP). One
+        // owned `config host` per reservation; the `pc_<s>_host<i>` name carries
+        // the owned prefix so snapshot/cleanup's delete-diff removes stale ones
+        // (verified via is_owned_wireless_section). Gated on !dhcp_disabled — a
+        // bridged (no-pool) SSID has no dnsmasq instance to serve a lease.
+        for (i, r) in spec.reservations.iter().enumerate() {
+            let h = format!("dhcp.pc_{s}_host{i}");
+            c.push(UciCmd::set(&h, "host"));
+            c.push(UciCmd::set(format!("{h}.mac"), r.mac.to_lowercase()));
+            c.push(UciCmd::set(format!("{h}.ip"), &r.ipaddr));
+            if !r.hostname.is_empty() {
+                c.push(UciCmd::set(format!("{h}.name"), &r.hostname));
+            }
+            c.push(UciCmd::set(format!("{h}.owner"), WIRELESS_OWNER));
+        }
     }
 
     // firewall.pc_<s>_zone = zone  (SECURE posture; zone name = slug)
@@ -295,6 +311,22 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         c.push(UciCmd::set(format!("{rp}.dest_port"), responder_port.to_string()));
         c.push(UciCmd::set(format!("{rp}.target"), "ACCEPT"));
         c.push(UciCmd::set(format!("{rp}.owner"), WIRELESS_OWNER));
+    }
+
+    // firewall.pc_<s>_allow<i> = rule  (P2: internal targets this SSID may reach
+    // across zones — NVR / POS / mgmt host on br-lan or a management net). One
+    // accept rule per target: src = this SSID's zone (slug), dest = target zone,
+    // dest_ip = target host/CIDR. The `pc_` prefix keeps it owned so the snapshot
+    // reconcile / teardown cleanup handles it. Empty = cloud-only + isolation.
+    for (i, t) in spec.internal_targets.iter().enumerate() {
+        let ra = format!("firewall.pc_{s}_allow{i}");
+        c.push(UciCmd::set(&ra, "rule"));
+        c.push(UciCmd::set(format!("{ra}.name"), format!("Allow-{s}-int{i}")));
+        c.push(UciCmd::set(format!("{ra}.src"), s));
+        c.push(UciCmd::set(format!("{ra}.dest"), &t.zone));
+        c.push(UciCmd::set(format!("{ra}.dest_ip"), &t.cidr));
+        c.push(UciCmd::set(format!("{ra}.target"), "ACCEPT"));
+        c.push(UciCmd::set(format!("{ra}.owner"), WIRELESS_OWNER));
     }
 
     // sqm.pc_<s> = queue  (F9: per-SSID bandwidth cap on this SSID's bridge). Only
@@ -623,6 +655,90 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             {
                 return bad(format!("dhcp_leasetime '{}' for slug '{s}' is invalid", ssid.dhcp_leasetime));
             }
+
+            // P1 static DHCP reservations: each is a MAC -> fixed IP pinned on THIS
+            // SSID's subnet, rendered as `dhcp.pc_<s>_host<i>` (only when the pool
+            // exists, i.e. !dhcp_disabled). Fail-OPEN reject the whole push if any
+            // reservation has a bad MAC, an IP not in the subnet, or duplicates a
+            // MAC/IP within the SSID — a bad reservation set writes nothing. An IP
+            // that lands inside the dynamic pool [start, start+limit) is only WARNED
+            // (dnsmasq honours the static lease over the pool), not rejected.
+            let pool_lo = net.wrapping_add(start); // host-order; net has 0 host bits
+            let pool_hi = net.wrapping_add(start).wrapping_add(limit); // exclusive
+            let mut seen_res_macs: Vec<String> = Vec::new();
+            let mut seen_res_ips: Vec<u32> = Vec::new();
+            for r in &ssid.reservations {
+                let mac = r.mac.to_lowercase();
+                // Render lowercases the MAC, so validate the lowercased form; the
+                // MAC must be well-formed hex (aa:bb:cc:dd:ee:ff).
+                if !is_mac_addr(&mac) {
+                    return bad(format!(
+                        "reservation mac '{}' for slug '{s}' is not a MAC (aa:bb:cc:dd:ee:ff)",
+                        r.mac
+                    ));
+                }
+                let ip = parse_ipv4(&r.ipaddr).ok_or_else(|| {
+                    ProvisionError::Invalid(format!(
+                        "reservation ipaddr '{}' for slug '{s}' not a dotted-quad IPv4",
+                        r.ipaddr
+                    ))
+                })?;
+                // Must be a usable host on this SSID's subnet (not net/bcast/gateway).
+                if !(net < ip && ip < bcast) {
+                    return bad(format!(
+                        "reservation ipaddr '{}' for slug '{s}' is not inside this SSID's subnet",
+                        r.ipaddr
+                    ));
+                }
+                if ip == gw {
+                    return bad(format!(
+                        "reservation ipaddr '{}' for slug '{s}' collides with the gateway address",
+                        r.ipaddr
+                    ));
+                }
+                if seen_res_macs.contains(&mac) {
+                    return bad(format!("duplicate reservation mac '{mac}' for slug '{s}'"));
+                }
+                if seen_res_ips.contains(&ip) {
+                    return bad(format!("duplicate reservation ipaddr '{}' for slug '{s}'", r.ipaddr));
+                }
+                // Overlap with the dynamic pool is legal (dnsmasq prefers the static
+                // lease) but a smell — warn so the operator can move it OUT of range.
+                if pool_lo <= ip && ip < pool_hi {
+                    tracing::warn!(
+                        slug = %s,
+                        ip = %r.ipaddr,
+                        "static DHCP reservation falls inside the dynamic pool range; \
+                         prefer an IP outside [dhcp_start, dhcp_start+dhcp_limit)"
+                    );
+                }
+                seen_res_macs.push(mac);
+                seen_res_ips.push(ip);
+            }
+        }
+
+        // P2 internal targets: cross-zone accept rules (NVR / POS / mgmt host this
+        // SSID may reach). Rendered as `firewall.pc_<s>_allow<i>` (src=slug zone,
+        // dest=zone, dest_ip=cidr). Fail-OPEN reject the whole push if any target
+        // has an empty dest zone, a dest zone equal to this SSID's own slug (its
+        // own zone — a no-op/foot-gun; it reaches itself already), or a dest_ip
+        // that is not a bare IPv4 or IPv4/prefix CIDR.
+        for t in &ssid.internal_targets {
+            if t.zone.is_empty() {
+                return bad(format!("internal_target for slug '{s}' has an empty dest zone"));
+            }
+            if t.zone == s {
+                return bad(format!(
+                    "internal_target zone '{}' for slug '{s}' equals its own zone",
+                    t.zone
+                ));
+            }
+            if !is_ipv4_or_cidr(&t.cidr) {
+                return bad(format!(
+                    "internal_target cidr '{}' for slug '{s}' is not a valid IPv4 or IPv4/prefix",
+                    t.cidr
+                ));
+            }
         }
     }
 
@@ -721,6 +837,26 @@ fn parse_ipv4(s: &str) -> Option<u32> {
     Some(out)
 }
 
+/// Validate a firewall `dest_ip` target: either a bare dotted-quad IPv4 (a single
+/// host) or `IPv4/prefix` with `prefix` in `0..=32` (a CIDR block). Rendered
+/// VERBATIM into `firewall.pc_<slug>_allow<i>.dest_ip`, so — like the dhcp fields —
+/// reject any whitespace/control up front (`parse_ipv4` trims internally and would
+/// otherwise mask a trailing newline into the UCI line-based rollback marker).
+fn is_ipv4_or_cidr(s: &str) -> bool {
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    match s.split_once('/') {
+        None => parse_ipv4(s).is_some(),
+        Some((ip, prefix)) => {
+            let prefix_ok = !prefix.is_empty()
+                && prefix.bytes().all(|b| b.is_ascii_digit())
+                && prefix.parse::<u32>().map(|p| p <= 32).unwrap_or(false);
+            parse_ipv4(ip).is_some() && prefix_ok
+        }
+    }
+}
+
 /// A valid subnet mask is a run of 1-bits followed by a run of 0-bits, and must
 /// not be all-zero (a `/0` "mask" gives a degenerate hotspot subnet). All-ones
 /// (`/32`) is also rejected — it leaves no host range.
@@ -760,6 +896,7 @@ fn is_leasetime(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portcullis_types::{DhcpReservation, InternalTarget};
 
     #[test]
     fn argv_is_explicit_no_shell() {
@@ -792,7 +929,9 @@ mod tests {
             dhcp_limit: "200".into(),
             dhcp_leasetime: "2h".into(),
             dhcp_disabled: false,
+            reservations: Vec::new(),
             egress_zone: String::new(),
+            internal_targets: Vec::new(),
             max_clients: 0,
             mac_policy: String::new(),
             mac_list: Vec::new(),
@@ -869,6 +1008,76 @@ mod tests {
         assert!(has_set(&cmds, "firewall.pc_public_portal.dest_port", "8080"));
         // every section stamped with the owner
         assert!(has_set(&cmds, "firewall.pc_public_zone.owner", WIRELESS_OWNER));
+    }
+
+    #[test]
+    fn render_ssid_emits_host_sections_for_reservations() {
+        let mut spec = valid_ssid("devices", false);
+        spec.reservations = vec![
+            DhcpReservation {
+                mac: "AA:BB:CC:DD:EE:01".into(), // uppercase in -> lowercased out
+                ipaddr: "10.0.0.240".into(),
+                hostname: "vending-1".into(),
+            },
+            DhcpReservation {
+                mac: "aa:bb:cc:dd:ee:02".into(),
+                ipaddr: "10.0.0.241".into(),
+                hostname: String::new(), // no name option
+            },
+        ];
+        let cmds = render_ssid(&spec, 8080);
+        // First reservation -> dhcp.pc_devices_host0 with a lowercased MAC + name.
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0", "host"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0.mac", "aa:bb:cc:dd:ee:01"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0.ip", "10.0.0.240"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0.name", "vending-1"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0.owner", WIRELESS_OWNER));
+        // Second reservation -> host1, no `name` option (empty hostname).
+        assert!(has_set(&cmds, "dhcp.pc_devices_host1", "host"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host1.ip", "10.0.0.241"));
+        assert!(!has_key(&cmds, "dhcp.pc_devices_host1.name"));
+        // The host section name carries the owned pc_ prefix (snapshot/cleanup).
+        assert!(is_owned_wireless_section("dhcp.pc_devices_host0"));
+    }
+
+    #[test]
+    fn render_ssid_emits_allow_rules_for_internal_targets() {
+        let mut spec = valid_ssid("devices", false);
+        spec.internal_targets = vec![
+            InternalTarget { zone: "lan".into(), cidr: "192.168.1.50".into() },
+            InternalTarget { zone: "mgmt".into(), cidr: "10.9.0.0/24".into() },
+        ];
+        let cmds = render_ssid(&spec, 8080);
+        // First target -> firewall.pc_devices_allow0 (src=slug zone, dest=zone, dest_ip=cidr).
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0", "rule"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0.name", "Allow-devices-int0"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0.src", "devices"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0.dest", "lan"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0.dest_ip", "192.168.1.50"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0.target", "ACCEPT"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow0.owner", WIRELESS_OWNER));
+        // Second target -> allow1 with the CIDR dest_ip.
+        assert!(has_set(&cmds, "firewall.pc_devices_allow1", "rule"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow1.dest", "mgmt"));
+        assert!(has_set(&cmds, "firewall.pc_devices_allow1.dest_ip", "10.9.0.0/24"));
+        // The allow section name carries the owned pc_ prefix (snapshot/cleanup).
+        assert!(is_owned_wireless_section("firewall.pc_devices_allow0"));
+    }
+
+    #[test]
+    fn render_ssid_no_allow_rules_without_internal_targets() {
+        let cmds = render_ssid(&valid_ssid("devices", false), 8080);
+        assert!(!has_key(&cmds, "firewall.pc_devices_allow0"));
+    }
+
+    #[test]
+    fn render_ssid_no_host_sections_when_dhcp_disabled() {
+        let mut spec = valid_ssid("devices", false);
+        spec.dhcp_disabled = true;
+        spec.reservations =
+            vec![DhcpReservation { mac: "aa:bb:cc:dd:ee:01".into(), ipaddr: "10.0.0.240".into(), hostname: String::new() }];
+        let cmds = render_ssid(&spec, 8080);
+        assert!(!has_key(&cmds, "dhcp.pc_devices_host0"));
     }
 
     #[test]
@@ -1198,6 +1407,86 @@ mod tests {
         let mut s = ssid_on("home", false, 0);
         s.key = "short".into(); // < 8
         assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_out_of_subnet_reservation() {
+        // valid_ssid is 10.0.0.1/24; a reservation on a different /24 is out of range.
+        let mut s = ssid_on("devices", false, 0);
+        s.reservations = vec![DhcpReservation {
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            ipaddr: "10.1.0.5".into(), // NOT in 10.0.0.0/24
+            hostname: String::new(),
+        }];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_accepts_in_subnet_reservation() {
+        let mut s = ssid_on("devices", false, 0);
+        s.reservations = vec![DhcpReservation {
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            ipaddr: "10.0.0.240".into(), // in 10.0.0.0/24, outside pool [10, 210)
+            hostname: "vending-1".into(),
+        }];
+        assert!(validate_wireless(&wstate(vec![s])).is_ok());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_bad_reservation_mac() {
+        let mut s = ssid_on("devices", false, 0);
+        s.reservations = vec![DhcpReservation {
+            mac: "not-a-mac".into(),
+            ipaddr: "10.0.0.240".into(),
+            hostname: String::new(),
+        }];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_duplicate_reservation_ip() {
+        let mut s = ssid_on("devices", false, 0);
+        s.reservations = vec![
+            DhcpReservation { mac: "aa:bb:cc:dd:ee:01".into(), ipaddr: "10.0.0.240".into(), hostname: String::new() },
+            DhcpReservation { mac: "aa:bb:cc:dd:ee:02".into(), ipaddr: "10.0.0.240".into(), hostname: String::new() },
+        ];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_accepts_valid_internal_targets() {
+        let mut s = ssid_on("devices", false, 0);
+        s.internal_targets = vec![
+            InternalTarget { zone: "lan".into(), cidr: "192.168.1.50".into() },
+            InternalTarget { zone: "mgmt".into(), cidr: "10.9.0.0/24".into() },
+        ];
+        assert!(validate_wireless(&wstate(vec![s])).is_ok());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_internal_target_empty_zone() {
+        let mut s = ssid_on("devices", false, 0);
+        s.internal_targets = vec![InternalTarget { zone: String::new(), cidr: "192.168.1.50".into() }];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_internal_target_own_zone() {
+        let mut s = ssid_on("devices", false, 0);
+        // dest zone == the SSID's own slug (its own zone) — a foot-gun no-op.
+        s.internal_targets = vec![InternalTarget { zone: "devices".into(), cidr: "192.168.1.50".into() }];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_internal_target_bad_cidr() {
+        let mut s = ssid_on("devices", false, 0);
+        s.internal_targets = vec![InternalTarget { zone: "lan".into(), cidr: "not-an-ip".into() }];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+        // A prefix out of range (/40) is also rejected.
+        let mut s2 = ssid_on("devices", false, 0);
+        s2.internal_targets = vec![InternalTarget { zone: "lan".into(), cidr: "10.0.0.0/40".into() }];
+        assert!(validate_wireless(&wstate(vec![s2])).is_err());
     }
 
     #[test]

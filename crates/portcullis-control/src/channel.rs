@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures::SinkExt;
 use portcullis_types::{
     Deauthenticator, EngineControl, Enforcer, ProvisionState, Provisioner, RulesetWriter,
-    SessionEvent, WirelessLiveness, WirelessStatus,
+    SessionEvent, WirelessDeviceReport, WirelessLiveness, WirelessStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
@@ -101,12 +101,19 @@ pub struct ControlChannelConfig {
 /// `EngineFrame::WirelessLiveness`. Purely observational — the channel just
 /// forwards them; a snapshot emitted while disconnected simply buffers (and the
 /// next tick supersedes it anyway).
+///
+/// `device_reports` is the P3 per-device telemetry poller's upward mpsc: periodic
+/// [`WirelessDeviceReport`]s are fanned into UNSOLICITED
+/// `EngineFrame::WirelessDevices`. Same purely-observational contract as
+/// `liveness` — forwarded verbatim, superseded each tick, never touches
+/// enforcement.
 pub async fn run<F>(
     cfg: ControlChannelConfig,
     enforcer: Arc<dyn Enforcer>,
     events: broadcast::Sender<SessionEvent>,
     mut wireless_status: mpsc::Receiver<WirelessStatus>,
     mut liveness: mpsc::Receiver<WirelessLiveness>,
+    mut device_reports: mpsc::Receiver<WirelessDeviceReport>,
     cp_state: F,
 ) where
     F: Fn(bool) + Send + Sync,
@@ -128,6 +135,7 @@ pub async fn run<F>(
             &mut rx,
             &mut wireless_status,
             &mut liveness,
+            &mut device_reports,
             &cp_state,
             &mut established,
         )
@@ -158,12 +166,17 @@ pub async fn run<F>(
 
 /// One connection lifetime: dial, send `Hello`, then multiplex inbound commands
 /// and outbound events until either side ends.
+// Many upward streams (events + wireless status + P5 liveness + P3 device
+// telemetry) are multiplexed here; grouping them into a struct would add
+// indirection without clarity, so we keep the flat argument list.
+#[allow(clippy::too_many_arguments)]
 async fn connect_once<F>(
     cfg: &ControlChannelConfig,
     enforcer: &Arc<dyn Enforcer>,
     rx: &mut broadcast::Receiver<SessionEvent>,
     wireless_status: &mut mpsc::Receiver<WirelessStatus>,
     liveness: &mut mpsc::Receiver<WirelessLiveness>,
+    device_reports: &mut mpsc::Receiver<WirelessDeviceReport>,
     cp_state: &F,
     established: &mut bool,
 ) -> portcullis_types::Result<()>
@@ -253,6 +266,22 @@ where
                 }
                 None => {
                     tracing::debug!("liveness channel closed; stopping liveness fan-out");
+                    std::future::pending::<()>().await;
+                }
+            },
+            dr = device_reports.recv() => match dr {
+                Some(report) => {
+                    // P3 per-device telemetry: purely observational. Unsolicited
+                    // (correlation_id 0); the CP records the latest batch per store
+                    // and matches each MAC to its store_devices registry. Never
+                    // re-scopes or touches enforcement.
+                    let f = frame(0, engine_frame::Msg::WirelessDevices(convert::wireless_device_report_to_pb(&report)));
+                    if out_tx.send(f).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    tracing::debug!("device-report channel closed; stopping device fan-out");
                     std::future::pending::<()>().await;
                 }
             },

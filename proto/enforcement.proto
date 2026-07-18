@@ -70,7 +70,30 @@ message EngineFrame {
     WirelessStatus  wireless_status  = 11; // CP-managed wireless (P-W1) lifecycle; unsolicited on watchdog rollback
     WirelessConfig  wireless_config  = 12; // reply to ControlFrame.get_wireless_config (keys REDACTED)
     WirelessLiveness wireless_liveness = 13; // on-air SSID liveness (P5); unsolicited, periodic poll of gated VIFs
+    WirelessDeviceReport wireless_devices = 14; // per-device telemetry (P3 device monitoring); unsolicited, ~30s poll of device VIFs
   }
+}
+
+// One observed device (station) on an owned SSID (P3 device monitoring). The
+// engine polls hostapd assoclist + per-device-IP nft counters (~30s) for device
+// SSIDs and pushes a batch up unsolicited. Keyed by MAC; the CP matches MAC ->
+// store_devices registry to name it (vending / smartPOS / camera / NVR).
+message DeviceObservation {
+  string slug        = 1; // owning SSID slug
+  string mac         = 2; // station MAC (lowercase aa:bb:..)
+  string ipaddr      = 3; // leased/reserved IP on the subnet, "" if unknown
+  bool   online      = 4; // currently associated
+  int32  signal_dbm  = 5; // last signal in dBm, 0 = unknown
+  uint64 rx_bytes    = 6; // cumulative bytes FROM the device (upload), by device IP
+  uint64 tx_bytes    = 7; // cumulative bytes TO the device (download)
+  uint32 uptime_secs = 8; // association age in seconds
+}
+
+// A batch of per-device observations for one router at one sample instant,
+// pushed unsolicited as EngineFrame.wireless_devices.
+message WirelessDeviceReport {
+  repeated DeviceObservation devices = 1;
+  int64 ts_unix = 2; // engine wall-clock (unix seconds) at sample
 }
 
 // control plane -> engine. `correlation_id` is echoed back in the answering
@@ -353,6 +376,16 @@ message ProvisionStatus {
 // ifaces are fed into portcullis enforcement (captive gate); the rest are trusted.
 // ---------------------------------------------------------------------------
 
+// One static DHCP lease (reservation) on this SSID's subnet: a fixed IP pinned to
+// a device MAC. Rendered as a dnsmasq `config host` (dhcp.pc_<slug>_host<i>). The
+// IP SHOULD sit OUTSIDE [dhcp_start, dhcp_start+dhcp_limit) to avoid pool
+// collisions. Drives store-device static IPs (vending / smartPOS / camera / NVR).
+message DhcpReservation {
+  string mac      = 1; // device MAC, lowercase aa:bb:cc:dd:ee:ff
+  string ipaddr   = 2; // full static IP on this subnet, e.g. "10.40.0.11"
+  string hostname = 3; // optional dnsmasq name/label, e.g. "vending-1"
+}
+
 // Network binding for one SSID. Day-1 mode: own-bridge + static subnet + DHCP.
 message WirelessNetwork {
   string bridge_name    = 1; // owned L2 iface, e.g. "br-public" (must NOT be br-lan)
@@ -362,11 +395,25 @@ message WirelessNetwork {
   string dhcp_limit     = 5; // pool size, e.g. "200"
   string dhcp_leasetime = 6; // e.g. "2h"
   bool   dhcp_disabled  = 7; // true = bridged, no DHCP pool (rare)
+  // Static leases (MAC -> fixed IP) on this subnet. Device SSIDs pin vending/POS/
+  // camera/NVR to known IPs; rendered as `dhcp.pc_<slug>_host<i>` config host.
+  repeated DhcpReservation reservations = 8;
+}
+
+// One internal destination a device SSID may reach across zones (P2): e.g. a
+// local NVR / POS server sitting on br-lan or a management net. Rendered as an
+// accept rule (firewall.pc_<slug>_allow<i>: src=zone, dest=zone, dest_ip=cidr).
+message WirelessInternalTarget {
+  string zone = 1; // dest firewall zone the target sits in, e.g. "lan"
+  string cidr = 2; // dest host/CIDR, e.g. "192.168.1.50" or "192.168.1.0/24"
 }
 
 // Firewall posture for one SSID's zone.
 message WirelessFirewall {
   string egress_zone = 1; // zone this SSID forwards out through, e.g. "wan" (cable/4g). Must NOT be "lan".
+  // P2: internal hosts this SSID may reach (NVR / POS server on br-lan / mgmt).
+  // Empty = cloud-only (egress_zone) + full isolation from every other zone.
+  repeated WirelessInternalTarget internal_targets = 2;
 }
 
 // One SSID the engine should own. Only owned (pc_<slug>_*) sections are written.

@@ -773,6 +773,34 @@ pub enum ProvisionState {
 // flattened here (the pb nests them) to keep the renderer/validator simple.
 // ---------------------------------------------------------------------------
 
+/// One static DHCP lease (reservation) on an SSID's subnet: a fixed IP pinned to a
+/// device MAC. Rendered as a dnsmasq `config host` (`dhcp.pc_<slug>_host<i>`). The
+/// IP SHOULD sit OUTSIDE the dynamic pool `[dhcp_start, dhcp_start+dhcp_limit)` to
+/// avoid collisions. Drives store-device static IPs (vending / smartPOS / camera /
+/// NVR). Carries no secret.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub struct DhcpReservation {
+    /// Device MAC, lowercase `aa:bb:cc:dd:ee:ff`.
+    pub mac: String,
+    /// Full static IP on this SSID's subnet, e.g. `10.40.0.11`.
+    pub ipaddr: String,
+    /// Optional dnsmasq name/label, e.g. `vending-1` (empty = no `name`).
+    pub hostname: String,
+}
+
+/// One internal destination a device SSID may reach across zones (P2): e.g. a
+/// local NVR / POS server on `br-lan` or a management net. Rendered as a firewall
+/// accept rule (`firewall.pc_<slug>_allow<i>`: `src`=slug zone, `dest`=[`zone`],
+/// `dest_ip`=[`cidr`], `target`=ACCEPT). Carries no secret.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub struct InternalTarget {
+    /// Destination firewall zone the target sits in, e.g. `lan`. Must be non-empty
+    /// and MUST NOT equal the SSID's own slug.
+    pub zone: String,
+    /// Destination host or CIDR, e.g. `192.168.1.50` or `192.168.1.0/24`.
+    pub cidr: String,
+}
+
 /// One SSID the engine should own. Renders to owner-namespaced `pc_<slug>_*` UCI
 /// sections only; never touches lan / br-lan / admin / wan / the `inet wifihub`
 /// table (enforced by the renderer's reserved denylist).
@@ -813,9 +841,16 @@ pub struct SsidSpec {
     pub dhcp_leasetime: String,
     /// `true` = bridged, no DHCP pool rendered.
     pub dhcp_disabled: bool,
+    /// Static DHCP leases (MAC → fixed IP) on this subnet — one dnsmasq `config
+    /// host` per entry. Only rendered when `!dhcp_disabled`. Empty = none.
+    pub reservations: Vec<DhcpReservation>,
     /// Firewall zone this SSID forwards out through, e.g. `wan` (must NOT be
     /// `lan`). Empty => the engine default (`wan`).
     pub egress_zone: String,
+    /// Internal hosts this SSID may reach across zones (NVR / POS / mgmt) — one
+    /// firewall accept rule (`firewall.pc_<slug>_allow<i>`) per entry. Empty =
+    /// cloud-only (`egress_zone`) + full isolation from every other zone.
+    pub internal_targets: Vec<InternalTarget>,
     /// Max associated stations (`maxassoc`); `0` = unlimited.
     pub max_clients: u32,
     /// MAC access policy: `""`/`"disable"` = off, `"allow"` = allow-list,
@@ -856,7 +891,9 @@ impl std::fmt::Debug for SsidSpec {
             .field("dhcp_limit", &self.dhcp_limit)
             .field("dhcp_leasetime", &self.dhcp_leasetime)
             .field("dhcp_disabled", &self.dhcp_disabled)
+            .field("reservations", &self.reservations)
             .field("egress_zone", &self.egress_zone)
+            .field("internal_targets", &self.internal_targets)
             .field("max_clients", &self.max_clients)
             .field("mac_policy", &self.mac_policy)
             .field("mac_list", &self.mac_list)
@@ -958,6 +995,49 @@ pub struct WirelessLiveness {
     pub config_version: String,
     pub per_ssid: Vec<SsidLiveness>,
     /// Engine wall-clock (unix secs) when the snapshot was taken.
+    pub ts_unix: i64,
+}
+
+/// One observed device on an owned **device** SSID (P3 per-device telemetry).
+///
+/// A device SSID is an owned `pc_<slug>` SSID carrying DHCP **reservations**
+/// (static IP ↔ MAC pins) for fixed appliances — vending machines, smart-POS,
+/// cameras, NVRs. Those SSIDs are typically UNGATED (the device is trusted), so
+/// the [`WirelessLiveness`] poller — which only covers *gated* VIFs — never sees
+/// them. This report is the device-SSID counterpart: one row per registered
+/// reservation, combining the reservation's static IP (from the desired-state)
+/// with a live association probe (assoclist: online/signal/uptime) and per-IP nft
+/// named-counter byte totals. Purely OBSERVATIONAL — never affects enforcement.
+///
+/// `portcullis-control` maps it to `pb::DeviceObservation`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DeviceObservation {
+    /// Owning SSID slug (matches the desired-state).
+    pub slug: String,
+    /// Device MAC, lowercase `aa:bb:cc:dd:ee:ff` (the reservation's MAC).
+    pub mac: String,
+    /// The reservation's static IP on the SSID subnet, `""` if unknown.
+    pub ipaddr: String,
+    /// The device's MAC is currently associated on the VIF (assoclist).
+    pub online: bool,
+    /// Last observed signal in dBm (`0` = unknown / offline).
+    pub signal_dbm: i32,
+    /// Cumulative bytes FROM the device (upload), read from the per-IP `ip saddr`
+    /// nft named counter (`0` if the counter is missing / unread).
+    pub rx_bytes: u64,
+    /// Cumulative bytes TO the device (download), from the `ip daddr` counter.
+    pub tx_bytes: u64,
+    /// Association age in seconds (assoclist `connected_time`; `0` if unknown).
+    pub uptime_secs: u32,
+}
+
+/// A batch of per-device observations for one router at one sample instant (P3).
+/// Pushed upward by the device-observation poller; `portcullis-control` maps it
+/// to `pb::WirelessDeviceReport` and fans it into an unsolicited `EngineFrame`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WirelessDeviceReport {
+    pub devices: Vec<DeviceObservation>,
+    /// Engine wall-clock (unix secs) when the sample was taken.
     pub ts_unix: i64,
 }
 

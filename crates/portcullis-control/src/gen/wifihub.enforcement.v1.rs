@@ -11,7 +11,7 @@
 pub struct EngineFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
-    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
+    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
     pub msg: ::core::option::Option<engine_frame::Msg>,
 }
 /// Nested message and enum types in `EngineFrame`.
@@ -55,7 +55,53 @@ pub mod engine_frame {
         /// on-air SSID liveness (P5); unsolicited, periodic poll of gated VIFs
         #[prost(message, tag="13")]
         WirelessLiveness(super::WirelessLiveness),
+        /// per-device telemetry (P3 device monitoring); unsolicited, ~30s poll of device VIFs
+        #[prost(message, tag="14")]
+        WirelessDevices(super::WirelessDeviceReport),
     }
+}
+/// One observed device (station) on an owned SSID (P3 device monitoring). The
+/// engine polls hostapd assoclist + per-device-IP nft counters (~30s) for device
+/// SSIDs and pushes a batch up unsolicited. Keyed by MAC; the CP matches MAC ->
+/// store_devices registry to name it (vending / smartPOS / camera / NVR).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeviceObservation {
+    /// owning SSID slug
+    #[prost(string, tag="1")]
+    pub slug: ::prost::alloc::string::String,
+    /// station MAC (lowercase aa:bb:..)
+    #[prost(string, tag="2")]
+    pub mac: ::prost::alloc::string::String,
+    /// leased/reserved IP on the subnet, "" if unknown
+    #[prost(string, tag="3")]
+    pub ipaddr: ::prost::alloc::string::String,
+    /// currently associated
+    #[prost(bool, tag="4")]
+    pub online: bool,
+    /// last signal in dBm, 0 = unknown
+    #[prost(int32, tag="5")]
+    pub signal_dbm: i32,
+    /// cumulative bytes FROM the device (upload), by device IP
+    #[prost(uint64, tag="6")]
+    pub rx_bytes: u64,
+    /// cumulative bytes TO the device (download)
+    #[prost(uint64, tag="7")]
+    pub tx_bytes: u64,
+    /// association age in seconds
+    #[prost(uint32, tag="8")]
+    pub uptime_secs: u32,
+}
+/// A batch of per-device observations for one router at one sample instant,
+/// pushed unsolicited as EngineFrame.wireless_devices.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessDeviceReport {
+    #[prost(message, repeated, tag="1")]
+    pub devices: ::prost::alloc::vec::Vec<DeviceObservation>,
+    /// engine wall-clock (unix seconds) at sample
+    #[prost(int64, tag="2")]
+    pub ts_unix: i64,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.
@@ -530,6 +576,23 @@ pub struct ProvisionStatus {
 // ifaces are fed into portcullis enforcement (captive gate); the rest are trusted.
 // ---------------------------------------------------------------------------
 
+/// One static DHCP lease (reservation) on this SSID's subnet: a fixed IP pinned to
+/// a device MAC. Rendered as a dnsmasq `config host` (dhcp.pc_<slug>_host<i>). The
+/// IP SHOULD sit OUTSIDE [dhcp_start, dhcp_start+dhcp_limit) to avoid pool
+/// collisions. Drives store-device static IPs (vending / smartPOS / camera / NVR).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DhcpReservation {
+    /// device MAC, lowercase aa:bb:cc:dd:ee:ff
+    #[prost(string, tag="1")]
+    pub mac: ::prost::alloc::string::String,
+    /// full static IP on this subnet, e.g. "10.40.0.11"
+    #[prost(string, tag="2")]
+    pub ipaddr: ::prost::alloc::string::String,
+    /// optional dnsmasq name/label, e.g. "vending-1"
+    #[prost(string, tag="3")]
+    pub hostname: ::prost::alloc::string::String,
+}
 /// Network binding for one SSID. Day-1 mode: own-bridge + static subnet + DHCP.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -555,6 +618,23 @@ pub struct WirelessNetwork {
     /// true = bridged, no DHCP pool (rare)
     #[prost(bool, tag="7")]
     pub dhcp_disabled: bool,
+    /// Static leases (MAC -> fixed IP) on this subnet. Device SSIDs pin vending/POS/
+    /// camera/NVR to known IPs; rendered as `dhcp.pc_<slug>_host<i>` config host.
+    #[prost(message, repeated, tag="8")]
+    pub reservations: ::prost::alloc::vec::Vec<DhcpReservation>,
+}
+/// One internal destination a device SSID may reach across zones (P2): e.g. a
+/// local NVR / POS server sitting on br-lan or a management net. Rendered as an
+/// accept rule (firewall.pc_<slug>_allow<i>: src=zone, dest=zone, dest_ip=cidr).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessInternalTarget {
+    /// dest firewall zone the target sits in, e.g. "lan"
+    #[prost(string, tag="1")]
+    pub zone: ::prost::alloc::string::String,
+    /// dest host/CIDR, e.g. "192.168.1.50" or "192.168.1.0/24"
+    #[prost(string, tag="2")]
+    pub cidr: ::prost::alloc::string::String,
 }
 /// Firewall posture for one SSID's zone.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -563,6 +643,10 @@ pub struct WirelessFirewall {
     /// zone this SSID forwards out through, e.g. "wan" (cable/4g). Must NOT be "lan".
     #[prost(string, tag="1")]
     pub egress_zone: ::prost::alloc::string::String,
+    /// P2: internal hosts this SSID may reach (NVR / POS server on br-lan / mgmt).
+    /// Empty = cloud-only (egress_zone) + full isolation from every other zone.
+    #[prost(message, repeated, tag="2")]
+    pub internal_targets: ::prost::alloc::vec::Vec<WirelessInternalTarget>,
 }
 /// One SSID the engine should own. Only owned (pc_<slug>_*) sections are written.
 #[allow(clippy::derive_partial_eq_without_eq)]

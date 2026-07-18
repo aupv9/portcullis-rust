@@ -10,9 +10,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use portcullis_types::{
-    EngineInfoSnapshot, EngineParameters, Error, GrantParams, HealthStatus, MacAddr,
-    MetricsSnapshot, PeerAllow, ProvisionState, Result, RevokeReason, SessionEvent, SessionId,
-    SessionInfo, SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessLiveness, WirelessStatus,
+    DeviceObservation, EngineInfoSnapshot, EngineParameters, Error, GrantParams, HealthStatus,
+    MacAddr, MetricsSnapshot, PeerAllow, ProvisionState, Result, RevokeReason, SessionEvent,
+    SessionId, SessionInfo, SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessDeviceReport,
+    WirelessLiveness, WirelessStatus,
 };
 
 use crate::pb;
@@ -299,7 +300,21 @@ pub fn wireless_ssid_from_pb(s: pb::WirelessSsid) -> SsidSpec {
         dhcp_limit: net.dhcp_limit,
         dhcp_leasetime: net.dhcp_leasetime,
         dhcp_disabled: net.dhcp_disabled,
+        reservations: net
+            .reservations
+            .into_iter()
+            .map(|r| portcullis_types::DhcpReservation {
+                mac: r.mac,
+                ipaddr: r.ipaddr,
+                hostname: r.hostname,
+            })
+            .collect(),
         egress_zone: fw.egress_zone,
+        internal_targets: fw
+            .internal_targets
+            .into_iter()
+            .map(|t| portcullis_types::InternalTarget { zone: t.zone, cidr: t.cidr })
+            .collect(),
         max_clients: s.max_clients,
         mac_policy: s.mac_policy,
         mac_list: s.mac_list,
@@ -366,6 +381,29 @@ pub fn wireless_liveness_to_pb(lv: &WirelessLiveness) -> pb::WirelessLiveness {
     }
 }
 
+/// Map a domain [`WirelessDeviceReport`] to the wire `EngineFrame.wireless_devices`
+/// (P3 per-device telemetry). Purely observational — no secrets (MAC/IP/signal/
+/// byte-totals only; carries no PSK).
+pub fn wireless_device_report_to_pb(r: &WirelessDeviceReport) -> pb::WirelessDeviceReport {
+    pb::WirelessDeviceReport {
+        devices: r.devices.iter().map(device_observation_to_pb).collect(),
+        ts_unix: r.ts_unix,
+    }
+}
+
+fn device_observation_to_pb(d: &DeviceObservation) -> pb::DeviceObservation {
+    pb::DeviceObservation {
+        slug: d.slug.clone(),
+        mac: d.mac.clone(),
+        ipaddr: d.ipaddr.clone(),
+        online: d.online,
+        signal_dbm: d.signal_dbm,
+        rx_bytes: d.rx_bytes,
+        tx_bytes: d.tx_bytes,
+        uptime_secs: d.uptime_secs,
+    }
+}
+
 /// Map the committed domain [`WirelessDesiredState`] to the `get_wireless_config`
 /// reply. PSK keys are **REDACTED** (emptied): the engine never echoes a secret
 /// back over the wire, even to the control plane that set it.
@@ -394,8 +432,26 @@ fn ssid_spec_to_pb_redacted(s: &SsidSpec) -> pb::WirelessSsid {
             dhcp_limit: s.dhcp_limit.clone(),
             dhcp_leasetime: s.dhcp_leasetime.clone(),
             dhcp_disabled: s.dhcp_disabled,
+            // Reservations carry no secret — echoed back verbatim (NOT redacted).
+            reservations: s
+                .reservations
+                .iter()
+                .map(|r| pb::DhcpReservation {
+                    mac: r.mac.clone(),
+                    ipaddr: r.ipaddr.clone(),
+                    hostname: r.hostname.clone(),
+                })
+                .collect(),
         }),
-        firewall: Some(pb::WirelessFirewall { egress_zone: s.egress_zone.clone() }),
+        firewall: Some(pb::WirelessFirewall {
+            egress_zone: s.egress_zone.clone(),
+            // Internal targets carry no secret — echoed back verbatim (NOT redacted).
+            internal_targets: s
+                .internal_targets
+                .iter()
+                .map(|t| pb::WirelessInternalTarget { zone: t.zone.clone(), cidr: t.cidr.clone() })
+                .collect(),
+        }),
         max_clients: s.max_clients,
         mac_policy: s.mac_policy.clone(),
         mac_list: s.mac_list.clone(),
@@ -634,8 +690,12 @@ mod tests {
                 dhcp_limit: "200".into(),
                 dhcp_leasetime: "2h".into(),
                 dhcp_disabled: false,
+                reservations: Vec::new(),
             }),
-            firewall: Some(pb::WirelessFirewall { egress_zone: "wan".into() }),
+            firewall: Some(pb::WirelessFirewall {
+                egress_zone: "wan".into(),
+                internal_targets: Vec::new(),
+            }),
             max_clients: 0,
             mac_policy: String::new(),
             mac_list: Vec::new(),
@@ -708,7 +768,12 @@ mod tests {
                 dhcp_limit: "200".into(),
                 dhcp_leasetime: "2h".into(),
                 dhcp_disabled: false,
+                reservations: Vec::new(),
                 egress_zone: String::new(),
+                internal_targets: vec![portcullis_types::InternalTarget {
+                    zone: "lan".into(),
+                    cidr: "192.168.1.50".into(),
+                }],
                 max_clients: 0,
                 mac_policy: String::new(),
                 mac_list: Vec::new(),
@@ -726,6 +791,11 @@ mod tests {
         // Non-secret fields are preserved.
         assert_eq!(pb.ssids[0].encryption, "psk2");
         assert_eq!(pb.ssids[0].network.as_ref().unwrap().bridge_name, "br-home");
+        // Internal targets carry no secret — echoed back verbatim.
+        let fw = pb.ssids[0].firewall.as_ref().unwrap();
+        assert_eq!(fw.internal_targets.len(), 1);
+        assert_eq!(fw.internal_targets[0].zone, "lan");
+        assert_eq!(fw.internal_targets[0].cidr, "192.168.1.50");
     }
 
     #[test]
@@ -784,6 +854,48 @@ mod tests {
         assert_eq!(p.expiry_tick_secs, d.expiry_tick_secs);
         assert_eq!(p.max_sessions, d.max_sessions);
         assert_eq!(p.idle_timeout_secs, 0, "idle 0 = disabled, must not become a default");
+    }
+
+    #[test]
+    fn wireless_device_report_maps_all_fields() {
+        let report = WirelessDeviceReport {
+            ts_unix: 1_700_000_500,
+            devices: vec![
+                DeviceObservation {
+                    slug: "devices".into(),
+                    mac: "aa:bb:cc:dd:ee:01".into(),
+                    ipaddr: "10.40.0.11".into(),
+                    online: true,
+                    signal_dbm: -48,
+                    rx_bytes: 1500,
+                    tx_bytes: 9000,
+                    uptime_secs: 1200,
+                },
+                DeviceObservation {
+                    slug: "devices".into(),
+                    mac: "aa:bb:cc:dd:ee:02".into(),
+                    ipaddr: "10.40.0.12".into(),
+                    online: false,
+                    signal_dbm: 0,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    uptime_secs: 0,
+                },
+            ],
+        };
+        let pb = wireless_device_report_to_pb(&report);
+        assert_eq!(pb.ts_unix, 1_700_000_500);
+        assert_eq!(pb.devices.len(), 2);
+        let online = &pb.devices[0];
+        assert_eq!(online.slug, "devices");
+        assert_eq!(online.mac, "aa:bb:cc:dd:ee:01");
+        assert_eq!(online.ipaddr, "10.40.0.11");
+        assert!(online.online);
+        assert_eq!(online.signal_dbm, -48);
+        assert_eq!(online.rx_bytes, 1500);
+        assert_eq!(online.tx_bytes, 9000);
+        assert_eq!(online.uptime_secs, 1200);
+        assert!(!pb.devices[1].online);
     }
 
     #[test]

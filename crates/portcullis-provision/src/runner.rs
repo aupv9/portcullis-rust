@@ -18,10 +18,22 @@ use portcullis_types::ProvisionError;
 /// the whole side-effecting surface is a single mockable seam.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
-    /// Run `program` with `args`; feed `stdin` if `Some` (used by nothing today
-    /// but kept for symmetry with the nft backend's stdin batch). Non-zero exit
-    /// → `Err`.
+    /// Run `program` with `args` and no stdin. Non-zero exit → `Err`.
     async fn run(&self, program: &str, args: &[&str]) -> Result<Vec<u8>, ProvisionError>;
+
+    /// Run `program` with `args`, feeding `stdin` on the child's standard input
+    /// (the P3 device-metering path pipes an `nft -j -f -` document this way).
+    /// Non-zero exit → `Err`. The default forwards to [`run`](Self::run) and
+    /// IGNORES `stdin` (so existing runners and mocks keep working unchanged); the
+    /// production [`ProcessRunner`] overrides it to actually pipe the bytes.
+    async fn run_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        _stdin: &[u8],
+    ) -> Result<Vec<u8>, ProvisionError> {
+        self.run(program, args).await
+    }
 }
 
 /// Production runner: `tokio::process::Command` with explicit argv, output
@@ -47,6 +59,51 @@ impl CommandRunner for ProcessRunner {
             .output()
             .await
             .map_err(|e| ProvisionError::Apply(format!("spawn {program}: {e}")))?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(ProvisionError::Apply(format!(
+                "{program} {} exited {:?}: {}",
+                args.join(" "),
+                out.status.code(),
+                stderr.trim()
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    async fn run_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<Vec<u8>, ProvisionError> {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+        use tokio::process::Command;
+
+        // Explicit argv only — NO `sh -c`. The payload is written to the child's
+        // stdin (e.g. `nft -j -f -`), never interpolated into the command line.
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ProvisionError::Apply(format!("spawn {program}: {e}")))?;
+
+        if let Some(mut sink) = child.stdin.take() {
+            sink.write_all(stdin)
+                .await
+                .map_err(|e| ProvisionError::Apply(format!("write stdin to {program}: {e}")))?;
+            // Drop closes the pipe so the child sees EOF.
+            drop(sink);
+        }
+
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| ProvisionError::Apply(format!("wait {program}: {e}")))?;
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);

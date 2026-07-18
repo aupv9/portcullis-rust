@@ -9,6 +9,12 @@ description = "Isolated hotspot-network provisioning subsystem (P0.5): renders a
 
 [dependencies]
 portcullis-types.workspace = true
+# P3 device telemetry: the pure nft named-counter renderers/parsers
+# (`device_meter`) that build the per-device-IP `nft -j` metering docs and parse
+# `nft -j list counters`. These are pure JSON helpers — no netfilter linkage of
+# their own — reused so the counter naming/parsing contract lives in ONE place
+# (the crate that owns the `inet wifihub` table).
+portcullis-nft.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true

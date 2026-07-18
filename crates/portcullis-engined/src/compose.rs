@@ -180,6 +180,35 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     }
     let mut liveness_rx = Some(liveness_rx);
 
+    // 4d. Per-device telemetry poller (P3) — a third ISOLATED, read-only task.
+    //     Device SSIDs (owned SSIDs carrying DHCP reservations for fixed
+    //     appliances: vending / smart-POS / camera / NVR) are typically UNGATED,
+    //     so the P5 liveness poller (gated VIFs only) never covers them. This
+    //     poller fills that gap: every ~30 s it reads the committed reservations,
+    //     reconciles per-device-IP nft named counters in the owned `inet wifihub`
+    //     table (pure meters — no verdict, can't gate), reads each device SSID's
+    //     assoclist + the counters, and fans a WirelessDeviceReport up the control
+    //     channel. Purely observational — reads committed state + meters, never
+    //     writes wireless config or touches enforcement. Metering keys on the
+    //     reservation's STATIC IP via nft counters (NOT conntrack — absent on the
+    //     RUT906 target). DEVICE-ONLY: ubus/nft exist only on the router.
+    let (device_reports_tx, device_reports_rx) =
+        tokio::sync::mpsc::channel(portcullis_provision::DEVICE_REPORT_BUFFER);
+    {
+        let runner = Arc::new(portcullis_provision::ProcessRunner);
+        let prov = provisioner.clone();
+        tasks.push(tokio::spawn(async move {
+            portcullis_provision::run_device_obs_poller(
+                runner,
+                prov,
+                device_reports_tx,
+                portcullis_provision::DEFAULT_DEVICE_POLL_INTERVAL,
+            )
+            .await;
+        }));
+    }
+    let mut device_reports_rx = Some(device_reports_rx);
+
     // 4e. Runtime control state (F0): the CP-pushed config store + EngineControl
     //     controller. Built UNCONDITIONALLY (independent of CP connectivity) — it
     //     holds local runtime state and drives the effect loops (garden/enforcement
@@ -248,9 +277,12 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
                 .expect("wireless status receiver taken once");
             // Move the P5 liveness stream in too (unsolicited periodic snapshots).
             let liveness_rx = liveness_rx.take().expect("liveness receiver taken once");
+            // Move the P3 device-telemetry stream in too (unsolicited periodic).
+            let device_reports_rx =
+                device_reports_rx.take().expect("device-report receiver taken once");
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
-                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, liveness_rx, move |up| {
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, liveness_rx, device_reports_rx, move |up| {
                     mgr.set_cp_connected(up);
                     if !up {
                         m.incr(Metric::CpDisconnect);
