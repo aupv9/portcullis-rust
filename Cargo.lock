@@ -719,6 +719,7 @@ name = "portcullis-provision"
 version = "0.14.0"
 dependencies = [
  "async-trait",
+ "portcullis-nft",
  "portcullis-types",
  "serde_json",
  "tempfile",

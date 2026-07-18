@@ -20,12 +20,17 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod device_meter;
 pub mod ipset_iptables;
 pub mod nftables_json;
 pub mod ruleset;
 pub mod writer;
 
 pub use backend::{FirewallBackend, MockBackend, MockOp};
+pub use device_meter::{
+    bytes_for_ip, build_prune_doc, build_reconcile_doc, counter_name, parse_counters,
+    CHAIN_DEVICE_METER,
+};
 pub use ipset_iptables::{parse_ipset_list, IpsetIptablesBackend};
 pub use nftables_json::{parse_auth_set, NftJsonBackend};
 pub use ruleset::{build_base_ruleset, build_base_script, build_rescope_ruleset};

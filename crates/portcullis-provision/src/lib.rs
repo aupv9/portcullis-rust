@@ -34,12 +34,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod device_obs;
 pub mod handle;
 pub mod liveness;
 pub mod runner;
 pub mod sm;
 pub mod uci;
 
+pub use device_obs::{
+    run_device_obs_poller, AssocEntry, DEFAULT_DEVICE_POLL_INTERVAL, DEVICE_REPORT_BUFFER,
+};
 pub use handle::{run_provision_subsystem, run_provision_subsystem_with_policy, ProvisionHandle};
 pub use liveness::{poll_once, run_liveness_poller, DEFAULT_POLL_INTERVAL, LIVENESS_BUFFER};
 pub use runner::{CommandRunner, ProcessRunner};
