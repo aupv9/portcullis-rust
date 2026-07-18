@@ -14,7 +14,7 @@
 //! by the snapshot filter too, so a snapshot can never capture a non-owned
 //! section).
 
-use portcullis_types::{ProvisionError, SsidSpec, WirelessDesiredState};
+use portcullis_types::{PeerAllow, ProvisionError, SsidSpec, WirelessDesiredState};
 
 /// The UCI `config`s (top-level files) the reload touches. Commit order:
 /// `uci commit network wireless dhcp firewall sqm` (firewall before sqm; sqm
@@ -316,13 +316,49 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     c
 }
 
-/// Render the full desired-state `uci set` batch (every SSID). Pure; assumes
-/// [`validate_wireless`] passed. The set/delete DIFF against on-device owned
-/// state is computed in `sm.rs` — this renders the desired half.
+/// The owned `config.section` key for one inter-SSID allow-forwarding: unique per
+/// `(from, to)` direction. Both slugs are `[a-z0-9_]{1,16}` (validated), so this
+/// stays well within UCI section-name limits (`pc_peer_` + ≤16 + `_` + ≤16 ≈ 41).
+fn peer_fwd_section(from: &str, to: &str) -> String {
+    format!("firewall.pc_peer_{from}_{to}")
+}
+
+/// Render ONE owned `config forwarding` opening a single inter-SSID direction
+/// (`from`'s zone → `to`'s zone). The zone name of an SSID IS its slug (see
+/// `render_ssid`'s `firewall.pc_<slug>_zone.name = slug`), so `.src = from` and
+/// `.dest = to` reference the two owned zones directly. Stamped with
+/// [`WIRELESS_OWNER`] and named `pc_peer_<from>_<to>` so the reconcile diff /
+/// [`is_owned_wireless_section`] recognise it as owned. Pure; assumes
+/// [`validate_wireless`] passed (both slugs name SSIDs in the same state).
+pub fn render_peer_allow(peer: &PeerAllow) -> Vec<UciCmd> {
+    let (from, to) = (peer.from_slug.as_str(), peer.to_slug.as_str());
+    let f = peer_fwd_section(from, to);
+    vec![
+        UciCmd::set(&f, "forwarding"),
+        UciCmd::set(format!("{f}.src"), from),
+        UciCmd::set(format!("{f}.dest"), to),
+        UciCmd::set(format!("{f}.owner"), WIRELESS_OWNER),
+    ]
+}
+
+/// Render the full desired-state `uci set` batch (every SSID, then every
+/// inter-SSID allow-forwarding). Pure; assumes [`validate_wireless`] passed. The
+/// set/delete DIFF against on-device owned state is computed in `sm.rs` — this
+/// renders the desired half.
+///
+/// Inter-SSID isolation is the DEFAULT: with no `peer_allows` this renders no
+/// `pc_peer_*` forwardings, so fw3's default-deny keeps every owned SSID zone
+/// unable to reach the others (empty list == the pre-P2 behaviour exactly). Each
+/// [`PeerAllow`] opens exactly one direction; a removed allow disappears from this
+/// batch and the reconcile diff (owned-section recognition) deletes its stale
+/// forwarding on the next apply.
 pub fn render_wireless(state: &WirelessDesiredState, responder_port: u16) -> Vec<UciCmd> {
     let mut c = Vec::new();
     for ssid in &state.ssids {
         c.extend(render_ssid(ssid, responder_port));
+    }
+    for peer in &state.peer_allows {
+        c.extend(render_peer_allow(peer));
     }
     c
 }
@@ -596,6 +632,36 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
         }
     }
 
+    // Inter-SSID allow-list (P2): each PeerAllow opens ONE forwarding direction
+    // between two OWNED SSID zones (the zone name == the slug). Fail-OPEN reject
+    // the whole push if any entry references a slug not present in `state.ssids`,
+    // is a self-pair, is malformed, or is a duplicate direction — a bad allow-list
+    // must write nothing (no forwarding is opened; isolation is preserved).
+    // `seen_slugs` above holds every SSID slug in this desired-state.
+    let mut seen_pairs: Vec<(&str, &str)> = Vec::new();
+    for pa in &state.peer_allows {
+        let (from, to) = (pa.from_slug.as_str(), pa.to_slug.as_str());
+        if !is_slug(from) {
+            return bad(format!("peer_allow from_slug must match [a-z0-9_]{{1,16}}, got '{from}'"));
+        }
+        if !is_slug(to) {
+            return bad(format!("peer_allow to_slug must match [a-z0-9_]{{1,16}}, got '{to}'"));
+        }
+        if from == to {
+            return bad(format!("peer_allow from_slug == to_slug ('{from}'); a zone always reaches itself"));
+        }
+        if !seen_slugs.contains(&from) {
+            return bad(format!("peer_allow from_slug '{from}' is not a slug of any SSID in this push"));
+        }
+        if !seen_slugs.contains(&to) {
+            return bad(format!("peer_allow to_slug '{to}' is not a slug of any SSID in this push"));
+        }
+        if seen_pairs.contains(&(from, to)) {
+            return bad(format!("duplicate peer_allow '{from}' -> '{to}'"));
+        }
+        seen_pairs.push((from, to));
+    }
+
     Ok(())
 }
 
@@ -747,7 +813,26 @@ mod tests {
     }
 
     fn wstate(ssids: Vec<SsidSpec>) -> WirelessDesiredState {
-        WirelessDesiredState { config_version: "cfg-1".into(), ssids, confirm_timeout_secs: 0 }
+        WirelessDesiredState {
+            config_version: "cfg-1".into(),
+            ssids,
+            confirm_timeout_secs: 0,
+            peer_allows: Vec::new(),
+        }
+    }
+
+    /// A [`WirelessDesiredState`] with SSIDs and an explicit peer-allow list.
+    fn wstate_peers(ssids: Vec<SsidSpec>, peer_allows: Vec<PeerAllow>) -> WirelessDesiredState {
+        WirelessDesiredState {
+            config_version: "cfg-1".into(),
+            ssids,
+            confirm_timeout_secs: 0,
+            peer_allows,
+        }
+    }
+
+    fn peer(from: &str, to: &str) -> PeerAllow {
+        PeerAllow { from_slug: from.into(), to_slug: to.into() }
     }
 
     fn has_set(cmds: &[UciCmd], key: &str, value: &str) -> bool {
@@ -910,7 +995,12 @@ mod tests {
     }
 
     fn wstate1(s: SsidSpec) -> WirelessDesiredState {
-        WirelessDesiredState { config_version: "cfg".into(), ssids: vec![s], confirm_timeout_secs: 0 }
+        WirelessDesiredState {
+            config_version: "cfg".into(),
+            ssids: vec![s],
+            confirm_timeout_secs: 0,
+            peer_allows: Vec::new(),
+        }
     }
 
     // Phase 3 (F9): a rate cap renders an sqm `queue` section on the SSID's bridge.
@@ -1175,6 +1265,122 @@ mod tests {
         assert!(!is_owned_wireless_section("network.lan"));
         assert!(!is_owned_wireless_section("wireless.wifi_hotspot"));
         assert!(!is_owned_wireless_section("firewall.wan"));
+    }
+
+    // --- P2 inter-SSID allow-pairs -----------------------------------------
+
+    // A PeerAllow renders exactly one owned `config forwarding` src=from dest=to,
+    // stamped with the owner tag; the zone name == the slug (see render_ssid).
+    #[test]
+    fn render_peer_allow_forwarding_src_dest_owner() {
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("public", "staff")],
+        );
+        let cmds = render_wireless(&st, 8080);
+        assert!(has_set(&cmds, "firewall.pc_peer_public_staff", "forwarding"));
+        assert!(has_set(&cmds, "firewall.pc_peer_public_staff.src", "public"));
+        assert!(has_set(&cmds, "firewall.pc_peer_public_staff.dest", "staff"));
+        assert!(has_set(&cmds, "firewall.pc_peer_public_staff.owner", WIRELESS_OWNER));
+        // One direction only: the reverse forwarding is NOT rendered.
+        assert!(!has_key(&cmds, "firewall.pc_peer_staff_public"));
+    }
+
+    // Both directions => two distinct owned forwarding sections.
+    #[test]
+    fn render_peer_allow_bidirectional_is_two_sections() {
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("public", "staff"), peer("staff", "public")],
+        );
+        let cmds = render_wireless(&st, 8080);
+        assert!(has_set(&cmds, "firewall.pc_peer_public_staff", "forwarding"));
+        assert!(has_set(&cmds, "firewall.pc_peer_staff_public", "forwarding"));
+    }
+
+    // Default (no peer_allows) renders NO peer sections — isolation via fw3
+    // default-deny is unchanged from the pre-P2 behaviour.
+    #[test]
+    fn render_wireless_no_peer_allows_renders_no_peer_sections() {
+        let st = wstate(vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)]);
+        let cmds = render_wireless(&st, 8080);
+        assert!(!cmds.iter().any(|c| matches!(
+            c,
+            UciCmd::Set { key, .. } if key.contains(".pc_peer_")
+        )));
+    }
+
+    // section_decls picks up the peer forwarding (exactly one `.`), so the
+    // reconcile diff tracks it — removing the allow deletes its section next apply.
+    #[test]
+    fn section_decls_includes_peer_forwarding() {
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("public", "staff")],
+        );
+        let decls = section_decls(&render_wireless(&st, 8080));
+        assert!(decls.iter().any(|d| d == "firewall.pc_peer_public_staff"));
+    }
+
+    // The peer forwarding section is recognised as OWNED (pc_ prefix), so the
+    // snapshot captures it and the delete-then-set reconcile removes a dropped
+    // allow. This is the removal mechanism — no dedicated teardown needed.
+    #[test]
+    fn peer_forwarding_section_is_owned() {
+        assert!(is_owned_wireless_section("firewall.pc_peer_public_staff"));
+    }
+
+    #[test]
+    fn validate_wireless_accepts_valid_peer_allow() {
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("public", "staff")],
+        );
+        validate_wireless(&st).unwrap();
+    }
+
+    #[test]
+    fn validate_wireless_rejects_peer_allow_unknown_slug() {
+        // to_slug references an SSID not in the push.
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("public", "ghost")],
+        );
+        assert!(validate_wireless(&st).is_err());
+        // from_slug unknown too.
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0)],
+            vec![peer("ghost", "public")],
+        );
+        assert!(validate_wireless(&st).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_peer_allow_self_pair() {
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0)],
+            vec![peer("public", "public")],
+        );
+        assert!(validate_wireless(&st).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_peer_allow_bad_slug() {
+        // A malformed slug (uppercase) fails is_slug before the membership check.
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("Public", "staff")],
+        );
+        assert!(validate_wireless(&st).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_duplicate_peer_allow() {
+        let st = wstate_peers(
+            vec![ssid_on("public", true, 0), ssid_on("staff", false, 1)],
+            vec![peer("public", "staff"), peer("public", "staff")],
+        );
+        assert!(validate_wireless(&st).is_err());
     }
 
     #[test]

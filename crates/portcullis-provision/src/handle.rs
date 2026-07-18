@@ -527,6 +527,7 @@ mod tests {
             config_version: version.into(),
             confirm_timeout_secs: timeout,
             ssids: vec![wssid("public", true, 0), wssid("home", false, 1)],
+            peer_allows: Vec::new(),
         }
     }
 
