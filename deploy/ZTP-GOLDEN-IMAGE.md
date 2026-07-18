@@ -30,8 +30,22 @@ Gói `.ipk` (theo `deploy/Makefile`) cài các file:
 /etc/uci-defaults/99-portcullis-enroll    first-boot: enable+kick agent ← A3
 /etc/capabilities/portcullis.json         CAP_NET_ADMIN
 ```
-DEPENDS: `nftables kmod-nft-core kmod-nft-nat dnsmasq-full curl ca-bundle openssl-util`
-(engine + agent chạy offline-của-opkg ngoài field).
+DEPENDS (.ipk): `ipset iptables ip6tables kmod-ipt-ipset iptables-mod-ipset conntrack curl ca-bundle openssl-util`
+(ipset backend — TDD §17 opt B, chạy trên stock RUTM11 + RUT200; engine + agent
+chạy offline-của-opkg ngoài field).
+- ⚠️ **`iptables-mod-ipset`** (libxt_set.so) BẮT BUỘC: engine chạy `iptables -m set
+  --match-set` cho gate auth/garden — thiếu nó thì rule KHÔNG load, gate im lặng không lên.
+  Khác `kmod-ipt-ipset` (chỉ là kernel module ip_set/xt_set).
+- ⚠️ **`dnsmasq-full`** KHÔNG để trong DEPENDS (conflict với `dnsmasq` stock → `opkg
+  install` fail). Nạp lúc bake image qua `PACKAGES="dnsmasq-full -dnsmasq"` (script tự làm).
+- ⚠️ **`conntrack`** (KHÔNG phải `conntrack-tools` = conntrackd/daemon) — tên sai không
+  resolve → abort install (verify on-device 2026-07-11). `kmod-*` phải lấy từ repo RutOS
+  (Image Builder), KHÔNG feed OpenWrt (hash kernel lệch → fail).
+
+> **Tự động hoá:** Part 2–3 (điền secret + bake) đã gói vào `deploy/build-golden-image.sh`
+> — 1 lệnh cho mỗi model. Xem `deploy/ZTP-DEPLOYMENT-PLAN.md` cho plan đầy đủ 2 model
+> (RUTM11 `ramips/mt7621` vs RUT200 `ramips/mt7628`; cùng 1 .ipk `mipsel_24kc`).
+> Part dưới đây là quy trình thủ công / để hiểu từng bước.
 
 ---
 
@@ -86,7 +100,7 @@ make image \
   FILES=./files          # overlay chứa etc/portcullis/bootstrap.conf (Cách A)
 # Output: bin/targets/ramips/mt7621/*-sysupgrade.bin  (hoặc -factory.bin)
 ```
-- `PACKAGES="portcullis"` kéo theo toàn bộ DEPENDS (nftables/dnsmasq-full/curl/openssl-util…).
+- `PACKAGES="portcullis dnsmasq-full -dnsmasq"` kéo theo DEPENDS của .ipk (ipset/iptables/iptables-mod-ipset/conntrack/curl/openssl-util…) + thay dnsmasq slim bằng dnsmasq-full (cần cho `ipset=` garden).
 - `FILES=./files` nướng `bootstrap.conf` đã điền secret.
 - **Nghiệm thu 1 con** trước khi nhân bản batch (Part 5).
 

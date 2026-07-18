@@ -33,11 +33,33 @@ define Package/portcullis
   CATEGORY:=Network
   TITLE:=Per-store captive-portal edge enforcement engine
   URL:=https://github.com/aupv9/portcullis-rust
-  # Runtime deps: the nftables backend + dnsmasq nftset support (§5.2, §7.3),
-  # plus the ZTP first-boot claim agent's tools (curl for the HTTPS claim POST,
-  # openssl-util for the HMAC signature, ca-bundle for TLS trust) so a golden
-  # image can self-enroll with NO opkg/internet at install time.
-  DEPENDS:=+nftables +kmod-nft-core +kmod-nft-nat +dnsmasq-full +curl +ca-bundle +openssl-util
+  # Runtime deps: the ipset+iptables backend (TDD §17 opt B — stock RutOS lacks
+  # CONFIG_NFT_NAT, so this is the shipping backend on BOTH RUTM11 and RUT200; the
+  # engine auto-probes at startup). The engine runs `iptables/ip6tables -m set
+  # --match-set` (ipset_iptables.rs) for the auth/garden gate, so it needs BOTH the
+  # ipset userspace tool (`ipset`), the kernel set modules (`kmod-ipt-ipset` =
+  # ip_set + xt_set) AND the iptables userspace extension `iptables-mod-ipset`
+  # (libxt_set.so) — WITHOUT the latter, `-m set` fails to load and the gate never
+  # installs. The `conntrack` CLI (for de-auth flow reaping, invariant #9) is the
+  # package **`conntrack`** — NOT `conntrack-tools` (that ships conntrackd, the
+  # daemon; the wrong name never resolves and aborts the install; verified on-device
+  # 2026-07-11). ZTP first-boot agent tools: curl (HTTPS claim POST), openssl-util
+  # (HMAC signature), ca-bundle (TLS trust) — baked so a golden image self-enrolls
+  # with NO opkg/internet. Kept in sync with deploy/ci/pack-ipk.sh.
+  #
+  # NOT hard deps (avoid opkg conflicts / flash bloat on install):
+  #  - dnsmasq-full (needed for the `ipset=` garden directive; stock slim dnsmasq
+  #    lacks it) CONFLICTS with the pre-installed `dnsmasq` — declaring +dnsmasq-full
+  #    makes `opkg install` fail. Swap it in at golden-image bake time instead:
+  #    Image Builder PACKAGES="... dnsmasq-full -dnsmasq" (see build-golden-image.sh).
+  #  - SQM/per-SSID QoS (tc, sqm-scripts, kmod-sched-cake) is opt-in — RUT200 flash
+  #    budget; the engine degrades gracefully when absent. Install only if used.
+  #
+  # kmod caveat: kmods from the generic OpenWrt feed FAIL to install on RutOS (kernel
+  # vermagic/hash differs). For a golden image, kmod-ipt-ipset must come from the
+  # RutOS/Teltonika package repo the Image Builder is paired with; on stock RutOS the
+  # ip_set/xt_set modules are typically already present (fw3/openNDS use ipset).
+  DEPENDS:=+ipset +iptables +ip6tables +kmod-ipt-ipset +iptables-mod-ipset +conntrack +curl +ca-bundle +openssl-util
 endef
 
 define Package/portcullis/description

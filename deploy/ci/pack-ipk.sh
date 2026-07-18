@@ -65,7 +65,18 @@ Priority: optional
 # (snapshot/commit/reload tolerate a missing /etc/config/sqm; a cap set on such a
 # device simply doesn't shape). On devices that USE per-SSID caps, install:
 #   opkg install sqm-scripts kmod-sched-cake
-Depends: ipset, iptables, ip6tables, kmod-ipt-ipset, conntrack-tools, curl, ca-bundle, openssl-util
+# NOTE (ipset match): the engine runs `iptables/ip6tables -m set --match-set` for
+# the auth/garden gate, which needs the userspace extension `iptables-mod-ipset`
+# (libxt_set.so) IN ADDITION to `kmod-ipt-ipset` (the kernel ip_set/xt_set mods).
+# Stock RutOS usually ships it (fw3/openNDS use ipset matching), but an Image-
+# Builder golden image won't include it unless it's declared here → `-m set` fails
+# to load and the gate silently never installs. dnsmasq-full is NOT declared here:
+# it conflicts with the pre-installed dnsmasq (opkg install would fail); swap it in
+# at golden-image bake time via Image Builder PACKAGES (see build-golden-image.sh).
+# NOTE (conntrack): the package providing the `conntrack` CLI (flow reaper, invariant
+# #9) is `conntrack` — NOT `conntrack-tools` (that is conntrackd, the daemon). The
+# wrong name never resolves and aborts `opkg install` (verified on-device 2026-07-11).
+Depends: ipset, iptables, ip6tables, kmod-ipt-ipset, iptables-mod-ipset, conntrack, curl, ca-bundle, openssl-util
 Description: Per-store captive-portal edge enforcement engine. Holds the internet
  gate shut until the WiFi Hub control plane authorizes a client, then enforces,
  meters, and expires that grant via ipset + iptables (TDD 17 option B).
