@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use portcullis_types::{
     EngineInfoSnapshot, EngineParameters, Error, GrantParams, HealthStatus, MacAddr,
-    MetricsSnapshot, ProvisionState, Result, RevokeReason, SessionEvent, SessionId, SessionInfo,
-    SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessStatus,
+    MetricsSnapshot, PeerAllow, ProvisionState, Result, RevokeReason, SessionEvent, SessionId,
+    SessionInfo, SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessLiveness, WirelessStatus,
 };
 
 use crate::pb;
@@ -318,6 +318,11 @@ pub fn wireless_config_from_pb(req: pb::SetWirelessConfigRequest) -> WirelessDes
         config_version: req.config_version,
         ssids: req.ssids.into_iter().map(wireless_ssid_from_pb).collect(),
         confirm_timeout_secs: req.confirm_timeout_secs,
+        peer_allows: req
+            .peer_allows
+            .into_iter()
+            .map(|p| PeerAllow { from_slug: p.from_slug, to_slug: p.to_slug })
+            .collect(),
     }
 }
 
@@ -338,6 +343,26 @@ pub fn wireless_status_to_pb(s: &WirelessStatus) -> pb::WirelessStatus {
             })
             .collect(),
         message: s.message.clone(),
+    }
+}
+
+/// Map a domain [`WirelessLiveness`] snapshot to the wire
+/// `EngineFrame.wireless_liveness` (P5). Purely observational — no secrets.
+pub fn wireless_liveness_to_pb(lv: &WirelessLiveness) -> pb::WirelessLiveness {
+    pb::WirelessLiveness {
+        config_version: lv.config_version.clone(),
+        per_ssid: lv
+            .per_ssid
+            .iter()
+            .map(|s| pb::SsidLiveness {
+                slug: s.slug.clone(),
+                iface: s.iface.clone(),
+                broadcasting: s.broadcasting,
+                stations: s.stations,
+                signal_dbm: s.signal_dbm,
+            })
+            .collect(),
+        ts_unix: lv.ts_unix,
     }
 }
 
@@ -628,6 +653,7 @@ mod tests {
             config_version: "cfg-1".into(),
             ssids: vec![pb_ssid("public", true, ""), pb_ssid("home", false, "supersecret")],
             confirm_timeout_secs: 90,
+            peer_allows: Vec::new(),
         };
         let st = wireless_config_from_pb(req);
         assert_eq!(st.config_version, "cfg-1");
@@ -638,6 +664,25 @@ mod tests {
         assert_eq!(home.egress_zone, "wan");
         assert_eq!(home.key, "supersecret");
         assert!(!home.gated);
+        // Default: no peer allows => full isolation (unchanged behaviour).
+        assert!(st.peer_allows.is_empty());
+    }
+
+    #[test]
+    fn wireless_config_from_pb_maps_peer_allows() {
+        let req = pb::SetWirelessConfigRequest {
+            config_version: "cfg-1".into(),
+            ssids: vec![pb_ssid("public", true, ""), pb_ssid("staff", false, "supersecret")],
+            confirm_timeout_secs: 0,
+            peer_allows: vec![pb::WirelessPeerAllow {
+                from_slug: "public".into(),
+                to_slug: "staff".into(),
+            }],
+        };
+        let st = wireless_config_from_pb(req);
+        assert_eq!(st.peer_allows.len(), 1);
+        assert_eq!(st.peer_allows[0].from_slug, "public");
+        assert_eq!(st.peer_allows[0].to_slug, "staff");
     }
 
     #[test]
@@ -646,6 +691,7 @@ mod tests {
         let state = WirelessDesiredState {
             config_version: "cfg-2".into(),
             confirm_timeout_secs: 0,
+            peer_allows: Vec::new(),
             ssids: vec![SsidSpec {
                 slug: "home".into(),
                 ssid: "Staff".into(),

@@ -69,6 +69,7 @@ message EngineFrame {
     ProvisionStatus provision_status = 10; // hotspot-provision lifecycle (P0.5); unsolicited on watchdog rollback
     WirelessStatus  wireless_status  = 11; // CP-managed wireless (P-W1) lifecycle; unsolicited on watchdog rollback
     WirelessConfig  wireless_config  = 12; // reply to ControlFrame.get_wireless_config (keys REDACTED)
+    WirelessLiveness wireless_liveness = 13; // on-air SSID liveness (P5); unsolicited, periodic poll of gated VIFs
   }
 }
 
@@ -394,12 +395,25 @@ message WirelessSsid {
   string ieee80211w  = 18;   // PMF: "" off | "1" optional | "2" required
 }
 
+// One permitted inter-SSID forwarding direction (P2 inter-SSID isolation policy).
+// By default owned SSID zones CANNOT reach each other — fw3 denies inter-zone
+// forwarding when no explicit rule exists, and the engine renders none. Each
+// PeerAllow opens exactly one direction (from_slug -> to_slug); add both to make
+// a pair bidirectional. Both slugs must name owned SSIDs in this desired-state.
+message WirelessPeerAllow {
+  string from_slug = 1; // source SSID slug (its firewall zone)
+  string to_slug   = 2; // destination SSID slug (its firewall zone)
+}
+
 // Full declarative desired-state of the engine's owned SSIDs. The engine diffs
 // this against its currently-owned sections and applies the minimal set/delete.
 message SetWirelessConfigRequest {
   string config_version = 1;       // CP-issued; echoed in status + confirm (cursor/idempotency)
   repeated WirelessSsid ssids = 2; // empty = tear down ALL owned sections
   uint32 confirm_timeout_secs = 3; // local watchdog window; 0 = default 90; bounds [15, 600]
+  // Inter-SSID allow-list (P2): permitted from->to forwarding directions between
+  // owned SSID zones. Empty (default) = every SSID fully isolated from the others.
+  repeated WirelessPeerAllow peer_allows = 4;
 }
 
 // CP confirms a still-pending wireless push before the watchdog fires.
@@ -428,6 +442,34 @@ message WirelessStatus {
 message WirelessConfig {
   string config_version = 1;
   repeated WirelessSsid ssids = 2;
+}
+
+// ---------------------------------------------------------------------------
+// On-air SSID liveness (P5). Whereas WirelessStatus reports the LIFECYCLE of a
+// config push (did it apply/commit/roll back), liveness reports the observed
+// RADIO reality: for each gated VIF the engine owns, is the SSID actually
+// broadcasting and how many stations are associated. The engine polls this on a
+// timer (~30s) by shelling out on-device (iwinfo / ubus hostapd get_status /
+// ubus iwinfo assoclist) and pushes it UP unsolicited as an EngineFrame. It is
+// purely observational — never affects enforcement or config.
+// ---------------------------------------------------------------------------
+
+// Observed radio state of one gated SSID's VIF.
+message SsidLiveness {
+  string slug         = 1; // owner-namespace slug (matches WirelessSsid.slug)
+  string iface        = 2; // observed VIF, e.g. "wlan0" / "phy0-ap0" (NOT the bridge)
+  bool   broadcasting = 3; // hostapd state == ENABLED (beacon on the air)
+  uint32 stations     = 4; // associated station count (assoclist length)
+  int32  signal_dbm   = 5; // representative/strongest station signal in dBm (0 = unknown)
+}
+
+// engine -> control plane: a snapshot of on-air liveness across the gated VIFs.
+// Unsolicited (correlation_id 0), emitted periodically. Missing/absent VIFs are
+// simply omitted (best-effort — a missing tool or non-JSON reply skips that VIF).
+message WirelessLiveness {
+  string config_version = 1;         // the committed config this snapshot reflects (best-effort)
+  repeated SsidLiveness per_ssid = 2;
+  int64  ts_unix = 3;                // engine wall-clock when the snapshot was taken
 }
 
 message Empty {}

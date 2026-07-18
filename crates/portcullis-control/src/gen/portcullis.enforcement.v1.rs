@@ -11,7 +11,7 @@
 pub struct EngineFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
-    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
     pub msg: ::core::option::Option<engine_frame::Msg>,
 }
 /// Nested message and enum types in `EngineFrame`.
@@ -52,6 +52,9 @@ pub mod engine_frame {
         /// reply to ControlFrame.get_wireless_config (keys REDACTED)
         #[prost(message, tag="12")]
         WirelessConfig(super::WirelessConfig),
+        /// on-air SSID liveness (P5); unsolicited, periodic poll of gated VIFs
+        #[prost(message, tag="13")]
+        WirelessLiveness(super::WirelessLiveness),
     }
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
@@ -622,6 +625,21 @@ pub struct WirelessSsid {
     #[prost(string, tag="18")]
     pub ieee80211w: ::prost::alloc::string::String,
 }
+/// One permitted inter-SSID forwarding direction (P2 inter-SSID isolation policy).
+/// By default owned SSID zones CANNOT reach each other — fw3 denies inter-zone
+/// forwarding when no explicit rule exists, and the engine renders none. Each
+/// PeerAllow opens exactly one direction (from_slug -> to_slug); add both to make
+/// a pair bidirectional. Both slugs must name owned SSIDs in this desired-state.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessPeerAllow {
+    /// source SSID slug (its firewall zone)
+    #[prost(string, tag="1")]
+    pub from_slug: ::prost::alloc::string::String,
+    /// destination SSID slug (its firewall zone)
+    #[prost(string, tag="2")]
+    pub to_slug: ::prost::alloc::string::String,
+}
 /// Full declarative desired-state of the engine's owned SSIDs. The engine diffs
 /// this against its currently-owned sections and applies the minimal set/delete.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -636,6 +654,10 @@ pub struct SetWirelessConfigRequest {
     /// local watchdog window; 0 = default 90; bounds \[15, 600\]
     #[prost(uint32, tag="3")]
     pub confirm_timeout_secs: u32,
+    /// Inter-SSID allow-list (P2): permitted from->to forwarding directions between
+    /// owned SSID zones. Empty (default) = every SSID fully isolated from the others.
+    #[prost(message, repeated, tag="4")]
+    pub peer_allows: ::prost::alloc::vec::Vec<WirelessPeerAllow>,
 }
 /// CP confirms a still-pending wireless push before the watchdog fires.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -681,6 +703,51 @@ pub struct WirelessConfig {
     pub config_version: ::prost::alloc::string::String,
     #[prost(message, repeated, tag="2")]
     pub ssids: ::prost::alloc::vec::Vec<WirelessSsid>,
+}
+// ---------------------------------------------------------------------------
+// On-air SSID liveness (P5). Whereas WirelessStatus reports the LIFECYCLE of a
+// config push (did it apply/commit/roll back), liveness reports the observed
+// RADIO reality: for each gated VIF the engine owns, is the SSID actually
+// broadcasting and how many stations are associated. The engine polls this on a
+// timer (~30s) by shelling out on-device (iwinfo / ubus hostapd get_status /
+// ubus iwinfo assoclist) and pushes it UP unsolicited as an EngineFrame. It is
+// purely observational — never affects enforcement or config.
+// ---------------------------------------------------------------------------
+
+/// Observed radio state of one gated SSID's VIF.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SsidLiveness {
+    /// owner-namespace slug (matches WirelessSsid.slug)
+    #[prost(string, tag="1")]
+    pub slug: ::prost::alloc::string::String,
+    /// observed VIF, e.g. "wlan0" / "phy0-ap0" (NOT the bridge)
+    #[prost(string, tag="2")]
+    pub iface: ::prost::alloc::string::String,
+    /// hostapd state == ENABLED (beacon on the air)
+    #[prost(bool, tag="3")]
+    pub broadcasting: bool,
+    /// associated station count (assoclist length)
+    #[prost(uint32, tag="4")]
+    pub stations: u32,
+    /// representative/strongest station signal in dBm (0 = unknown)
+    #[prost(int32, tag="5")]
+    pub signal_dbm: i32,
+}
+/// engine -> control plane: a snapshot of on-air liveness across the gated VIFs.
+/// Unsolicited (correlation_id 0), emitted periodically. Missing/absent VIFs are
+/// simply omitted (best-effort — a missing tool or non-JSON reply skips that VIF).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WirelessLiveness {
+    /// the committed config this snapshot reflects (best-effort)
+    #[prost(string, tag="1")]
+    pub config_version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag="2")]
+    pub per_ssid: ::prost::alloc::vec::Vec<SsidLiveness>,
+    /// engine wall-clock when the snapshot was taken
+    #[prost(int64, tag="3")]
+    pub ts_unix: i64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
