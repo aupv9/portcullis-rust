@@ -57,6 +57,7 @@ service Enforcement {
 // this frame answers (0 for unsolicited frames: hello, events, health).
 message EngineFrame {
   uint64 correlation_id = 1;
+  string trace_ctx = 15;   // echoed back on the answering ack/reply so the CP can confirm continuity.
   oneof msg {
     Hello        hello    = 2; // first frame after Connect
     SessionEvent event    = 3; // lifecycle/accounting (was StreamEvents)
@@ -100,6 +101,7 @@ message WirelessDeviceReport {
 // EngineFrame(s) so overlapping requests can be matched.
 message ControlFrame {
   uint64 correlation_id = 1;
+  string trace_ctx = 18;   // W3C traceparent of the CP request that issued this command; "" when OTEL off / unsampled. Top-level so it accompanies every oneof variant.
   oneof msg {
     GrantRequest  grant  = 2;
     RevokeRequest revoke = 3;
