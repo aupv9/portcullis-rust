@@ -41,6 +41,15 @@ pub trait FirewallBackend: Send + Sync {
         Ok(())
     }
 
+    /// The CURRENT gated-SSID interface scope (the ifaces `set_gated_ifaces` /
+    /// `with_gated_ifaces` last applied). Read-only introspection for the P2
+    /// liveness `gate_enforced` signal — does NOT touch the kernel. Default is an
+    /// empty list ([`MockBackend`] / test doubles); the production backends hold
+    /// the scope and override it.
+    async fn gated_ifaces(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Add resolved walled-garden IPs to the garden sets (the "engine-resolver
     /// garden", used when dnsmasq lacks the `ipset=` directive so the garden
     /// sets can't be populated by DNS — see the daemon's compose loop). Each IP

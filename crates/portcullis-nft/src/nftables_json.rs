@@ -224,6 +224,10 @@ impl FirewallBackend for NftJsonBackend {
         *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") = filtered;
         Ok(())
     }
+
+    async fn gated_ifaces(&self) -> Result<Vec<String>> {
+        Ok(self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned").clone())
+    }
 }
 
 /// Parse the JSON produced by `nft -j list set inet wifihub auth` into

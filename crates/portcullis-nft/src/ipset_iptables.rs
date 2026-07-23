@@ -377,6 +377,10 @@ impl FirewallBackend for IpsetIptablesBackend {
         *self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned") = filtered;
         Ok(())
     }
+
+    async fn gated_ifaces(&self) -> Result<Vec<String>> {
+        Ok(self.gated_ifaces.lock().expect("gated_ifaces mutex poisoned").clone())
+    }
 }
 
 /// Parse `ipset list wifihub_auth` output into [`AuthElement`]s.
