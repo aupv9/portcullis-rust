@@ -4,6 +4,28 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.15.0] — 2026-07-23
+
+### Added
+- **Device-SSID engine** — DHCP reservations, internal-target firewalling, and
+  per-device telemetry (P3) for store-device SSIDs (vending / smartPOS / camera /
+  NVR): the engine honours reserved MAC→IP leases, renders internal-target allow
+  rules, meters per-device IP counters, and fans an observational
+  `WirelessDeviceReport` up-frame to the control plane. Purely diagnostic — the
+  telemetry path never touches the enforcement gate.
+- **Engine trace-context propagation (tracing P0)** — `ControlFrame` and
+  `EngineFrame` now carry a `trace_ctx` (W3C `traceparent`). The engine parses it
+  (hand-rolled, **no OpenTelemetry dependency** — MIPS binary-size budget), labels
+  the command-dispatch span and its logs with the originating `trace_id` for
+  trace→logs correlation, and echoes the context back so the control plane can
+  confirm continuity. A malformed value is treated as absent (fail-closed, never
+  aborts a command). See `docs/design/engine-tracing.md`.
+
+### Notes
+- Both are wire-compatible additions (a new scalar `trace_ctx` + proto fields an
+  old peer ignores). No new runtime dependency; the release binary stays within
+  the MIPS size budget.
+
 ## [0.14.0] — 2026-07-18
 
 ### Added
