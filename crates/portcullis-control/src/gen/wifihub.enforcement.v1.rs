@@ -11,6 +11,9 @@
 pub struct EngineFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
+    /// echoed back on the answering ack/reply so the CP can confirm continuity.
+    #[prost(string, tag="15")]
+    pub trace_ctx: ::prost::alloc::string::String,
     #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
     pub msg: ::core::option::Option<engine_frame::Msg>,
 }
@@ -110,6 +113,9 @@ pub struct WirelessDeviceReport {
 pub struct ControlFrame {
     #[prost(uint64, tag="1")]
     pub correlation_id: u64,
+    /// W3C traceparent of the CP request that issued this command; "" when OTEL off / unsampled. Top-level so it accompanies every oneof variant.
+    #[prost(string, tag="18")]
+    pub trace_ctx: ::prost::alloc::string::String,
     #[prost(oneof="control_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17")]
     pub msg: ::core::option::Option<control_frame::Msg>,
 }

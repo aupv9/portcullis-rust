@@ -302,11 +302,51 @@ async fn handle_control_frame(
     deauth_svc: &Arc<dyn Deauthenticator>,
 ) -> Vec<pb::EngineFrame> {
     let cid = ctrl.correlation_id;
+    // Trace-context propagation (P0). Capture the inbound `traceparent` up front:
+    // its parsed ids label every log line emitted while dispatching this command
+    // (Grafana trace -> logs), and the raw string is echoed back on each answering
+    // frame so the CP can confirm continuity. A malformed value parses to `None`
+    // and is treated as absent (fail-closed — never aborts the command).
+    let trace_ctx = ctrl.trace_ctx.clone();
+    let span = tracing::info_span!(
+        "engine.cmd",
+        cid = cid,
+        trace_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    if let Some((tid, sid, _sampled)) = parse_traceparent(&trace_ctx) {
+        span.record("trace_id", tracing::field::display(tid));
+        span.record("parent_span_id", tracing::field::display(sid));
+    }
+    let _enter = span.enter();
+
     let Some(msg) = ctrl.msg else {
         // Empty frame (unknown/forward-compat): ignore rather than tear down.
         return Vec::new();
     };
 
+    // Dispatch, then stamp the inbound `trace_ctx` onto each answering frame so
+    // the CP sees the same context echoed back (unsolicited fan-out is untouched).
+    let mut out = dispatch(msg, cid, enforcer, provisioner, engine_control, deauth_svc).await;
+    if !trace_ctx.is_empty() {
+        for f in &mut out {
+            f.trace_ctx = trace_ctx.clone();
+        }
+    }
+    out
+}
+
+/// The command dispatch body. Split out from [`handle_control_frame`] so the
+/// enclosing function can own the `engine.cmd` span + the `trace_ctx` echo around
+/// the whole match with the least churn.
+async fn dispatch(
+    msg: control_frame::Msg,
+    cid: u64,
+    enforcer: &Arc<dyn Enforcer>,
+    provisioner: &Arc<dyn Provisioner>,
+    engine_control: &Arc<dyn EngineControl>,
+    deauth_svc: &Arc<dyn Deauthenticator>,
+) -> Vec<pb::EngineFrame> {
     match msg {
         control_frame::Msg::Grant(mut g) => {
             // G3a: fill unset ttl/quota from the named tier's policy before
@@ -503,10 +543,65 @@ async fn build_hello(store_id: &str, enforcer: &Arc<dyn Enforcer>) -> pb::Hello 
     }
 }
 
+// --- trace context ---------------------------------------------------------
+
+/// Hand-parse a W3C `traceparent` (NO `opentelemetry` dep — MIPS size budget,
+/// §2.1). The header has one fixed ASCII shape:
+///
+/// ```text
+/// 00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>
+/// ^^ version           ^^^^^^^^^^^^^^^^ ^^ trace-flags (bit0 = sampled)
+/// ```
+///
+/// Returns `(trace_id_hex, span_id_hex, sampled)` on a strictly-valid header, or
+/// `None` on ANY deviation (wrong length, bad segmentation, non-hex, unsupported
+/// version, all-zero trace-id / span-id). Fail-closed: a malformed value is
+/// treated as absent, never panics/unwraps on input.
+fn parse_traceparent(s: &str) -> Option<(&str, &str, bool)> {
+    // Fixed total length: 2 + 1 + 32 + 1 + 16 + 1 + 2 = 55.
+    if s.len() != 55 {
+        return None;
+    }
+    let mut parts = s.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    // Exactly four parts — reject a trailing segment (`00-..-..-..-extra`).
+    if parts.next().is_some() {
+        return None;
+    }
+    if version.len() != 2 || trace_id.len() != 32 || span_id.len() != 16 || flags.len() != 2 {
+        return None;
+    }
+    // Only version 00 is defined; future versions are not assumed compatible.
+    if version != "00" {
+        return None;
+    }
+    let is_hex = |p: &str| p.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_hex(trace_id) || !is_hex(span_id) || !is_hex(flags) {
+        return None;
+    }
+    // An all-zero id is invalid per spec (means "no trace"/"no parent").
+    if trace_id.bytes().all(|b| b == b'0') || span_id.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    // trace-flags is a hex byte; bit 0 is the sampled flag. Hex-validated above,
+    // so this parse cannot fail — but stay fail-closed and never unwrap.
+    let sampled = match u8::from_str_radix(flags, 16) {
+        Ok(byte) => (byte & 0x01) != 0,
+        Err(_) => return None,
+    };
+    Some((trace_id, span_id, sampled))
+}
+
 // --- frame helpers ---------------------------------------------------------
 
 fn frame(correlation_id: u64, msg: engine_frame::Msg) -> pb::EngineFrame {
-    pb::EngineFrame { correlation_id, msg: Some(msg) }
+    // `trace_ctx` defaults empty; answering frames are stamped with the inbound
+    // ControlFrame's context in `handle_control_frame`. Unsolicited fan-out frames
+    // (correlation_id 0) leave it empty — no request to correlate.
+    pb::EngineFrame { correlation_id, trace_ctx: String::new(), msg: Some(msg) }
 }
 
 fn session(cid: u64, info: &portcullis_types::SessionInfo) -> pb::EngineFrame {
@@ -761,10 +856,14 @@ mod tests {
         Arc::new(portcullis_types::NoopDeauth) as Arc<dyn portcullis_types::Deauthenticator>
     }
 
+    /// A valid sampled W3C traceparent used by the echo tests.
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
     /// Build a `Revoke` control frame, optionally requesting an 802.11 deauth.
     fn revoke_ctrl(cid: u64, mac: &str, deauth: bool) -> pb::ControlFrame {
         pb::ControlFrame {
             correlation_id: cid,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::Revoke(pb::RevokeRequest {
                 client_mac: mac.into(),
                 reason: pb::RevokeReason::RevokeQuota as i32,
@@ -776,6 +875,7 @@ mod tests {
     fn grant_ctrl(cid: u64, mac: &str) -> pb::ControlFrame {
         pb::ControlFrame {
             correlation_id: cid,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::Grant(pb::GrantRequest {
                 store_id: "s".into(),
                 client_mac: mac.into(),
@@ -905,6 +1005,7 @@ mod tests {
     async fn get_found_yields_session_then_list_end() {
         let ctrl = pb::ControlFrame {
             correlation_id: 5,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
         let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
@@ -921,6 +1022,7 @@ mod tests {
     async fn get_missing_yields_failed_list_end() {
         let ctrl = pb::ControlFrame {
             correlation_id: 5,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::Get(pb::Key { client_mac: "aa:bb:cc:dd:ee:ff".into() })),
         };
         let out = handle_control_frame(ctrl, &(MockEnforcer::failing() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
@@ -935,6 +1037,7 @@ mod tests {
     async fn list_streams_all_then_list_end() {
         let ctrl = pb::ControlFrame {
             correlation_id: 9,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::List(pb::ListRequest { page_size: 0, page_token: String::new() })),
         };
         let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
@@ -949,6 +1052,7 @@ mod tests {
     async fn ping_yields_health() {
         let ctrl = pb::ControlFrame {
             correlation_id: 2,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::Ping(pb::Ping { ts_unix: 100 })),
         };
         let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
@@ -960,7 +1064,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_frame_is_ignored_no_panic() {
-        let ctrl = pb::ControlFrame { correlation_id: 0, msg: None };
+        let ctrl = pb::ControlFrame { correlation_id: 0, trace_ctx: String::new(), msg: None };
         let out = handle_control_frame(ctrl, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
         assert!(out.is_empty());
     }
@@ -972,6 +1076,7 @@ mod tests {
         // rejects these frames so a not-yet-migrated CP learns to switch over.
         let hotspot = pb::ControlFrame {
             correlation_id: 4,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::ProvisionHotspot(pb::ProvisionHotspotRequest::default())),
         };
         let out = handle_control_frame(hotspot, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
@@ -979,6 +1084,7 @@ mod tests {
 
         let confirm = pb::ControlFrame {
             correlation_id: 5,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::ConfirmProvision(pb::ConfirmProvisionRequest::default())),
         };
         let out = handle_control_frame(confirm, &(MockEnforcer::ok() as Arc<dyn Enforcer>), &prov(), &ec(), &da()).await;
@@ -1015,6 +1121,7 @@ mod tests {
     async fn set_wireless_frame_acks_ok() {
         let ctrl = pb::ControlFrame {
             correlation_id: 9,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::SetWirelessConfig(pb::SetWirelessConfigRequest {
                 config_version: "cfg-1".into(),
                 ssids: Vec::new(),
@@ -1038,6 +1145,7 @@ mod tests {
     async fn set_wireless_frame_acks_error_on_reject() {
         let ctrl = pb::ControlFrame {
             correlation_id: 1,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::SetWirelessConfig(pb::SetWirelessConfigRequest {
                 config_version: "cfg-x".into(),
                 ssids: Vec::new(),
@@ -1060,6 +1168,7 @@ mod tests {
     async fn get_wireless_frame_returns_config_reply() {
         let ctrl = pb::ControlFrame {
             correlation_id: 5,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::GetWirelessConfig(pb::Empty {})),
         };
         let out = handle_control_frame(
@@ -1085,6 +1194,7 @@ mod tests {
         let control = Arc::new(MockControl::default());
         let ctrl = pb::ControlFrame {
             correlation_id: 3,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::SetTierPolicies(pb::SetTierPoliciesRequest {
                 policies: vec![pb::TierPolicy {
                     tier: "vip".into(),
@@ -1111,6 +1221,7 @@ mod tests {
         // expiry_tick 999 is out of [1,60] -> rejected, never silently applied.
         let ctrl = pb::ControlFrame {
             correlation_id: 1,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::SetEngineParameters(pb::SetEngineParametersRequest {
                 accounting_interval_secs: 0,
                 garden_tick_secs: 0,
@@ -1135,6 +1246,7 @@ mod tests {
         let control = Arc::new(MockControl::default());
         let ctrl = pb::ControlFrame {
             correlation_id: 2,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::SetEnforcement(pb::SetEnforcementRequest { enabled: false })),
         };
         let out = handle_control_frame(
@@ -1153,6 +1265,7 @@ mod tests {
     async fn get_engine_info_frame_returns_engine_info() {
         let ctrl = pb::ControlFrame {
             correlation_id: 4,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::GetEngineInfo(pb::Empty {})),
         };
         let out = handle_control_frame(
@@ -1174,6 +1287,7 @@ mod tests {
     async fn get_metrics_frame_returns_metrics() {
         let ctrl = pb::ControlFrame {
             correlation_id: 6,
+            trace_ctx: String::new(),
             msg: Some(control_frame::Msg::GetMetrics(pb::Empty {})),
         };
         let out = handle_control_frame(
@@ -1185,5 +1299,155 @@ mod tests {
         )
         .await;
         assert!(matches!(out[0].msg, Some(engine_frame::Msg::Metrics(_))));
+    }
+
+    // --- trace-context propagation (P0) ------------------------------------
+
+    #[test]
+    fn parse_traceparent_valid_sampled() {
+        let (tid, sid, sampled) =
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").unwrap();
+        assert_eq!(tid, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(sid, "00f067aa0ba902b7");
+        assert!(sampled);
+    }
+
+    #[test]
+    fn parse_traceparent_valid_unsampled() {
+        let (tid, sid, sampled) =
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00").unwrap();
+        assert_eq!(tid, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(sid, "00f067aa0ba902b7");
+        assert!(!sampled);
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_wrong_length() {
+        // Too short, too long, empty, and a trailing extra segment are all rejected.
+        assert!(parse_traceparent("").is_none());
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0").is_none());
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-010").is_none());
+        assert!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-99").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_non_hex() {
+        // A non-hex char in the trace-id (55-byte shape preserved) is rejected.
+        assert!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_bad_version() {
+        // Only version 00 is defined; ff is the reserved/invalid version.
+        assert!(
+            parse_traceparent("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_all_zero_trace_id() {
+        assert!(
+            parse_traceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_all_zero_span_id() {
+        assert!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_frame_echoes_trace_ctx() {
+        // A ControlFrame carrying a traceparent -> the answering ack echoes it back.
+        let mut ctrl = grant_ctrl(7, "aa:bb:cc:dd:ee:ff");
+        ctrl.trace_ctx = TRACEPARENT.to_string();
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &da(),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].trace_ctx, TRACEPARENT, "the ack must echo the inbound trace_ctx");
+    }
+
+    #[tokio::test]
+    async fn revoke_frame_echoes_trace_ctx() {
+        let mut ctrl = revoke_ctrl(3, "aa:bb:cc:dd:ee:ff", false);
+        ctrl.trace_ctx = TRACEPARENT.to_string();
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &da(),
+        )
+        .await;
+        assert_eq!(out[0].trace_ctx, TRACEPARENT);
+    }
+
+    #[tokio::test]
+    async fn list_frames_all_echo_trace_ctx() {
+        // Multi-frame reply (sessions + list_end): EVERY answering frame echoes it.
+        let ctrl = pb::ControlFrame {
+            correlation_id: 9,
+            trace_ctx: TRACEPARENT.to_string(),
+            msg: Some(control_frame::Msg::List(pb::ListRequest {
+                page_size: 0,
+                page_token: String::new(),
+            })),
+        };
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &da(),
+        )
+        .await;
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|f| f.trace_ctx == TRACEPARENT));
+    }
+
+    #[tokio::test]
+    async fn absent_trace_ctx_leaves_echo_empty() {
+        // No inbound context -> answering frames carry an empty trace_ctx (no-op,
+        // exactly as before P0).
+        let out = handle_control_frame(
+            grant_ctrl(7, "aa:bb:cc:dd:ee:ff"),
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &da(),
+        )
+        .await;
+        assert!(out[0].trace_ctx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_trace_ctx_is_echoed_verbatim_but_never_aborts() {
+        // A malformed trace_ctx fails the parse (no span fields recorded) yet the
+        // command still succeeds; the raw value is echoed verbatim (fail-closed on
+        // the parse path, not on the command path).
+        let mut ctrl = grant_ctrl(7, "aa:bb:cc:dd:ee:ff");
+        ctrl.trace_ctx = "not-a-traceparent".to_string();
+        let out = handle_control_frame(
+            ctrl,
+            &(MockEnforcer::ok() as Arc<dyn Enforcer>),
+            &prov(),
+            &ec(),
+            &da(),
+        )
+        .await;
+        assert!(ack_of(&out[0]).ok, "a malformed trace_ctx must not abort the command");
+        assert_eq!(out[0].trace_ctx, "not-a-traceparent");
     }
 }
