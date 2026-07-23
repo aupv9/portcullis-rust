@@ -164,6 +164,14 @@ where
         cmd_rx,
         wireless_status_tx,
         pending_wireless: None,
+        // TODO(reboot-gate): rehydrate last_committed version at boot. Part A
+        // self-heals the ENFORCEMENT gate scope from persistent UCI, but
+        // GetWirelessConfig still reports an empty config_version after a reboot
+        // until the CP re-pushes (last_committed only set on confirm). Rehydrating
+        // it would mean persisting config_version in an owned UCI option and
+        // reconstructing the desired-state from `uci show` here — invasive (touches
+        // the confirm/version-echo path), so deferred to keep the gate self-heal
+        // low-risk. The captive gate itself is correct post-reboot regardless.
         last_committed: None,
         protected_radios,
     };

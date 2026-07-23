@@ -823,6 +823,9 @@ pub struct SsidLiveness {
     /// representative/strongest station signal in dBm (0 = unknown)
     #[prost(int32, tag="5")]
     pub signal_dbm: i32,
+    /// enforcement gate actually scoped to this SSID's bridge (P2)
+    #[prost(bool, tag="6")]
+    pub gate_enforced: bool,
 }
 /// engine -> control plane: a snapshot of on-air liveness across the gated VIFs.
 /// Unsolicited (correlation_id 0), emitted periodically. Missing/absent VIFs are

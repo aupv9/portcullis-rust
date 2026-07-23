@@ -145,6 +145,105 @@ pub fn is_owned_wireless_section(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Strip a single layer of UCI single/double quotes from a `uci show` value.
+/// Shared by the snapshot filter ([`crate::sm`]) and the boot self-heal parser
+/// ([`parse_gated_bridges_from_uci`]) so both read `uci show` output identically.
+pub(crate) fn unquote(v: &str) -> String {
+    let v = v.trim();
+    let bytes = v.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return v[1..v.len() - 1].to_string();
+        }
+    }
+    v.to_string()
+}
+
+/// The section-name suffix on the portal firewall rule an SSID gets IFF it is
+/// gated. See [`render_ssid`] (`firewall.pc_<slug>_portal`).
+const PORTAL_SUFFIX: &str = "_portal";
+
+/// Self-heal the enforcement gate scope from PERSISTENT UCI at boot (P1 reboot
+/// fix). A router reboot survives the on-flash UCI (the gated SSID returns on the
+/// air) but wipes the tmpfs gate scope (`committed.gated`), so the engine would
+/// otherwise fall back to the empty static seed and drop the captive gate —
+/// fail-OPEN. This derives the gate scope purely from what UCI already persists,
+/// with ZERO schema change: `firewall.pc_<slug>_portal=rule` exists in `uci show
+/// firewall` IFF the SSID is gated (only [`render_ssid`] with `spec.gated` emits
+/// it), and `network.pc_<slug>_dev.name` holds that slug's bridge iface.
+///
+/// - From `firewall_show`: every OWNED (`is_owned_wireless_section`) portal rule
+///   `firewall.pc_<slug>_portal=rule` → the gated `<slug>`. Non-owned sections
+///   and non-`pc_` names can never enter (guardrail: br-lan / admin are never
+///   `pc_`-prefixed, so this never gates them).
+/// - From `network_show`: for each gated slug, `network.pc_<slug>_dev.name='br-…'`
+///   → that slug's bridge iface (quotes stripped via [`unquote`]).
+///
+/// Returns the deduped bridge names in a deterministic (sorted) order. A gated
+/// slug whose bridge is absent from `network_show` is skipped (nothing to gate).
+/// PURE: no I/O; [`crate::sm::derive_gated_from_uci`] wraps it with the shell-out.
+pub fn parse_gated_bridges_from_uci(firewall_show: &str, network_show: &str) -> Vec<String> {
+    // 1. Gated slugs: owned `firewall.pc_<slug>_portal=rule` lines.
+    let mut gated_slugs: Vec<String> = Vec::new();
+    for line in firewall_show.lines() {
+        let line = line.trim();
+        let Some((key, raw_val)) = line.split_once('=') else { continue };
+        // Only the section-decl line (`firewall.pc_<slug>_portal=rule`), never an
+        // option line (`firewall.pc_<slug>_portal.target=…`).
+        if key.matches('.').count() != 1 {
+            continue;
+        }
+        // Guardrail: only owner-namespaced (`pc_`) sections — br-lan / admin /
+        // wan are never owned, so they can never be read as gated here.
+        if !is_owned_wireless_section(key) {
+            continue;
+        }
+        if unquote(raw_val) != "rule" {
+            continue;
+        }
+        let Some((_, section)) = key.split_once('.') else { continue };
+        // `pc_<slug>_portal` → `<slug>` (slug may itself contain `_`).
+        let Some(rest) = section.strip_prefix(WIRELESS_SECTION_PREFIX) else { continue };
+        let Some(slug) = rest.strip_suffix(PORTAL_SUFFIX) else { continue };
+        if slug.is_empty() {
+            continue;
+        }
+        let slug = slug.to_string();
+        if !gated_slugs.contains(&slug) {
+            gated_slugs.push(slug);
+        }
+    }
+    if gated_slugs.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Bridge per gated slug: `network.pc_<slug>_dev.name='br-…'`.
+    let mut bridges: Vec<String> = Vec::new();
+    for slug in &gated_slugs {
+        let want = format!("network.{WIRELESS_SECTION_PREFIX}{slug}_dev.name");
+        for line in network_show.lines() {
+            let line = line.trim();
+            let Some((key, raw_val)) = line.split_once('=') else { continue };
+            if key != want {
+                continue;
+            }
+            let br = unquote(raw_val);
+            // Never gate the LAN bridge — belt-and-braces (an owned dev can't be
+            // br-lan by construction, but the gate scope must never include it).
+            if br.is_empty() || RESERVED_BRIDGES.contains(&br.as_str()) {
+                continue;
+            }
+            if !bridges.contains(&br) {
+                bridges.push(br);
+            }
+        }
+    }
+    bridges.sort();
+    bridges
+}
+
 /// Render the `uci set` batch for ONE validated SSID: the owned `pc_<slug>_*`
 /// sections — bridge, interface, one wifi-iface per radio, dhcp, firewall zone,
 /// forwarding, dhcp/dns allow-rules, and (only when `gated`) a portal rule. Each
@@ -1703,5 +1802,93 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
         s.key = String::new();
         assert!(format!("{s:?}").contains("<none>"));
+    }
+
+    // --- P1 boot gate self-heal (parse_gated_bridges_from_uci) -------------
+
+    #[test]
+    fn parse_gated_bridges_only_returns_gated_ssid_bridges() {
+        // `public` is GATED (has a portal rule) on br-public; `staff` is NOT gated
+        // (no portal rule); a foreign lan/br-lan line appears too. Only the gated
+        // SSID's bridge must come back, br-lan never.
+        let firewall = "\
+firewall.pc_public_zone=zone
+firewall.pc_public_zone.name='public'
+firewall.pc_public_portal=rule
+firewall.pc_public_portal.dest_port='8080'
+firewall.pc_staff_zone=zone
+firewall.pc_staff_zone.name='staff'
+firewall.lan=zone
+firewall.lan.name='lan'
+";
+        let network = "\
+network.lan=interface
+network.lan.device='br-lan'
+network.pc_public_dev=device
+network.pc_public_dev.name='br-public'
+network.pc_public_dev.type='bridge'
+network.pc_staff_dev=device
+network.pc_staff_dev.name='br-staff'
+";
+        let bridges = parse_gated_bridges_from_uci(firewall, network);
+        assert_eq!(bridges, vec!["br-public".to_string()]);
+        // never the LAN bridge, never the non-gated SSID's bridge
+        assert!(!bridges.iter().any(|b| b == "br-lan"));
+        assert!(!bridges.iter().any(|b| b == "br-staff"));
+    }
+
+    #[test]
+    fn parse_gated_bridges_multi_gated_dedup_and_sorted() {
+        // Two gated SSIDs (slug with `_` too) → both bridges, deterministic order.
+        let firewall = "\
+firewall.pc_guest_wifi_portal=rule
+firewall.pc_free_portal=rule
+";
+        let network = "\
+network.pc_guest_wifi_dev.name='br-guest'
+network.pc_free_dev.name='br-free'
+";
+        assert_eq!(
+            parse_gated_bridges_from_uci(firewall, network),
+            vec!["br-free".to_string(), "br-guest".to_string()] // sorted
+        );
+    }
+
+    #[test]
+    fn parse_gated_bridges_ignores_non_owned_and_option_lines() {
+        // A `_portal`-suffixed rule that is NOT owner-namespaced (no `pc_`) must be
+        // ignored, and an OPTION line (two dots) is not a section decl.
+        let firewall = "\
+firewall.custom_portal=rule
+firewall.pc_public_portal.target='ACCEPT'
+";
+        let network = "network.pc_public_dev.name='br-public'\n";
+        assert!(parse_gated_bridges_from_uci(firewall, network).is_empty());
+    }
+
+    #[test]
+    fn parse_gated_bridges_empty_when_no_gated_ssid() {
+        // No portal rule anywhere → nothing gated → empty (fall back to seed).
+        let firewall = "firewall.pc_staff_zone=zone\n";
+        let network = "network.pc_staff_dev.name='br-staff'\n";
+        assert!(parse_gated_bridges_from_uci(firewall, network).is_empty());
+    }
+
+    #[test]
+    fn parse_gated_bridges_skips_gated_slug_with_missing_bridge() {
+        // Gated slug present but its bridge decl absent from network → skipped
+        // (nothing to gate) rather than emitting a bogus iface.
+        let firewall = "firewall.pc_public_portal=rule\n";
+        let network = "network.lan.device='br-lan'\n";
+        assert!(parse_gated_bridges_from_uci(firewall, network).is_empty());
+    }
+
+    #[test]
+    fn parse_gated_bridges_never_gates_br_lan_even_if_declared() {
+        // Belt-and-braces: even if a (malformed) owned dev pointed at br-lan, the
+        // RESERVED_BRIDGES guard drops it.
+        let firewall = "firewall.pc_public_portal=rule\n";
+        let network = "network.pc_public_dev.name='br-lan'\n";
+        assert!(parse_gated_bridges_from_uci(firewall, network).is_empty());
     }
 }

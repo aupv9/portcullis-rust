@@ -29,7 +29,7 @@ use std::time::Duration;
 use portcullis_types::{ProvisionError, ProvisionState, SsidResult, WirelessStatus};
 
 use crate::runner::CommandRunner;
-use crate::uci::{self, UciCmd, OWNED_CONFIGS};
+use crate::uci::{self, unquote, UciCmd, OWNED_CONFIGS};
 
 /// tmpfs directory holding the provision snapshot + pending marker. Never flash.
 pub const DEFAULT_STATE_DIR: &str = "/tmp/portcullis/provision";
@@ -229,6 +229,33 @@ fn committed_gated_path(dir: &Path) -> PathBuf {
 pub fn read_committed_gated(state_dir: &Path) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(committed_gated_path(state_dir)).ok()?;
     Some(text.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
+/// Self-heal the gate scope from PERSISTENT UCI at boot (P1 reboot fix). A router
+/// REBOOT keeps the on-flash UCI (the gated SSID beacons again) but wipes the
+/// tmpfs `committed.gated` marker, so [`read_committed_gated`] returns `None` and
+/// the engine would fall back to the (empty, on CP-managed devices) static seed →
+/// the captive gate is lost and the SSID fails OPEN. This shells out to the same
+/// `uci show` sources [`ProvisionMachine::snapshot_wireless`] reads, hands them to
+/// the pure [`uci::parse_gated_bridges_from_uci`], and returns the derived gated
+/// bridge ifaces.
+///
+/// FAIL-SOFT: any error (missing `uci`, non-zero exit) yields an EMPTY list — it
+/// is logged and the caller falls back to the static seed. It NEVER panics and
+/// NEVER writes anything. Mirrors `snapshot_wireless`'s shell-out shape.
+pub async fn derive_gated_from_uci<R: CommandRunner>(runner: &R) -> Vec<String> {
+    let show = |cfg: &'static str| async move {
+        match runner.run(UCI, &["show", cfg]).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                tracing::warn!(config = cfg, error = %e, "boot gate self-heal: `uci show` failed; treating as empty");
+                String::new()
+            }
+        }
+    };
+    let firewall = show("firewall").await;
+    let network = show("network").await;
+    uci::parse_gated_bridges_from_uci(&firewall, &network)
 }
 
 
@@ -537,20 +564,6 @@ fn parse_uci_list(raw: &str) -> Vec<String> {
     raw.split_whitespace().map(unquote).filter(|s| !s.is_empty()).collect()
 }
 
-/// Strip a single layer of UCI single/double quotes from a `uci show` value.
-fn unquote(v: &str) -> String {
-    let v = v.trim();
-    let bytes = v.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            return v[1..v.len() - 1].to_string();
-        }
-    }
-    v.to_string()
-}
-
 /// Convert a raw confirm-timeout (seconds, `0` = default) into a `Duration` for
 /// the watchdog.
 pub fn confirm_window_secs(secs: u32) -> Duration {
@@ -654,6 +667,34 @@ mod tests {
         assert_eq!(unquote("\"ap\""), "ap");
         assert_eq!(unquote("bare"), "bare");
         assert_eq!(unquote("interface"), "interface");
+    }
+
+    #[tokio::test]
+    async fn derive_gated_from_uci_reads_firewall_and_network() {
+        // P1 boot self-heal: shell out to `uci show firewall` + `uci show network`
+        // and return the gated SSID's bridge (via the pure parser).
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args.first() == Some(&"show") {
+                let body = match args.get(1).copied().unwrap_or("") {
+                    "firewall" => "firewall.pc_public_portal=rule\nfirewall.pc_staff_zone=zone\n",
+                    "network" => "network.pc_public_dev.name='br-public'\nnetwork.lan.device='br-lan'\n",
+                    _ => "",
+                };
+                Ok(body.as_bytes().to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        assert_eq!(derive_gated_from_uci(&runner).await, vec!["br-public".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn derive_gated_from_uci_fail_soft_on_uci_error() {
+        // A failing `uci show` (missing binary / non-zero) → empty, never a panic.
+        let runner = RecordingRunner::with_responder(|_prog, _args| {
+            Err(ProvisionError::Apply("uci not found".into()))
+        });
+        assert!(derive_gated_from_uci(&runner).await.is_empty());
     }
 
     // --- CP-managed wireless (P-W1) ----------------------------------------
