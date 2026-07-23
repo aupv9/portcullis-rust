@@ -392,6 +392,16 @@ pub trait RulesetWriter: Send + Sync {
         Ok(())
     }
 
+    /// The CURRENT gated-SSID interface scope enforcement is applied to (P2). Read
+    /// by the liveness poller to report, per gated SSID, whether the enforcement
+    /// gate actually covers its bridge (`gate_enforced`) — surfacing a reboot
+    /// fail-OPEN where the SSID beacons but is un-gated. Read-only, never mutates.
+    /// Default is an empty list for test doubles; the writer actor overrides it to
+    /// read the [`RulesetWriter`]-backing backend's live scope.
+    async fn gated_ifaces(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Add resolved walled-garden IPs to the garden sets (the "engine-resolver
     /// garden": used on stock dnsmasq that lacks `ipset=`, where the engine
     /// resolves each garden FQDN itself and tops up the sets so pre-auth clients
@@ -947,6 +957,11 @@ pub struct SsidLiveness {
     pub stations: u32,
     /// Representative/strongest station signal in dBm (0 = unknown).
     pub signal_dbm: i32,
+    /// Whether the enforcement gate is ACTUALLY scoped to this SSID's bridge (P2).
+    /// `true` = the redirect/gate rules cover this SSID's iface right now; `false`
+    /// = broadcasting but NOT gated (open internet — the reboot fail-OPEN this
+    /// signal surfaces to the CP). Observational, fail-soft (false when unknown).
+    pub gate_enforced: bool,
 }
 
 /// A snapshot of on-air liveness across the engine's gated VIFs (P5). Pushed
