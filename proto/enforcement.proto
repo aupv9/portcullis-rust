@@ -510,6 +510,7 @@ message SsidLiveness {
   bool   broadcasting = 3; // hostapd state == ENABLED (beacon on the air)
   uint32 stations     = 4; // associated station count (assoclist length)
   int32  signal_dbm   = 5; // representative/strongest station signal in dBm (0 = unknown)
+  bool gate_enforced = 6; // enforcement gate actually scoped to this SSID's bridge (P2)
 }
 
 // engine -> control plane: a snapshot of on-air liveness across the gated VIFs.

@@ -375,6 +375,7 @@ pub fn wireless_liveness_to_pb(lv: &WirelessLiveness) -> pb::WirelessLiveness {
                 broadcasting: s.broadcasting,
                 stations: s.stations,
                 signal_dbm: s.signal_dbm,
+                gate_enforced: s.gate_enforced,
             })
             .collect(),
         ts_unix: lv.ts_unix,

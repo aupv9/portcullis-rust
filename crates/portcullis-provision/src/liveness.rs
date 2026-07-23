@@ -40,7 +40,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use portcullis_types::{Provisioner, SsidLiveness, WirelessLiveness};
+use portcullis_types::{Provisioner, RulesetWriter, SsidLiveness, WirelessLiveness};
 use tokio::sync::mpsc;
 
 use crate::runner::CommandRunner;
@@ -67,6 +67,7 @@ pub const LIVENESS_BUFFER: usize = 4;
 pub async fn run_liveness_poller<R: CommandRunner>(
     runner: Arc<R>,
     provisioner: Arc<dyn Provisioner>,
+    writer: Arc<dyn RulesetWriter>,
     tx: mpsc::Sender<WirelessLiveness>,
     interval: Duration,
 ) {
@@ -75,7 +76,7 @@ pub async fn run_liveness_poller<R: CommandRunner>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        let snapshot = poll_once(runner.as_ref(), provisioner.as_ref()).await;
+        let snapshot = poll_once(runner.as_ref(), provisioner.as_ref(), writer.as_ref()).await;
         match tx.try_send(snapshot) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -92,7 +93,11 @@ pub async fn run_liveness_poller<R: CommandRunner>(
 /// One liveness sweep: read committed gated SSIDs, resolve their VIFs, and probe
 /// each. Never fails — an error anywhere yields a thinner (possibly empty)
 /// snapshot. Public for on-device diagnostics + so the poll loop stays trivial.
-pub async fn poll_once<R: CommandRunner>(runner: &R, provisioner: &dyn Provisioner) -> WirelessLiveness {
+pub async fn poll_once<R: CommandRunner>(
+    runner: &R,
+    provisioner: &dyn Provisioner,
+    writer: &dyn RulesetWriter,
+) -> WirelessLiveness {
     let ts_unix = unix_now();
 
     // Committed desired-state (introspection). If unavailable, there is nothing
@@ -112,6 +117,16 @@ pub async fn poll_once<R: CommandRunner>(runner: &R, provisioner: &dyn Provision
     if gated.is_empty() {
         return WirelessLiveness { config_version, per_ssid: Vec::new(), ts_unix };
     }
+
+    // P2: the enforcement writer's CURRENT gated-iface scope (bridge names). Read
+    // once per tick, fail-soft — an error yields an empty scope so gate_enforced
+    // reports `false` (conservative: "not known to be gated"), never a panic or a
+    // false "gated". This is the signal that surfaces the reboot fail-OPEN: an SSID
+    // that is broadcasting but whose bridge is NOT in this scope is un-gated.
+    let gated_scope = writer.gated_ifaces().await.unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "liveness: could not read gated-iface scope; gate_enforced=false");
+        Vec::new()
+    });
 
     // Resolve slug -> VIF once (single `ubus call network.wireless status`), then
     // probe each VIF. An unresolvable slug is omitted (unknown, not "down").
@@ -133,7 +148,11 @@ pub async fn poll_once<R: CommandRunner>(runner: &R, provisioner: &dyn Provision
             // No VIF for this slug in ubus output — skip (unknown state).
             continue;
         };
-        per_ssid.push(probe_vif(runner, &spec.slug, &iface).await);
+        let mut row = probe_vif(runner, &spec.slug, &iface).await;
+        // gate_enforced = the enforcement scope actually covers THIS SSID's bridge
+        // (the gate is keyed on the bridge iface, e.g. `br-public`, not the VIF).
+        row.gate_enforced = gated_scope.iter().any(|b| b == &spec.bridge_name);
+        per_ssid.push(row);
     }
 
     WirelessLiveness { config_version, per_ssid, ts_unix }
@@ -175,7 +194,16 @@ async fn probe_vif<R: CommandRunner>(runner: &R, slug: &str, iface: &str) -> Ssi
         .unwrap_or_default();
     let (stations, signal_dbm) = assoclist_stats(&assoc_json);
 
-    SsidLiveness { slug: slug.to_string(), iface: iface.to_string(), broadcasting, stations, signal_dbm }
+    // `gate_enforced` is filled in by the caller ([`poll_once`]), which holds the
+    // enforcement scope + this SSID's bridge; the probe only knows the VIF.
+    SsidLiveness {
+        slug: slug.to_string(),
+        iface: iface.to_string(),
+        broadcasting,
+        stations,
+        signal_dbm,
+        gate_enforced: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,5 +390,146 @@ mod tests {
         assert_eq!(assoclist_stats(r#"{"results":[]}"#), (0, 0));
         assert_eq!(assoclist_stats("not json"), (0, 0));
         assert_eq!(assoclist_stats("{}"), (0, 0));
+    }
+
+    // --- gate_enforced (P2) --------------------------------------------------
+
+    use async_trait::async_trait;
+    use portcullis_types::{ProvisionError, Result, SsidSpec, WirelessDesiredState};
+
+    use crate::runner::RecordingRunner;
+
+    /// A `Provisioner` that returns a fixed committed desired-state.
+    struct FixedProvisioner(WirelessDesiredState);
+    #[async_trait]
+    impl Provisioner for FixedProvisioner {
+        async fn set_wireless(&self, _s: WirelessDesiredState) -> std::result::Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn confirm_wireless(&self, _v: &str) -> std::result::Result<(), ProvisionError> {
+            Ok(())
+        }
+        async fn get_wireless(&self) -> std::result::Result<WirelessDesiredState, ProvisionError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A `RulesetWriter` test double that reports a fixed gated-iface scope (and
+    /// only implements the reader; every mutation uses the trait default no-op).
+    struct FixedScopeWriter(Vec<String>);
+    #[async_trait]
+    impl RulesetWriter for FixedScopeWriter {
+        async fn ensure_base(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn add_auth(&self, _mac: portcullis_types::MacAddr, _ttl: Duration) -> Result<()> {
+            Ok(())
+        }
+        async fn del_auth(&self, _mac: portcullis_types::MacAddr) -> Result<()> {
+            Ok(())
+        }
+        async fn list_auth(&self) -> Result<Vec<portcullis_types::AuthElement>> {
+            Ok(Vec::new())
+        }
+        async fn gated_ifaces(&self) -> Result<Vec<String>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn gated_spec(slug: &str, bridge: &str) -> SsidSpec {
+        SsidSpec {
+            slug: slug.into(),
+            ssid: format!("Wifi {slug}"),
+            radios: vec!["radio0".into()],
+            encryption: "none".into(),
+            key: String::new(),
+            hidden: false,
+            isolate: true,
+            gated: true,
+            bridge_name: bridge.into(),
+            ipaddr: "10.0.0.1".into(),
+            netmask: "255.255.255.0".into(),
+            dhcp_start: "10".into(),
+            dhcp_limit: "200".into(),
+            dhcp_leasetime: "2h".into(),
+            dhcp_disabled: false,
+            egress_zone: String::new(),
+            ..SsidSpec::default()
+        }
+    }
+
+    /// `ubus network.wireless status` mapping the two slugs' VIFs; every other
+    /// command (hostapd/iwinfo/assoclist) returns empty (best-effort thin probe).
+    fn wireless_status_runner() -> RecordingRunner {
+        RecordingRunner::with_responder(|prog, args| {
+            if prog == UBUS && args == ["call", "network.wireless", "status"] {
+                let json = r#"{
+                    "radio0": { "interfaces": [
+                        { "section": "pc_public_ap", "ifname": "wlan0" },
+                        { "section": "pc_guest_ap",  "ifname": "wlan1" }
+                    ] }
+                }"#;
+                Ok(json.as_bytes().to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn poll_once_sets_gate_enforced_from_writer_scope() {
+        // Two gated SSIDs; only `br-public` is in the enforcement scope → `public`
+        // reports gate_enforced=true, `guest` (broadcasting but un-gated — the
+        // reboot fail-OPEN) reports false.
+        let desired = WirelessDesiredState {
+            config_version: "cfg-1".into(),
+            ssids: vec![gated_spec("public", "br-public"), gated_spec("guest", "br-guest")],
+            confirm_timeout_secs: 0,
+            peer_allows: Vec::new(),
+        };
+        let prov = FixedProvisioner(desired);
+        let writer = FixedScopeWriter(vec!["br-public".to_string()]);
+        let runner = wireless_status_runner();
+
+        let snap = poll_once(&runner, &prov, &writer).await;
+        assert_eq!(snap.per_ssid.len(), 2);
+        let public = snap.per_ssid.iter().find(|s| s.slug == "public").unwrap();
+        let guest = snap.per_ssid.iter().find(|s| s.slug == "guest").unwrap();
+        assert!(public.gate_enforced, "public's bridge is in scope → gated");
+        assert!(!guest.gate_enforced, "guest broadcasts but is NOT in scope → fail-OPEN");
+    }
+
+    #[tokio::test]
+    async fn poll_once_gate_enforced_false_when_scope_read_fails() {
+        // A writer whose scope read errors → gate_enforced=false (conservative),
+        // never a panic (fail-soft).
+        struct FailingWriter;
+        #[async_trait]
+        impl RulesetWriter for FailingWriter {
+            async fn ensure_base(&self) -> Result<()> {
+                Ok(())
+            }
+            async fn add_auth(&self, _m: portcullis_types::MacAddr, _t: Duration) -> Result<()> {
+                Ok(())
+            }
+            async fn del_auth(&self, _m: portcullis_types::MacAddr) -> Result<()> {
+                Ok(())
+            }
+            async fn list_auth(&self) -> Result<Vec<portcullis_types::AuthElement>> {
+                Ok(Vec::new())
+            }
+            async fn gated_ifaces(&self) -> Result<Vec<String>> {
+                Err(portcullis_types::Error::NftTransaction("boom".into()))
+            }
+        }
+        let desired = WirelessDesiredState {
+            config_version: "cfg-1".into(),
+            ssids: vec![gated_spec("public", "br-public")],
+            confirm_timeout_secs: 0,
+            peer_allows: Vec::new(),
+        };
+        let snap = poll_once(&wireless_status_runner(), &FixedProvisioner(desired), &FailingWriter).await;
+        assert_eq!(snap.per_ssid.len(), 1);
+        assert!(!snap.per_ssid[0].gate_enforced);
     }
 }

@@ -108,18 +108,49 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
         };
     w.mgr.set_shaper(shaper);
 
-    // F2: restore the enforcement scope from the last committed CP-managed
-    // wireless config (persisted to tmpfs on confirm). Survives a daemon restart
-    // — the auth set was already adopted above (kernel-as-truth); this re-applies
-    // the gated-SSID iface set so a CP-provisioned gated SSID keeps its captive
-    // gate across the restart, before the CP reconnects. `None` = no committed
-    // config → keep the static seed. Best-effort (never blocks startup).
-    if let Some(gated) = portcullis_provision::read_committed_gated(std::path::Path::new(
-        portcullis_provision::DEFAULT_STATE_DIR,
-    )) {
-        match writer.set_gated_ifaces(gated.clone()).await {
-            Ok(()) => tracing::info!(gated_ifaces = ?gated, "restored enforcement scope from committed wireless config"),
-            Err(e) => tracing::warn!(error = %e, "boot re-scope from committed wireless config failed; using static seed"),
+    // F2 + P1 boot gate self-heal: restore the enforcement scope BEFORE dialing
+    // the control channel, so a CP-provisioned gated SSID keeps its captive gate
+    // as early as possible (the auth set was already adopted above —
+    // kernel-as-truth). Fallback chain, most-authoritative first:
+    //
+    //   1. tmpfs `committed.gated` (survives a DAEMON restart, wiped by a REBOOT).
+    //   2. On a REBOOT the tmpfs marker is gone but the on-flash UCI still beacons
+    //      the gated SSID — so DERIVE the gate scope from persistent UCI
+    //      (`firewall.pc_<slug>_portal` exists iff gated → its bridge). This closes
+    //      the silent security hole where, post-reboot, the engine fell back to the
+    //      (empty, on CP-managed devices) static seed and the SSID went OPEN with no
+    //      captive portal — a fail-OPEN that violates invariant #5.
+    //   3. Static seed (`hotspot_iface`) — the pre-P-W1 single-SSID config.
+    //
+    // Best-effort throughout: this NEVER blocks or panics startup. Only skip the
+    // re-scope entirely when every source is empty (nothing to gate).
+    {
+        let (gated, source) = match portcullis_provision::read_committed_gated(
+            std::path::Path::new(portcullis_provision::DEFAULT_STATE_DIR),
+        ) {
+            Some(g) => (g, "committed.gated (tmpfs)"),
+            None => {
+                // Reboot path: tmpfs marker gone → self-heal from persistent UCI.
+                let derived =
+                    portcullis_provision::derive_gated_from_uci(&portcullis_provision::ProcessRunner)
+                        .await;
+                if derived.is_empty() {
+                    (gated_ifaces(&cfg), "static seed (no UCI-derived gate)")
+                } else {
+                    (derived, "persistent UCI (reboot self-heal)")
+                }
+            }
+        };
+        if gated.is_empty() {
+            tracing::info!(
+                source,
+                "boot gate self-heal: no gated ifaces to restore; keeping backend default scope"
+            );
+        } else {
+            match writer.set_gated_ifaces(gated.clone()).await {
+                Ok(()) => tracing::info!(gated_ifaces = ?gated, source, "restored enforcement gate scope at boot"),
+                Err(e) => tracing::warn!(error = %e, source, "boot gate re-scope failed; prior scope kept"),
+            }
         }
     }
 
@@ -168,10 +199,15 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     {
         let runner = Arc::new(portcullis_provision::ProcessRunner);
         let prov = provisioner.clone();
+        // P2: give the poller a read-only view of the enforcement gate scope so it
+        // can report per-SSID `gate_enforced` (surfacing a reboot fail-OPEN where a
+        // gated SSID beacons but its bridge is not in the gate scope).
+        let liveness_writer = writer.clone();
         tasks.push(tokio::spawn(async move {
             portcullis_provision::run_liveness_poller(
                 runner,
                 prov,
+                liveness_writer,
                 liveness_tx,
                 portcullis_provision::DEFAULT_POLL_INTERVAL,
             )

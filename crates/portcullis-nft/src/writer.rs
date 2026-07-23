@@ -42,6 +42,7 @@ enum Command {
         ifaces: Vec<String>,
         reply: oneshot::Sender<Result<()>>,
     },
+    GetGatedIfaces(oneshot::Sender<Result<Vec<String>>>),
     AddGarden {
         ips: Vec<std::net::IpAddr>,
         reply: oneshot::Sender<Result<()>>,
@@ -92,6 +93,10 @@ impl RulesetWriter for WriterHandle {
 
     async fn set_gated_ifaces(&self, ifaces: Vec<String>) -> Result<()> {
         self.call(|reply| Command::SetGatedIfaces { ifaces, reply }).await
+    }
+
+    async fn gated_ifaces(&self) -> Result<Vec<String>> {
+        self.call(Command::GetGatedIfaces).await
     }
 
     async fn add_garden(&self, ips: &[std::net::IpAddr]) -> Result<()> {
@@ -171,6 +176,12 @@ impl WriterActor {
                     let r = retry_once(|| self.backend.set_gated_ifaces(ifaces.clone())).await;
                     self.count_err(&r);
                     let _ = reply.send(r);
+                }
+                Command::GetGatedIfaces(reply) => {
+                    // Read-only introspection (P2 liveness gate_enforced signal): no
+                    // retry, not a txn error — a failed read just yields a thinner
+                    // liveness snapshot at the caller (fail-soft), never fail-open.
+                    let _ = reply.send(self.backend.gated_ifaces().await);
                 }
                 Command::AddGarden { ips, reply } => {
                     // add_garden is itself fail-open per element (Ok even when an
