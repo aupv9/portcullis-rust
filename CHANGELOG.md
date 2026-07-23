@@ -4,6 +4,27 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.16.0] — 2026-07-23
+
+### Fixed
+- **Reboot gate-loss (silent fail-open) — self-heal from UCI at boot.** After a
+  reboot the engine's tmpfs runtime state (`/tmp/portcullis/committed.gated`) is
+  wiped, so a previously-gated SSID came back on-air with NO captive gate (the
+  `wifihub_pre`/`wifihub_fwd` chains are created but never jumped from
+  PREROUTING/FORWARD) while the control-plane manual-apply reconcile stayed silent
+  — a silent fail-open (violates invariant #5). The engine now re-derives the
+  gated bridges from durable UCI at boot (presence of the `pc_<slug>_portal`
+  section ⟺ gated) and re-scopes enforcement BEFORE dialing the control plane,
+  closing the window without depending on a CP re-push. Fail-closed, independent
+  of the CP. Confirmed on-device: RUT906 reboot with v0.15.0 reproduced the
+  fail-open; this fix restores the gate at boot.
+
+### Added
+- **Per-SSID `gate_enforced` liveness signal** — the liveness poller reports
+  whether the enforcement gate is actually scoped to each SSID's bridge, so the CP
+  can raise an "SSID up but UNGATED" alert. Deploy this engine BEFORE the CP alert
+  (proto3 absent == false) to avoid a false-alarm storm.
+
 ## [0.15.0] — 2026-07-23
 
 ### Added
