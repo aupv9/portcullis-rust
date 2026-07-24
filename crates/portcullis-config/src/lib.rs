@@ -68,6 +68,15 @@ pub struct Config {
     #[serde(default)]
     pub wireless_protected_radios: Vec<String>,
 
+    /// Wireless liveness poll cadence (seconds): how often the engine reads its LIVE
+    /// owned WiFi config off UCI and reports it up for CP-SOT drift detection. Config
+    /// drift is rare (an operator/manual edit), so this is coarse — default 300 (5 min).
+    /// A longer period only delays drift detection and the post-apply "committed"
+    /// re-confirm; it never affects enforcement (the poll is read-only). Clamped to a
+    /// >=15 s floor at startup. The `PC_LIVENESS_POLL_SECS` env var, if set, overrides it.
+    #[serde(default = "default_liveness_poll_secs")]
+    pub liveness_poll_secs: u64,
+
     /// Path to the HMAC key file (§13 — the key lives outside this config).
     pub hmac_key_file: String,
 
@@ -175,6 +184,10 @@ fn default_keepalive_secs() -> u64 {
     20
 }
 
+fn default_liveness_poll_secs() -> u64 {
+    300
+}
+
 impl Default for Config {
     fn default() -> Self {
         // Mirrors the §9 example.
@@ -186,6 +199,7 @@ impl Default for Config {
             control_reconnect_max_secs: default_reconnect_max_secs(),
             control_keepalive_secs: default_keepalive_secs(),
             wireless_protected_radios: Vec::new(),
+            liveness_poll_secs: default_liveness_poll_secs(),
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
             responder_port: 8080,
             accounting_interval: 15,
@@ -411,6 +425,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "cp_server_name" => cfg.cp_server_name = val.to_string(),
         "control_reconnect_max_secs" => cfg.control_reconnect_max_secs = parse_u64(val)?,
         "control_keepalive_secs" => cfg.control_keepalive_secs = parse_u64(val)?,
+        "liveness_poll_secs" => cfg.liveness_poll_secs = parse_u64(val)?,
         "hmac_key_file" => cfg.hmac_key_file = val.to_string(),
         "responder_port" => cfg.responder_port = parse_u16(val)?,
         "accounting_interval" => cfg.accounting_interval = parse_u64(val)?,
@@ -558,6 +573,7 @@ config portcullis 'main'
     option default_ttl        '1800'
     option default_quota_mb   '0'
     option default_rate_kbps  '2048'
+    option liveness_poll_secs '300'                               # wireless drift poll cadence (5 min)
     list   garden_fqdn        'portal.wifihub.vn'
     list   garden_fqdn        'cdn.wifihub.vn'
     list   garden_fqdn        'otp.gateway'
@@ -576,6 +592,7 @@ config portcullis 'main'
         assert_eq!(cfg.default_ttl, 1800);
         assert_eq!(cfg.default_quota_mb, 0);
         assert_eq!(cfg.default_rate_kbps, 2048);
+        assert_eq!(cfg.liveness_poll_secs, 300);
         assert_eq!(
             cfg.garden_fqdn,
             vec![
@@ -655,6 +672,8 @@ config portcullis 'main'
             control_keepalive_secs: 20,
             // non-default so the roundtrip actually exercises the field.
             wireless_protected_radios: vec!["radio0".to_string()],
+            // non-default so the roundtrip actually exercises the field.
+            liveness_poll_secs: 120,
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
             responder_port: 8080,
             accounting_interval: 15,
