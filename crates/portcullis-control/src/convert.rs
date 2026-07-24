@@ -376,9 +376,15 @@ pub fn wireless_liveness_to_pb(lv: &WirelessLiveness) -> pb::WirelessLiveness {
                 stations: s.stations,
                 signal_dbm: s.signal_dbm,
                 gate_enforced: s.gate_enforced,
+                ssid: s.ssid.clone(),
+                bridge: s.bridge.clone(),
+                gated: s.gated,
+                encryption: s.encryption.clone(),
+                enabled: s.enabled,
             })
             .collect(),
         ts_unix: lv.ts_unix,
+        observed_fingerprint: lv.observed_fingerprint.clone(),
     }
 }
 

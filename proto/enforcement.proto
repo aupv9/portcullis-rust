@@ -503,7 +503,10 @@ message WirelessConfig {
 // purely observational — never affects enforcement or config.
 // ---------------------------------------------------------------------------
 
-// Observed radio state of one gated SSID's VIF.
+// Observed radio state of one gated SSID's VIF, merged with the OBSERVED config
+// read from LIVE UCI (CP-SOT: the engine reports what the device actually has,
+// not the last committed echo). Fields 1..6 are the on-air probe; 7..11 are the
+// observed owned-section summary parsed from `uci show`.
 message SsidLiveness {
   string slug         = 1; // owner-namespace slug (matches WirelessSsid.slug)
   string iface        = 2; // observed VIF, e.g. "wlan0" / "phy0-ap0" (NOT the bridge)
@@ -511,6 +514,11 @@ message SsidLiveness {
   uint32 stations     = 4; // associated station count (assoclist length)
   int32  signal_dbm   = 5; // representative/strongest station signal in dBm (0 = unknown)
   bool gate_enforced = 6; // enforcement gate actually scoped to this SSID's bridge (P2)
+  string ssid       = 7;  // observed SSID name from live UCI (wireless.pc_<slug>_ap*.ssid)
+  string bridge     = 8;  // observed bridge iface from live UCI (network.pc_<slug>_dev.name)
+  bool   gated      = 9;  // observed gated posture from live UCI (firewall.pc_<slug>_portal exists)
+  string encryption = 10; // observed encryption from live UCI (wireless.pc_<slug>_ap*.encryption)
+  bool   enabled    = 11; // observed enabled posture from live UCI (wifi-iface not `disabled '1'`)
 }
 
 // engine -> control plane: a snapshot of on-air liveness across the gated VIFs.
@@ -520,6 +528,7 @@ message WirelessLiveness {
   string config_version = 1;         // the committed config this snapshot reflects (best-effort)
   repeated SsidLiveness per_ssid = 2;
   int64  ts_unix = 3;                // engine wall-clock when the snapshot was taken
+  string observed_fingerprint = 4;   // stable hash over the canonicalized OBSERVED owned-section set (live UCI); moves iff owned config changed
 }
 
 message Empty {}

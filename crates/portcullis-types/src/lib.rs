@@ -999,6 +999,23 @@ pub struct SsidLiveness {
     /// = broadcasting but NOT gated (open internet — the reboot fail-OPEN this
     /// signal surfaces to the CP). Observational, fail-soft (false when unknown).
     pub gate_enforced: bool,
+    /// Observed SSID name from LIVE UCI (`wireless.pc_<slug>_ap*.ssid`). Empty when
+    /// the section is absent. CP-SOT: what the device actually advertises, not the
+    /// last committed echo.
+    pub ssid: String,
+    /// Observed bridge iface from LIVE UCI (`network.pc_<slug>_dev.name`). Empty
+    /// when absent.
+    pub bridge: String,
+    /// Observed gated posture from LIVE UCI: the owned portal rule
+    /// (`firewall.pc_<slug>_portal`) exists. This is the device's real captive
+    /// posture, independent of the in-memory committed state.
+    pub gated: bool,
+    /// Observed encryption from LIVE UCI (`wireless.pc_<slug>_ap*.encryption`).
+    /// Empty when absent (defaults to `none` on render).
+    pub encryption: String,
+    /// Observed enabled posture from LIVE UCI: the wifi-iface is not administratively
+    /// disabled (`disabled '1'`). `true` unless UCI says disabled.
+    pub enabled: bool,
 }
 
 /// A snapshot of on-air liveness across the engine's gated VIFs (P5). Pushed
@@ -1011,6 +1028,11 @@ pub struct WirelessLiveness {
     pub per_ssid: Vec<SsidLiveness>,
     /// Engine wall-clock (unix secs) when the snapshot was taken.
     pub ts_unix: i64,
+    /// Stable hash over the canonicalized OBSERVED owned-section set read from LIVE
+    /// UCI (CP-SOT). Moves iff the device's owned `pc_*` config actually changed —
+    /// the CP compares it to detect drift without re-reading the whole snapshot, and
+    /// the change-detected trigger uses it to suppress no-op emits.
+    pub observed_fingerprint: String,
 }
 
 /// One observed device on an owned **device** SSID (P3 per-device telemetry).
