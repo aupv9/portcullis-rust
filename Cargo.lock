@@ -722,6 +722,7 @@ dependencies = [
  "portcullis-nft",
  "portcullis-types",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

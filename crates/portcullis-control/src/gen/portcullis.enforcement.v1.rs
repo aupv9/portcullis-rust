@@ -804,7 +804,10 @@ pub struct WirelessConfig {
 // purely observational — never affects enforcement or config.
 // ---------------------------------------------------------------------------
 
-/// Observed radio state of one gated SSID's VIF.
+/// Observed radio state of one gated SSID's VIF, merged with the OBSERVED config
+/// read from LIVE UCI (CP-SOT: the engine reports what the device actually has,
+/// not the last committed echo). Fields 1..6 are the on-air probe; 7..11 are the
+/// observed owned-section summary parsed from `uci show`.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SsidLiveness {
@@ -826,6 +829,21 @@ pub struct SsidLiveness {
     /// enforcement gate actually scoped to this SSID's bridge (P2)
     #[prost(bool, tag="6")]
     pub gate_enforced: bool,
+    /// observed SSID name from live UCI (wireless.pc_<slug>_ap*.ssid)
+    #[prost(string, tag="7")]
+    pub ssid: ::prost::alloc::string::String,
+    /// observed bridge iface from live UCI (network.pc_<slug>_dev.name)
+    #[prost(string, tag="8")]
+    pub bridge: ::prost::alloc::string::String,
+    /// observed gated posture from live UCI (firewall.pc_<slug>_portal exists)
+    #[prost(bool, tag="9")]
+    pub gated: bool,
+    /// observed encryption from live UCI (wireless.pc_<slug>_ap*.encryption)
+    #[prost(string, tag="10")]
+    pub encryption: ::prost::alloc::string::String,
+    /// observed enabled posture from live UCI (wifi-iface not `disabled '1'`)
+    #[prost(bool, tag="11")]
+    pub enabled: bool,
 }
 /// engine -> control plane: a snapshot of on-air liveness across the gated VIFs.
 /// Unsolicited (correlation_id 0), emitted periodically. Missing/absent VIFs are
@@ -841,6 +859,9 @@ pub struct WirelessLiveness {
     /// engine wall-clock when the snapshot was taken
     #[prost(int64, tag="3")]
     pub ts_unix: i64,
+    /// stable hash over the canonicalized OBSERVED owned-section set (live UCI); moves iff owned config changed
+    #[prost(string, tag="4")]
+    pub observed_fingerprint: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
