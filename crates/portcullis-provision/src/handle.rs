@@ -1,14 +1,24 @@
 //! The provision subsystem's actor: a cloneable [`ProvisionHandle`] (implements
 //! [`Provisioner`]) that sends commands over an mpsc to a single owner task
 //! ([`run_provision_subsystem`]), mirroring the nft writer-actor shape. The task
-//! owns the [`ProvisionMachine`] + the commit-confirm watchdog and emits
-//! `WirelessStatus` upward on a bounded channel that `portcullis-control` fans
-//! into outbound `EngineFrame`s.
+//! owns the [`ProvisionMachine`] and emits `WirelessStatus` upward on a bounded
+//! channel that `portcullis-control` fans into outbound `EngineFrame`s.
+//!
+//! ## Apply-and-ACK (CP-SOT, P2)
+//! Wireless is namespaced to the owned `pc_*` sections — it can NEVER touch the
+//! LAN / WAN / dial-out path, so a bad push cannot brick the router's own
+//! connectivity the way a raw `network`/`firewall` commit-confirm exists to guard.
+//! So the subsystem APPLIES the config and ACKs immediately (emits `Committed`,
+//! sets the gate scope from live UCI, returns ok) rather than holding the change
+//! under a commit-confirm watchdog + timed rollback. A local apply FAILURE still
+//! reverts to the pre-apply snapshot (fail-OPEN). See
+//! `docs/design/confirm-on-reconnect.md` for the RISK-op pattern that DOES need
+//! commit-confirm (the dial-out-touching ops), which wireless is deliberately not.
 //!
 //! ## Isolation (guardrail)
 //! This runs as its OWN Tokio task. Every side-effecting step is awaited inside
 //! the task and its result is matched — a provision error becomes a status /
-//! rollback, never a panic that could unwind into the enforcement tasks. The
+//! local revert, never a panic that could unwind into the enforcement tasks. The
 //! composition root spawns it separately and aborts it on shutdown like the
 //! other subsystems.
 //!
@@ -16,17 +26,14 @@
 //! No `AtomicU64` (the RUTM11 is 32-bit MIPS): the single owner task holds all
 //! mutable state directly; the handle carries only an `mpsc::Sender`.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use portcullis_types::{
     ProvisionError, ProvisionState, Provisioner, SsidResult, WirelessDesiredState, WirelessStatus,
 };
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 
 use crate::runner::CommandRunner;
-use crate::sm::{self, ProvisionMachine, Snapshot, WirelessMarker};
+use crate::sm::{self, ProvisionMachine};
 use crate::uci;
 
 /// Bound on the command channel — provision commands are rare (a handful of CP
@@ -101,29 +108,10 @@ impl Provisioner for ProvisionHandle {
     }
 }
 
-/// The pending commit-confirm state for a CP-managed wireless push (P-W1):
-/// carries the multi-radio reload set, the owned sections present after apply
-/// (for the rollback delete), the per-SSID results (echoed in status), and the
-/// desired state (cached as last-committed on confirm).
-struct WirelessPending {
-    config_version: String,
-    radios: Vec<String>,
-    current_sections: Vec<String>,
-    /// Gated-SSID bridge ifaces (enforcement scope) — persisted in the marker so a
-    /// confirm after a mid-window restart writes the correct committed-gated set
-    /// even though `desired` is not reconstructed (P0 #2).
-    gated_ifaces: Vec<String>,
-    per_ssid: Vec<SsidResult>,
-    deadline: Instant,
-    snapshot: Snapshot,
-    desired: WirelessDesiredState,
-}
-
 /// Spawn the provision subsystem. Returns:
 /// - a cloneable [`ProvisionHandle`] to pass into the control channel;
 /// - an mpsc [`Receiver`](mpsc::Receiver) of [`WirelessStatus`] (P-W1), fanned by
-///   the composition root into outbound `EngineFrame`s (unsolicited on watchdog
-///   rollback);
+///   the composition root into outbound `EngineFrame`s;
 /// - the actor's [`JoinHandle`](tokio::task::JoinHandle) (abort on shutdown).
 ///
 /// `state_dir` is the tmpfs directory ([`sm::DEFAULT_STATE_DIR`] on-device).
@@ -163,15 +151,13 @@ where
         machine,
         cmd_rx,
         wireless_status_tx,
-        pending_wireless: None,
-        // TODO(reboot-gate): rehydrate last_committed version at boot. Part A
-        // self-heals the ENFORCEMENT gate scope from persistent UCI, but
-        // GetWirelessConfig still reports an empty config_version after a reboot
-        // until the CP re-pushes (last_committed only set on confirm). Rehydrating
-        // it would mean persisting config_version in an owned UCI option and
-        // reconstructing the desired-state from `uci show` here — invasive (touches
-        // the confirm/version-echo path), so deferred to keep the gate self-heal
-        // low-risk. The captive gate itself is correct post-reboot regardless.
+        // TODO(reboot-gate): rehydrate last_committed version at boot. The boot
+        // gate self-heal restores the ENFORCEMENT gate scope from persistent UCI,
+        // but GetWirelessConfig still reports an empty config_version after a reboot
+        // until the CP re-pushes (last_committed only set on apply). Rehydrating it
+        // would mean persisting config_version in an owned UCI option and
+        // reconstructing the desired-state from `uci show` here — invasive, so
+        // deferred. The captive gate itself is correct post-reboot regardless.
         last_committed: None,
         protected_radios,
     };
@@ -184,7 +170,6 @@ struct ProvisionActor<R: CommandRunner> {
     machine: ProvisionMachine<R>,
     cmd_rx: mpsc::Receiver<Command>,
     wireless_status_tx: mpsc::Sender<WirelessStatus>,
-    pending_wireless: Option<WirelessPending>,
     /// Last COMMITTED wireless desired-state (served by `get_wireless`).
     last_committed: Option<WirelessDesiredState>,
     /// Layer A: radios owned SSIDs may not target (admin/management radio).
@@ -194,37 +179,24 @@ struct ProvisionActor<R: CommandRunner> {
 
 impl<R: CommandRunner> ProvisionActor<R> {
     async fn run(mut self) {
-        // Crash-recovery reconcile: an unconfirmed wireless push from a previous
-        // process incarnation. Past deadline → roll back NOW; still within the
-        // window → resume the watchdog for the remainder.
-        self.reconcile_wireless_on_start().await;
-
-        loop {
-            // Watchdog sleep: armed only while a push is pending confirmation.
-            let wl_sleep =
-                self.pending_wireless.as_ref().map(|p| tokio::time::sleep_until(p.deadline));
-
-            tokio::select! {
-                cmd = self.cmd_rx.recv() => match cmd {
-                    Some(Command::Set { state, reply }) => {
-                        let r = self.handle_set_wireless(*state).await;
-                        let _ = reply.send(r);
-                    }
-                    Some(Command::Confirm { config_version, reply }) => {
-                        let r = self.handle_confirm_wireless(&config_version).await;
-                        let _ = reply.send(r);
-                    }
-                    Some(Command::Get { reply }) => {
-                        let _ = reply.send(Ok(self.last_committed.clone().unwrap_or_default()));
-                    }
-                    None => break, // all handles dropped -> shut down
-                },
-                // Only armed when a push is pending confirmation.
-                _ = maybe_sleep(wl_sleep) => {
-                    self.handle_wireless_watchdog_fire().await;
+        // Apply-and-ACK (CP-SOT, P2): no commit-confirm watchdog, so nothing to
+        // reconcile at start (an interrupted apply is just re-pushed by the CP).
+        while let Some(cmd) = self.cmd_rx.recv().await {
+            match cmd {
+                Command::Set { state, reply } => {
+                    let r = self.handle_set_wireless(*state).await;
+                    let _ = reply.send(r);
+                }
+                Command::Confirm { config_version, reply } => {
+                    let r = self.handle_confirm_wireless(&config_version).await;
+                    let _ = reply.send(r);
+                }
+                Command::Get { reply } => {
+                    let _ = reply.send(Ok(self.last_committed.clone().unwrap_or_default()));
                 }
             }
         }
+        // All handles dropped -> shut down.
     }
 
     // --- CP-managed wireless (P-W1) ---------------------------------------
@@ -245,8 +217,12 @@ impl<R: CommandRunner> ProvisionActor<R> {
     }
 
     /// Validate → snapshot → reconcile (delete pre-existing owned sections, then
-    /// set the desired) → apply + multi-radio reload → arm watchdog. Returns once
-    /// APPLIED_PENDING (COMMITTED / ROLLED_BACK arrives later as a status).
+    /// set the desired) → apply + multi-radio reload → derive+set the gate scope
+    /// from live UCI → ACK. Returns once COMMITTED (there is no commit-confirm
+    /// watchdog: wireless is namespaced to owned `pc_*` sections and can't brick
+    /// dial-out → apply-and-ACK, no timed rollback; see
+    /// `docs/design/confirm-on-reconnect.md` for the RISK-op pattern). A local
+    /// apply FAILURE still reverts to the pre-apply snapshot (fail-OPEN).
     async fn handle_set_wireless(
         &mut self,
         state: WirelessDesiredState,
@@ -256,14 +232,6 @@ impl<R: CommandRunner> ProvisionActor<R> {
         // Layer A: never let an owned SSID land on a protected (admin) radio, so a
         // `wifi reload <radio>` can't bounce/dark the admin SSID. No-op when unset.
         uci::validate_protected_radios(&state, &self.protected_radios)?;
-
-        // One pending push at a time — can't honour two watchdogs / rollback
-        // safety nets at once.
-        if self.pending_wireless.is_some() {
-            return Err(ProvisionError::Invalid(
-                "a wireless push is already pending confirmation; confirm or await its watchdog first".into(),
-            ));
-        }
 
         // Snapshot the CURRENT owned wireless state (pre-apply).
         let snapshot = self.machine.snapshot_wireless().await?;
@@ -302,7 +270,6 @@ impl<R: CommandRunner> ProvisionActor<R> {
             if let Err(re) = self.machine.rollback_to(&snapshot, &current_sections, &radios).await {
                 tracing::error!(config_version = %state.config_version, error = %re, "wireless rollback after failed apply ALSO failed");
             }
-            let _ = self.machine.clear_wireless_marker().await;
             self.emit_wireless(sm::wireless_status(
                 &state.config_version,
                 ProvisionState::Failed,
@@ -313,160 +280,43 @@ impl<R: CommandRunner> ProvisionActor<R> {
             return Err(e);
         }
 
-        // Arm the LOCAL watchdog + persist the marker (tmpfs) so a restart
-        // mid-window still honours the confirm/rollback.
-        let window = sm::confirm_window_secs(state.confirm_timeout_secs);
-        let deadline = Instant::now() + window;
-        let deadline_unix = unix_now() + window.as_secs() as i64;
-        // Gated-SSID bridge ifaces = the enforcement scope this push commits. Carry
-        // it in the marker AND the pending so a restart-then-confirm writes the
-        // RIGHT committed-gated set, not an empty one (P0 #2).
-        let gated_ifaces: Vec<String> =
-            state.ssids.iter().filter(|s| s.gated).map(|s| s.bridge_name.clone()).collect();
-        let marker = WirelessMarker {
-            config_version: state.config_version.clone(),
-            radios: radios.clone(),
-            current_sections: current_sections.clone(),
-            gated_ifaces: gated_ifaces.clone(),
-            deadline_unix,
-            snapshot: snapshot.clone(),
-        };
-        if let Err(e) = self.machine.write_wireless_marker(&marker).await {
-            tracing::warn!(config_version = %state.config_version, error = %e, "could not persist wireless marker (crash-recovery only)");
+        // wireless namespaced to owned pc_* (can't brick dial-out) → apply-and-ACK,
+        // no commit-confirm; see docs/design/confirm-on-reconnect.md for the RISK-op
+        // pattern. The apply above already committed + reloaded the owned sections.
+
+        // Derive the enforcement gate scope from LIVE UCI (the Fix A path) — reads
+        // what actually landed, so a section the renderer dropped or the driver
+        // rejected is reflected truthfully, and persist it to tmpfs so the boot
+        // gate self-heal has it after a daemon restart. Best-effort throughout.
+        let gated_ifaces = sm::derive_gated_from_uci(self.machine.runner()).await;
+        if let Err(e) = self.machine.write_committed_gated(&gated_ifaces).await {
+            tracing::warn!(error = %e, "could not persist committed gated ifaces (boot re-scope only)");
         }
 
         let per_ssid = Self::ssid_results(&state);
         tracing::info!(
             config_version = %state.config_version,
-            window_secs = window.as_secs(),
             ssids = state.ssids.len(),
-            "wireless applied; awaiting confirm (commit-confirm armed)"
+            gated_ifaces = ?gated_ifaces,
+            "wireless applied + committed (apply-and-ACK; no commit-confirm)"
         );
+        self.last_committed = Some(state.clone());
         self.emit_wireless(sm::wireless_status(
             &state.config_version,
-            ProvisionState::AppliedPending,
-            per_ssid.clone(),
-            "applied; awaiting confirm",
+            ProvisionState::Committed,
+            per_ssid,
+            "applied + committed",
         ))
         .await;
-        self.pending_wireless = Some(WirelessPending {
-            config_version: state.config_version.clone(),
-            radios,
-            current_sections,
-            gated_ifaces,
-            per_ssid,
-            deadline,
-            snapshot,
-            desired: state,
-        });
         Ok(())
     }
 
-    /// A confirm before the deadline commits the pending wireless push and caches
-    /// it as the last-committed desired-state.
-    async fn handle_confirm_wireless(&mut self, config_version: &str) -> Result<(), ProvisionError> {
-        match self.pending_wireless.take() {
-            Some(p) if p.config_version == config_version => {
-                let _ = self.machine.clear_wireless_marker().await;
-                // Persist the committed gated-SSID ifaces (F2) so a daemon restart
-                // re-scopes enforcement before the CP reconnects. Sourced from the
-                // pending's `gated_ifaces` (carried in the marker), NOT re-derived
-                // from `desired` — which is empty on a resumed-after-restart push, so
-                // deriving would write an empty set and silently un-gate every
-                // captive SSID (P0 #2). Best-effort.
-                if let Err(e) = self.machine.write_committed_gated(&p.gated_ifaces).await {
-                    tracing::warn!(error = %e, "could not persist committed gated ifaces (boot re-scope only)");
-                }
-                self.last_committed = Some(p.desired);
-                tracing::info!(config_version, "wireless push confirmed; committed permanently");
-                self.emit_wireless(sm::wireless_status(
-                    config_version,
-                    ProvisionState::Committed,
-                    p.per_ssid,
-                    "confirmed",
-                ))
-                .await;
-                Ok(())
-            }
-            // Not ours: put it back (take() removed it) and report no-pending.
-            other => {
-                self.pending_wireless = other;
-                Err(ProvisionError::NoPending(config_version.to_string()))
-            }
-        }
-    }
-
-    /// Watchdog fired without a confirm → roll back to the snapshot and emit an
-    /// UNSOLICITED RolledBack status.
-    async fn handle_wireless_watchdog_fire(&mut self) {
-        let Some(p) = self.pending_wireless.take() else { return };
-        tracing::warn!(
-            config_version = %p.config_version,
-            "wireless commit-confirm watchdog fired without confirm; rolling back (CGNAT has no inbound rescue)"
-        );
-        let (state, msg) = match self.machine.rollback_to(&p.snapshot, &p.current_sections, &p.radios).await {
-            Ok(()) => (ProvisionState::RolledBack, "watchdog expired; rolled back to snapshot".to_string()),
-            Err(e) => {
-                tracing::error!(config_version = %p.config_version, error = %e, "wireless watchdog rollback FAILED");
-                (ProvisionState::Failed, format!("watchdog rollback failed: {e}"))
-            }
-        };
-        let _ = self.machine.clear_wireless_marker().await;
-        self.emit_wireless(sm::wireless_status(&p.config_version, state, p.per_ssid, msg)).await;
-    }
-
-    /// Honour a leftover wireless marker at startup: past deadline → roll back
-    /// now; still within the window → resume the watchdog for the remainder.
-    async fn reconcile_wireless_on_start(&mut self) {
-        let marker = match self.machine.read_wireless_marker().await {
-            Ok(Some(m)) => m,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read wireless marker on start");
-                return;
-            }
-        };
-        let now_unix = unix_now();
-        if marker.deadline_unix <= now_unix {
-            tracing::warn!(
-                config_version = %marker.config_version,
-                "unconfirmed wireless push past its deadline at startup; rolling back"
-            );
-            let (state, msg) = match self
-                .machine
-                .rollback_to(&marker.snapshot, &marker.current_sections, &marker.radios)
-                .await
-            {
-                Ok(()) => (ProvisionState::RolledBack, "rolled back on startup (deadline passed)".to_string()),
-                Err(e) => (ProvisionState::Failed, format!("startup rollback failed: {e}")),
-            };
-            let _ = self.machine.clear_wireless_marker().await;
-            self.emit_wireless(sm::wireless_status(&marker.config_version, state, Vec::new(), msg)).await;
-        } else {
-            let remaining = Duration::from_secs((marker.deadline_unix - now_unix).max(0) as u64);
-            tracing::info!(
-                config_version = %marker.config_version,
-                remaining_secs = remaining.as_secs(),
-                "resuming wireless commit-confirm watchdog after restart"
-            );
-            self.pending_wireless = Some(WirelessPending {
-                config_version: marker.config_version,
-                radios: marker.radios,
-                current_sections: marker.current_sections,
-                // Reconstructed from the marker (P0 #2): a confirm after this resume
-                // writes the correct committed-gated set, not an empty one.
-                gated_ifaces: marker.gated_ifaces,
-                per_ssid: Vec::new(),
-                deadline: Instant::now() + remaining,
-                snapshot: marker.snapshot,
-                // The full desired state isn't persisted in the marker; a resumed
-                // push that then confirms records an empty last-committed (the CP
-                // re-pushes if it needs introspection). The rollback path (the
-                // common resume outcome) doesn't need it, and the gated-iface scope
-                // — the one thing a confirm MUST get right — is carried above.
-                desired: WirelessDesiredState::default(),
-            });
-        }
+    /// `ConfirmWireless` is now an idempotent no-op (apply-and-ACK already
+    /// committed on `set`). Kept for backward-compat with a CP that still sends a
+    /// confirm after a push — it always succeeds. No pending state, nothing to do.
+    async fn handle_confirm_wireless(&self, config_version: &str) -> Result<(), ProvisionError> {
+        tracing::debug!(config_version, "confirm_wireless: no-op (apply-and-ACK already committed)");
+        Ok(())
     }
 
     /// Emit a wireless status upward (see [`Self::emit`]).
@@ -475,24 +325,6 @@ impl<R: CommandRunner> ProvisionActor<R> {
             tracing::debug!("wireless status channel closed; status dropped");
         }
     }
-}
-
-/// Await an optional sleep future: if `None`, never resolves (so the `select!`
-/// arm is effectively disarmed when no provision is pending).
-async fn maybe_sleep(sleep: Option<tokio::time::Sleep>) {
-    match sleep {
-        Some(s) => s.await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
-/// Wall-clock UNIX seconds (for the marker deadline, which must survive a
-/// process restart — a monotonic `Instant` would not).
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -549,24 +381,43 @@ mod tests {
         out
     }
 
+    /// A runner that applies everything successfully (empty stdout) BUT serves the
+    /// gate-derive read (`uci show firewall`/`network`) with the owned gated
+    /// `public` SSID's portal rule + bridge — so `derive_gated_from_uci` (run after
+    /// a successful apply) resolves `br-public`, mirroring what would actually be on
+    /// the box post-apply.
+    fn gated_derive_runner() -> RecordingRunner {
+        RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args.first() == Some(&"show") {
+                let body = match args.get(1).copied().unwrap_or("") {
+                    "firewall" => "firewall.pc_public_portal=rule\n",
+                    "network" => "network.pc_public_dev.name='br-public'\n",
+                    _ => "",
+                };
+                return Ok(body.as_bytes().to_vec());
+            }
+            Ok(Vec::new())
+        })
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn wireless_set_then_confirm_commits() {
+    async fn wireless_set_applies_and_acks_committed() {
+        // Apply-and-ACK: a push applies + commits and returns COMMITTED immediately
+        // (no AppliedPending, no watchdog, no separate confirm needed).
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut wrx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+            run_provision_subsystem(gated_derive_runner(), dir.path().to_path_buf(), 8080);
 
         handle.set_wireless(wstate("cfg-1", 90)).await.unwrap();
         let s = wrx.recv().await.unwrap();
-        assert_eq!(s.state, ProvisionState::AppliedPending);
+        assert_eq!(s.state, ProvisionState::Committed);
         assert_eq!(s.config_version, "cfg-1");
         // per-SSID ifaces reported (fed to enforcement scoping when gated).
         assert!(s.per_ssid.iter().any(|r| r.slug == "public" && r.iface == "br-public"));
+        // No further status (no watchdog fire).
+        assert!(wdrain(&mut wrx).is_empty());
 
-        handle.confirm_wireless("cfg-1").await.unwrap();
-        let s = wrx.recv().await.unwrap();
-        assert_eq!(s.state, ProvisionState::Committed);
-
-        // get_wireless now returns the committed desired-state.
+        // get_wireless returns the committed desired-state (set on apply, not confirm).
         let got = handle.get_wireless().await.unwrap();
         assert_eq!(got.config_version, "cfg-1");
         assert_eq!(got.ssids.len(), 2);
@@ -576,32 +427,71 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wireless_set_then_watchdog_rolls_back() {
+    async fn wireless_committed_holds_through_channel_flap() {
+        // Simulate a CP/channel flap AFTER a successful apply-and-ACK: with no
+        // watchdog, no time-based rollback ever fires, so the config stays COMMITTED
+        // and the tmpfs gate scope stays br-public (never wiped to empty).
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut wrx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+            run_provision_subsystem(gated_derive_runner(), dir.path().to_path_buf(), 8080);
 
-        handle.set_wireless(wstate("cfg-2", 30)).await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+        handle.set_wireless(wstate("cfg-flap", 30)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
 
-        tokio::time::advance(Duration::from_secs(31)).await;
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::RolledBack);
+        // Advance well past any old watchdog window — nothing rolls back.
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert!(wdrain(&mut wrx).is_empty(), "no watchdog rollback after a flap");
+
+        // Gate scope held (derived from UCI on apply, persisted to tmpfs).
+        let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
+        assert_eq!(gated, vec!["br-public".to_string()], "gate scope must hold, never []");
+        // Committed view intact.
+        assert_eq!(handle.get_wireless().await.unwrap().config_version, "cfg-flap");
 
         drop(handle);
         let _ = join.await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wireless_supersede_is_rejected() {
+    async fn wireless_apply_failure_reverts_and_reports_failed() {
+        // A dark-radio / failed reload: the apply errors → local revert to the
+        // pre-apply snapshot + a FAILED status (fail-OPEN). No watchdog involved.
+        let dir = tempfile::tempdir().unwrap();
+        // Dark radio: EVERY `/sbin/wifi` step fails (reload, retry, AND the hard
+        // `wifi up` escalation) → the radio can't be brought up → apply_wireless
+        // surfaces the error → local revert + FAILED.
+        let runner = RecordingRunner::with_responder(|prog, _args| {
+            if prog == "/sbin/wifi" {
+                return Err(ProvisionError::Apply("radio dark: wifi bring-up failed".into()));
+            }
+            Ok(Vec::new())
+        });
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(runner, dir.path().to_path_buf(), 8080);
+
+        let err = handle.set_wireless(wstate("cfg-dark", 90)).await.unwrap_err();
+        assert!(matches!(err, ProvisionError::Apply(_)));
+        let s = wrx.recv().await.unwrap();
+        assert_eq!(s.state, ProvisionState::Failed, "apply failure → FAILED (local revert)");
+        assert_eq!(s.config_version, "cfg-dark");
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_supersede_is_allowed() {
+        // With apply-and-ACK there is no pending state, so a second push simply
+        // applies over the first (both COMMITTED) — no "already pending" rejection.
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut wrx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+            run_provision_subsystem(gated_derive_runner(), dir.path().to_path_buf(), 8080);
 
         handle.set_wireless(wstate("cfg-a", 90)).await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-        // A second push while one is pending is rejected (can't hold two watchdogs).
-        let err = handle.set_wireless(wstate("cfg-b", 90)).await.unwrap_err();
-        assert!(matches!(err, ProvisionError::Invalid(_)));
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+        handle.set_wireless(wstate("cfg-b", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+        assert_eq!(handle.get_wireless().await.unwrap().config_version, "cfg-b");
 
         drop(handle);
         let _ = join.await;
@@ -650,10 +540,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wireless_accepts_ssid_on_unprotected_radio() {
-        // Same protection, but the SSIDs sit on radio1 → accepted (applies + arms).
+        // Same protection, but the SSIDs sit on radio1 → accepted (applies + ACKs).
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut wrx, join) = run_provision_subsystem_with_policy(
-            RecordingRunner::new(),
+            gated_derive_runner(),
             dir.path().to_path_buf(),
             8080,
             vec!["radio0".to_string()],
@@ -664,7 +554,7 @@ mod tests {
             s.radios = vec!["radio1".into()];
         }
         handle.set_wireless(st).await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
 
         drop(handle);
         let _ = join.await;
@@ -682,7 +572,7 @@ mod tests {
             run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
 
         handle.set_wireless(wstate("cfg-e2e", 90)).await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
 
         let flat = runner.flat();
         let has = |p: &str, a: &str| flat.iter().any(|(pp, aa)| pp == p && aa == a);
@@ -703,74 +593,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wireless_confirm_unknown_version_errors() {
+    async fn wireless_confirm_is_idempotent_noop() {
+        // ConfirmWireless is now a backward-compat no-op: it always succeeds and
+        // never emits a status (the apply already committed).
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut wrx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+            run_provision_subsystem(gated_derive_runner(), dir.path().to_path_buf(), 8080);
 
         handle.set_wireless(wstate("cfg-real", 90)).await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-        // A confirm for a DIFFERENT version does not resolve the pending push.
-        let err = handle.confirm_wireless("cfg-wrong").await.unwrap_err();
-        assert!(matches!(err, ProvisionError::NoPending(_)));
-        // The real one still confirms.
-        handle.confirm_wireless("cfg-real").await.unwrap();
         assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+        // A confirm for ANY version (even one never pushed) is an ok no-op.
+        handle.confirm_wireless("cfg-anything").await.unwrap();
+        handle.confirm_wireless("cfg-real").await.unwrap();
+        // No extra status frames from the no-op confirms.
+        assert!(wdrain(&mut wrx).is_empty());
 
         drop(handle);
         let _ = join.await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn confirm_persists_committed_gated_ifaces_for_boot_rescope() {
-        // F2: on COMMIT, the gated-SSID bridge ifaces are persisted to tmpfs so a
-        // daemon restart (compose reads `read_committed_gated`) re-scopes
-        // enforcement before the CP reconnects.
+    async fn set_persists_committed_gated_ifaces_for_boot_rescope() {
+        // On apply-and-ACK the gated-SSID bridge ifaces are DERIVED from live UCI
+        // and persisted to tmpfs so a daemon restart (`read_committed_gated`)
+        // re-scopes enforcement before the CP reconnects.
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut wrx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+            run_provision_subsystem(gated_derive_runner(), dir.path().to_path_buf(), 8080);
 
         handle.set_wireless(wstate("cfg-f2", 90)).await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-        handle.confirm_wireless("cfg-f2").await.unwrap();
         assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
 
-        // wstate = [public (gated), home (not gated)] → only br-public is gated.
+        // Derived from live UCI (the gated `public` SSID → br-public).
         let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
         assert_eq!(gated, vec!["br-public".to_string()]);
-
-        drop(handle);
-        let _ = join.await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn resumed_confirm_persists_gated_ifaces_not_empty() {
-        // P0 #2: a push confirmed AFTER a mid-window restart must still write the
-        // correct committed-gated set (carried in the marker), NOT an empty one —
-        // an empty set would silently un-gate every captive SSID (unauth internet).
-        let dir = tempfile::tempdir().unwrap();
-
-        // Incarnation A: apply a gated SSID, reach AppliedPending, then "crash"
-        // (drop) WITHOUT confirming. The marker (with gated_ifaces) persists.
-        {
-            let (handle, mut wrx, join) =
-                run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
-            handle.set_wireless(wstate("cfg-resume", 600)).await.unwrap();
-            assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::AppliedPending);
-            drop(handle);
-            let _ = join.await;
-        }
-
-        // Incarnation B: fresh actor, same tmpfs dir → resumes the pending from the
-        // marker. A confirm now must persist the gated ifaces from the marker.
-        let (handle, mut wrx, join) =
-            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
-        handle.confirm_wireless("cfg-resume").await.unwrap();
-        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
-
-        // The scope survived the restart — NOT wiped to empty.
-        let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
-        assert_eq!(gated, vec!["br-public".to_string()], "resumed confirm must not wipe the gated scope");
 
         drop(handle);
         let _ = join.await;
