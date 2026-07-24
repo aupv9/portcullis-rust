@@ -23,6 +23,9 @@ thiserror.workspace = true
 # (D2). Already linked into the engine binary via other crates, so no new
 # footprint on the MIPS target.
 serde_json.workspace = true
+# Stable `observed_fingerprint` hash over the LIVE-UCI owned config (CP-SOT
+# liveness, P1). Already linked via portcullis-redirect, so no new MIPS footprint.
+sha2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
