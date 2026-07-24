@@ -65,11 +65,12 @@ pub struct ControlChannelConfig {
     /// into outbound `EngineFrame`s. Isolated from the [`Enforcer`]: a provision
     /// fault cannot affect enforcement.
     pub provisioner: Arc<dyn Provisioner>,
-    /// Enforcement writer (P-W1). On a terminal `WirelessStatus` (COMMITTED /
-    /// ROLLED_BACK) the channel re-scopes enforcement to the gated-SSID ifaces of
-    /// the now-committed wireless config, via [`RulesetWriter::set_gated_ifaces`]
-    /// (which re-applies only the scoped gating rules — never flushing the auth
-    /// set). Best-effort: a re-scope failure leaves the prior scope live.
+    /// Enforcement writer (P-W1). On a `WirelessStatus(COMMITTED)` (the engine
+    /// applies-and-ACKs; there is no watchdog ROLLED_BACK) the channel re-scopes
+    /// enforcement to the gated-SSID ifaces of the now-committed wireless config,
+    /// via [`RulesetWriter::set_gated_ifaces`] (which re-applies only the scoped
+    /// gating rules — never flushing the auth set). Best-effort: a re-scope failure
+    /// leaves the prior scope live; an empty committed view never clobbers it.
     pub writer: Arc<dyn RulesetWriter>,
     /// Runtime control surface (G3/G4): the `Set*` config-push and `Get*`
     /// introspection frames are dispatched here, and the `Grant` path resolves a
@@ -91,10 +92,10 @@ pub struct ControlChannelConfig {
 /// health flag and the disconnect metric.
 ///
 /// `wireless_status` is the provision subsystem's upward mpsc: [`WirelessStatus`]
-/// frames (including the UNSOLICITED watchdog-driven `ROLLED_BACK`) are fanned
-/// into outbound `EngineFrame`s. Held across reconnects like the event receiver
-/// — a status emitted while disconnected buffers in the mpsc; the control plane
-/// re-reads wireless state on reconnect regardless.
+/// frames (`COMMITTED` on a successful apply-and-ACK, or `FAILED` on a local apply
+/// revert) are fanned into outbound `EngineFrame`s. Held across reconnects like
+/// the event receiver — a status emitted while disconnected buffers in the mpsc;
+/// the control plane re-reads wireless state on reconnect regardless.
 ///
 /// `liveness` is the P5 on-air liveness poller's upward mpsc: periodic
 /// [`WirelessLiveness`] snapshots are fanned into UNSOLICITED
@@ -233,17 +234,16 @@ where
             },
             ws = wireless_status.recv() => match ws {
                 Some(s) => {
-                    // On a TERMINAL outcome (committed, or watchdog-rolled-back to
-                    // the prior committed config), re-scope enforcement to the
-                    // gated-SSID ifaces of the now-live config BEFORE fanning the
-                    // status up — so a newly-gated SSID starts being captive-gated,
-                    // and a de-gated one stops. Best-effort (never breaks the
-                    // channel; the auth set is preserved regardless).
-                    if matches!(s.state, ProvisionState::Committed | ProvisionState::RolledBack) {
+                    // On COMMITTED (the engine now applies-and-ACKs; there is no
+                    // watchdog RolledBack), re-scope enforcement to the gated-SSID
+                    // ifaces of the now-live config BEFORE fanning the status up —
+                    // so a newly-gated SSID starts being captive-gated, and a
+                    // de-gated one stops. Best-effort (never breaks the channel; the
+                    // auth set is preserved regardless).
+                    if matches!(s.state, ProvisionState::Committed) {
                         rescope_enforcement(cfg).await;
                     }
-                    // Unsolicited (correlation_id 0): the CP correlates by
-                    // config_version; a watchdog rollback has no request to echo.
+                    // Unsolicited (correlation_id 0): the CP correlates by config_version.
                     let f = frame(0, engine_frame::Msg::WirelessStatus(convert::wireless_status_to_pb(&s)));
                     if out_tx.send(f).await.is_err() {
                         return Ok(());
@@ -502,10 +502,21 @@ async fn dispatch(
 }
 
 /// Re-scope enforcement to the gated-SSID ifaces of the currently-committed
-/// wireless config. Reads the committed desired-state from the isolated
-/// [`Provisioner`] (its `get_wireless`), collects the bridge ifaces of the
-/// `gated == true` SSIDs, and feeds them to [`RulesetWriter::set_gated_ifaces`]
-/// (which re-applies only the scoped gating rules, never flushing the auth set).
+/// wireless config after a COMMITTED status. Reads the committed desired-state
+/// from the isolated [`Provisioner`] (its `get_wireless`), collects the bridge
+/// ifaces of the `gated == true` SSIDs, and feeds them to
+/// [`RulesetWriter::set_gated_ifaces`] (which re-applies only the scoped gating
+/// rules, never flushing the auth set).
+///
+/// GUARDRAIL (CP-SOT): NEVER set the gate scope from an EMPTY in-mem committed.
+/// The engine's authoritative gate scope is derived from LIVE UCI — at boot (the
+/// Fix A self-heal) and on every apply (the provision handle derives it from `uci
+/// show` and persists it). An empty `get_wireless()` means the in-RAM last-committed
+/// was not rehydrated (e.g. after a daemon restart with no re-push yet), NOT that
+/// there are zero gated SSIDs — so clobbering the live scope with `[]` would
+/// silently un-gate every captive SSID (fail-OPEN). When the committed view is
+/// empty we leave the live UCI-derived scope untouched.
+///
 /// Best-effort: any failure is logged and the prior enforcement scope stays live
 /// (fail-safe — authorized clients are never dropped).
 async fn rescope_enforcement(cfg: &ControlChannelConfig) {
@@ -516,6 +527,13 @@ async fn rescope_enforcement(cfg: &ControlChannelConfig) {
             return;
         }
     };
+    // Empty in-mem committed → do NOT clobber the live (UCI-derived) scope.
+    if state.ssids.is_empty() {
+        tracing::debug!(
+            "rescope: committed wireless view is empty; keeping live UCI-derived gate scope (no clobber)"
+        );
+        return;
+    }
     let ifaces: Vec<String> = state
         .ssids
         .iter()

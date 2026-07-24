@@ -158,12 +158,15 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
 
     // 4b. Hotspot provisioning subsystem (P0.5) — spawned as an ISOLATED task,
     //     completely separate from enforcement (its own actor + tmpfs state +
-    //     shell-out runner). It renders a FIXED allowlist of UCI sections and
-    //     holds each apply under a LOCAL commit-confirm watchdog. Fail-OPEN
-    //     (rollback), the ONE exception to the engine's fail-closed rule: it
-    //     manages router config, not enforcement, and kernel-as-truth means a
-    //     provision fault never drops an authorized client. Spawned BEFORE the
-    //     control channel so its handle + status stream can be wired in.
+    //     shell-out runner). It renders owner-namespaced `pc_*` UCI sections and
+    //     APPLIES-and-ACKs (CP-SOT, P2): a successful apply commits + reloads the
+    //     owned sections and returns COMMITTED immediately — no commit-confirm
+    //     watchdog, since wireless is namespaced to `pc_*` and can't brick dial-out.
+    //     A local apply FAILURE still reverts to the pre-apply snapshot (fail-OPEN,
+    //     the ONE exception to fail-closed): it manages router config, not
+    //     enforcement, and kernel-as-truth means a provision fault never drops an
+    //     authorized client. Spawned BEFORE the control channel so its handle +
+    //     status stream can be wired in.
     let (provisioner, wireless_status_rx, provision_join) =
         portcullis_provision::run_provision_subsystem_with_policy(
             portcullis_provision::ProcessRunner,
@@ -180,8 +183,8 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     tasks.push(provision_join);
     // The control channel consumes the WirelessStatus stream (fans it into
     // outbound EngineFrames). Kept in an Option so it is moved into the channel
-    // task only when TLS is present; otherwise the subsystem still runs (watchdog
-    // rollback works without the CP) and statuses simply buffer in the mpsc.
+    // task only when TLS is present; otherwise the subsystem still runs (apply +
+    // local revert-on-failure works without the CP) and statuses buffer in the mpsc.
     let mut wireless_status_rx = Some(wireless_status_rx);
 
     // 4c. On-air SSID liveness poller (P5) — a second ISOLATED, read-only task.
@@ -307,7 +310,7 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
             let mgr = w.mgr.clone();
             let m = metrics.clone();
             // Move the WirelessStatus stream into the channel task so it fans
-            // status (incl. unsolicited watchdog ROLLED_BACK) up to the CP.
+            // status (COMMITTED on apply-and-ACK, FAILED on a local revert) up to the CP.
             let wireless_rx = wireless_status_rx
                 .take()
                 .expect("wireless status receiver taken once");
