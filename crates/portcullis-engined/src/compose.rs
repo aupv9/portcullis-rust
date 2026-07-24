@@ -206,13 +206,25 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
         // can report per-SSID `gate_enforced` (surfacing a reboot fail-OPEN where a
         // gated SSID beacons but its bridge is not in the gate scope).
         let liveness_writer = writer.clone();
+        // Liveness poll cadence: default 5 min (DEFAULT_POLL_INTERVAL), overridable at
+        // startup via PC_LIVENESS_POLL_SECS (set through procd_set_param env). Clamp to a
+        // floor so a typo cannot hammer the MIPS shell-outs; a bad/absent/too-small value
+        // falls back to the default. A longer period only delays drift detection and the
+        // post-apply "committed" re-confirm — never enforcement (this poll is read-only).
+        let liveness_interval = std::env::var("PC_LIVENESS_POLL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s >= portcullis_provision::MIN_POLL_INTERVAL_SECS)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(portcullis_provision::DEFAULT_POLL_INTERVAL);
+        tracing::info!(interval_secs = liveness_interval.as_secs(), "wireless liveness poller cadence");
         tasks.push(tokio::spawn(async move {
             portcullis_provision::run_liveness_poller(
                 runner,
                 prov,
                 liveness_writer,
                 liveness_tx,
-                portcullis_provision::DEFAULT_POLL_INTERVAL,
+                liveness_interval,
             )
             .await;
         }));

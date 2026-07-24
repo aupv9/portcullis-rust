@@ -45,7 +45,9 @@ pub use device_obs::{
     run_device_obs_poller, AssocEntry, DEFAULT_DEVICE_POLL_INTERVAL, DEVICE_REPORT_BUFFER,
 };
 pub use handle::{run_provision_subsystem, run_provision_subsystem_with_policy, ProvisionHandle};
-pub use liveness::{poll_once, run_liveness_poller, DEFAULT_POLL_INTERVAL, LIVENESS_BUFFER};
+pub use liveness::{
+    poll_once, run_liveness_poller, DEFAULT_POLL_INTERVAL, LIVENESS_BUFFER, MIN_POLL_INTERVAL_SECS,
+};
 pub use runner::{CommandRunner, ProcessRunner};
 pub use sm::{derive_gated_from_uci, read_committed_gated, ProvisionMachine, DEFAULT_STATE_DIR};
 pub use uci::{parse_gated_bridges_from_uci, render_wireless, validate_wireless, UciCmd};
