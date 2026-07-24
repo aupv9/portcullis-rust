@@ -16,7 +16,8 @@
 //! enforcement or wireless config. A poll failure just yields a thinner snapshot.
 //!
 //! ## How
-//! A background task ([`run_liveness_poller`]) ticks on a timer (~30 s). Each poll
+//! A background task ([`run_liveness_poller`]) ticks on a timer (default 5 min,
+//! overridable via `PC_LIVENESS_POLL_SECS`). Each poll
 //! reads the OBSERVED owned-`pc_*` config from LIVE UCI (via [`observed_ssids_from_uci`]
 //! and [`observed_fingerprint`]), then for each observed SSID resolves its on-air VIF
 //! and shells out (via the [`CommandRunner`] seam, explicit argv — never `sh -c`)
@@ -59,9 +60,16 @@ const UBUS: &str = "ubus";
 const IWINFO: &str = "iwinfo";
 const UCI: &str = "uci";
 
-/// Default poll cadence. Kept coarse (~30 s) so the shell-outs are negligible on
-/// the MIPS budget; liveness is a slow-changing gauge, not an event stream.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Default poll cadence. Coarse on purpose (5 min): wireless config drift is rare
+/// (an operator/manual edit), so a slow gauge keeps the shell-outs negligible on the
+/// MIPS budget and the control channel quiet. The composition root can override this
+/// via the `PC_LIVENESS_POLL_SECS` env var (see `compose.rs`) — a slower period only
+/// delays drift detection and the post-apply "committed" re-confirm, never enforcement.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Floor for the env-overridden poll cadence: below this the shell-outs start to
+/// matter on the MIPS budget and the value is almost certainly a misconfiguration.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 15;
 
 /// Bound on the outward liveness mpsc. Tiny: a stale snapshot is worthless, so if
 /// the channel task is behind we would rather drop than buffer. The sender uses
