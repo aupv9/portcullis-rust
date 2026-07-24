@@ -1,0 +1,32 @@
+Package: portcullis
+Version: 0.18.1-1
+Architecture: mipsel_24kc
+Maintainer: The portcullis authors
+Section: net
+Priority: optional
+# NOTE (F9 per-SSID QoS): SQM shaping is OPT-IN, not a hard dep — forcing
+# sqm-scripts + kmod-sched-cake onto every device (RUT200 flash budget) is wrong
+# for an optional feature. The engine degrades gracefully when they're absent
+# (snapshot/commit/reload tolerate a missing /etc/config/sqm; a cap set on such a
+# device simply doesn't shape). On devices that USE per-SSID caps, install:
+#   opkg install sqm-scripts kmod-sched-cake
+# NOTE (ipset match): the engine runs  for
+# the auth/garden gate, which needs the userspace extension 
+# (libxt_set.so) IN ADDITION to  (the kernel ip_set/xt_set mods).
+# Stock RutOS usually ships it (fw3/openNDS use ipset matching), but an Image-
+# Builder golden image won't include it unless it's declared here →  fails
+# to load and the gate silently never installs. dnsmasq-full is NOT declared here:
+# it conflicts with the pre-installed dnsmasq (opkg install would fail); swap it in
+# at golden-image bake time via Image Builder PACKAGES (see build-golden-image.sh).
+# NOTE (conntrack): the package providing the  CLI (flow reaper, invariant
+# #9) is  — NOT  (that is conntrackd, the daemon). The
+# wrong name never resolves and aborts  (verified on-device 2026-07-11).
+Depends: ipset, iptables, ip6tables, kmod-ipt-ipset, iptables-mod-ipset, conntrack, curl, ca-bundle, openssl-util
+Description: Per-store captive-portal edge enforcement engine. Holds the internet
+ gate shut until the WiFi Hub control plane authorizes a client, then enforces,
+ meters, and expires that grant via ipset + iptables (TDD 17 option B).
+Filename: portcullis_0.18.1-1_mipsel_24kc.ipk
+Size: 1056444
+SHA256sum: 9bc0e48544b172112fb4a17ba593b4922205c1a366b7ede6fc9518f55be3c4d8
+MD5Sum: cec46ca9340848eb773c07a975188d2c
+
