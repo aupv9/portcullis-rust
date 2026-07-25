@@ -118,6 +118,21 @@ pub const RESERVED_SLUGS: [&str; 6] = ["lan", "wan", "wan6", "admin", "loopback"
 pub const RESERVED_EGRESS: [&str; 1] = ["lan"];
 /// Bridge ifaces the CP may not claim.
 pub const RESERVED_BRIDGES: [&str; 1] = ["br-lan"];
+/// WAN netdevs a `bridge_ports` entry may never name — bridging the uplink into a
+/// client SSID would bypass the gate and expose the WAN L2 to clients.
+pub const RESERVED_WAN_NETDEVS: [&str; 2] = ["wan", "wan6"];
+
+/// Whether `s` names a LAN switch port a device-network SSID may bridge in: the
+/// DSA per-port netdev layout `lan1`..`lanN` (`^lan[0-9]+$`). Bare `lan` is NOT a
+/// port (it's the br-lan interface) and is rejected. Kept in sync with the
+/// renderer, which emits each entry VERBATIM as `network.pc_<slug>_dev.ports`.
+fn is_lan_netdev(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix("lan") {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        false
+    }
+}
 
 /// The effective radios for an SSID: its list, or `[DEFAULT_RADIO]` when empty.
 pub fn effective_radios(spec: &SsidSpec) -> Vec<&str> {
@@ -262,6 +277,14 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     c.push(UciCmd::set(&dev, "device"));
     c.push(UciCmd::set(format!("{dev}.name"), &spec.bridge_name));
     c.push(UciCmd::set(format!("{dev}.type"), "bridge"));
+    // Wired LAN ports bridged into this SSID (device network): one owned
+    // `add_list` on `.ports` per netdev, e.g. `network.pc_<s>_dev.ports=lan1`.
+    // Empty (default) = a Wi-Fi-only bridge — byte-identical to before. The ports
+    // are freed from br-lan at BOOTSTRAP; the engine only ADDS them here, never
+    // removes them from br-lan (invariant: never touch br-lan).
+    for port in &spec.bridge_ports {
+        c.push(UciCmd::add_list(format!("{dev}.ports"), port.as_str()));
+    }
     c.push(UciCmd::set(format!("{dev}.owner"), WIRELESS_OWNER));
 
     // network.pc_<s>_if = interface  (static subnet on the bridge)
@@ -344,6 +367,14 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         c.push(UciCmd::set(format!("{d}.limit"), &spec.dhcp_limit));
         c.push(UciCmd::set(format!("{d}.leasetime"), &spec.dhcp_leasetime));
         c.push(UciCmd::set(format!("{d}.dhcpv6"), "disabled"));
+        // Static-only (device network): keep the dnsmasq instance + static host
+        // leases below but serve NO dynamic pool. `dynamicdhcp '0'` makes dnsmasq
+        // hand out addresses ONLY to known `config host` reservations (start/limit
+        // stay set but inert). Default (static_only=false) omits the option => a
+        // dynamic pool exactly as before (backward-compatible).
+        if spec.static_only {
+            c.push(UciCmd::set(format!("{d}.dynamicdhcp"), "0"));
+        }
         c.push(UciCmd::set(format!("{d}.owner"), WIRELESS_OWNER));
 
         // dhcp.pc_<s>_host<i> = host  (P1 static leases: MAC -> fixed IP). One
@@ -584,6 +615,7 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
 
     let mut seen_slugs: Vec<&str> = Vec::new();
     let mut seen_bridges: Vec<&str> = Vec::new();
+    let mut seen_ports: Vec<&str> = Vec::new(); // LAN netdevs bridged across all SSIDs
     let mut subnets: Vec<(u32, u32, &str)> = Vec::new(); // (net, bcast, slug)
     let mut radio_vifs: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
 
@@ -692,6 +724,38 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             return bad(format!("duplicate bridge_name '{br}'"));
         }
         seen_bridges.push(br);
+
+        // Wired LAN ports bridged into this SSID (device network). Each entry is
+        // rendered VERBATIM as `network.pc_<slug>_dev.ports`, so validate strictly
+        // and fail-OPEN reject the whole push if any is malformed: it must be a LAN
+        // switch port (`^lan[0-9]+$`), MUST NOT be a WAN netdev (would bridge the
+        // uplink into a client SSID and bypass the gate), MUST NOT be a reserved
+        // bridge (br-lan), and MUST NOT be claimed by another SSID in this push
+        // (one netdev cannot be a member of two bridges).
+        for port in &ssid.bridge_ports {
+            let p = port.as_str();
+            if RESERVED_WAN_NETDEVS.contains(&p) {
+                return bad(format!(
+                    "bridge_ports entry '{p}' for slug '{s}' is a WAN netdev (would bypass the gate)"
+                ));
+            }
+            if RESERVED_BRIDGES.contains(&p) {
+                return bad(format!(
+                    "bridge_ports entry '{p}' for slug '{s}' is a reserved bridge"
+                ));
+            }
+            if !is_lan_netdev(p) {
+                return bad(format!(
+                    "bridge_ports entry '{p}' for slug '{s}' is not a LAN netdev (expected lan1..lanN)"
+                ));
+            }
+            if seen_ports.contains(&p) {
+                return bad(format!(
+                    "bridge_ports entry '{p}' for slug '{s}' is already bridged into another SSID"
+                ));
+            }
+            seen_ports.push(p);
+        }
 
         let egress = if ssid.egress_zone.is_empty() { WAN_ZONE } else { ssid.egress_zone.as_str() };
         if !is_uci_ident(egress) {
@@ -1028,7 +1092,9 @@ mod tests {
             dhcp_limit: "200".into(),
             dhcp_leasetime: "2h".into(),
             dhcp_disabled: false,
+            static_only: false,
             reservations: Vec::new(),
+            bridge_ports: Vec::new(),
             egress_zone: String::new(),
             internal_targets: Vec::new(),
             max_clients: 0,
@@ -1137,6 +1203,64 @@ mod tests {
         assert!(!has_key(&cmds, "dhcp.pc_devices_host1.name"));
         // The host section name carries the owned pc_ prefix (snapshot/cleanup).
         assert!(is_owned_wireless_section("dhcp.pc_devices_host0"));
+    }
+
+    // --- device network: wired bridge ports + static-only DHCP -------------
+
+    #[test]
+    fn render_ssid_adds_a_list_entry_per_bridge_port() {
+        // Multiple wired LAN ports -> one add_list on .ports each; the bridge
+        // device section is otherwise unchanged (owner still stamped).
+        let mut spec = valid_ssid("devices", false);
+        spec.bridge_ports = vec!["lan1".into(), "lan2".into(), "lan3".into()];
+        let cmds = render_ssid(&spec, 8080);
+        assert!(has_set(&cmds, "network.pc_devices_dev", "device"));
+        assert!(has_set(&cmds, "network.pc_devices_dev.type", "bridge"));
+        assert!(has_add_list(&cmds, "network.pc_devices_dev.ports", "lan1"));
+        assert!(has_add_list(&cmds, "network.pc_devices_dev.ports", "lan2"));
+        assert!(has_add_list(&cmds, "network.pc_devices_dev.ports", "lan3"));
+        // exactly three .ports add_lists (no stray/duplicate members)
+        let n_ports = cmds
+            .iter()
+            .filter(|c| matches!(c, UciCmd::AddList { key, .. } if key == "network.pc_devices_dev.ports"))
+            .count();
+        assert_eq!(n_ports, 3, "one add_list per bridge port");
+        assert!(has_set(&cmds, "network.pc_devices_dev.owner", WIRELESS_OWNER));
+    }
+
+    #[test]
+    fn render_ssid_static_only_emits_dynamicdhcp_zero_and_keeps_reservations() {
+        // static_only keeps the dnsmasq instance + static host leases but adds
+        // `dynamicdhcp '0'` to suppress the dynamic pool.
+        let mut spec = valid_ssid("devices", false);
+        spec.static_only = true;
+        spec.reservations = vec![DhcpReservation {
+            mac: "aa:bb:cc:dd:ee:11".into(),
+            ipaddr: "10.0.0.240".into(),
+            hostname: "vending-1".into(),
+        }];
+        let cmds = render_ssid(&spec, 8080);
+        // dnsmasq instance still present + dynamic pool suppressed.
+        assert!(has_set(&cmds, "dhcp.pc_devices", "dhcp"));
+        assert!(has_set(&cmds, "dhcp.pc_devices.dynamicdhcp", "0"));
+        // Reservation still rendered as a `config host` under the same instance.
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0", "host"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0.mac", "aa:bb:cc:dd:ee:11"));
+        assert!(has_set(&cmds, "dhcp.pc_devices_host0.ip", "10.0.0.240"));
+    }
+
+    #[test]
+    fn render_ssid_backward_compatible_without_device_network_fields() {
+        // static_only=false + empty bridge_ports must produce EXACTLY the UCI a
+        // pre-device-network engine rendered: no `.ports` add_list, no
+        // `dynamicdhcp`. (Byte-identical backward-compat guarantee.)
+        let spec = valid_ssid("public", true); // defaults: static_only=false, no ports
+        let cmds = render_ssid(&spec, 8080);
+        assert!(!has_key(&cmds, "network.pc_public_dev.ports"));
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UciCmd::AddList { key, .. } if key == "network.pc_public_dev.ports")));
+        assert!(!has_key(&cmds, "dhcp.pc_public.dynamicdhcp"));
     }
 
     #[test]
@@ -1492,6 +1616,58 @@ mod tests {
         let mut s = ssid_on("public", true, 0);
         s.egress_zone = "lan".into();
         assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    // --- device network: bridge_ports validation ---------------------------
+
+    #[test]
+    fn validate_wireless_accepts_valid_lan_bridge_ports() {
+        let mut s = ssid_on("devices", false, 5);
+        s.bridge_ports = vec!["lan1".into(), "lan2".into(), "lan3".into()];
+        assert!(validate_wireless(&wstate(vec![s])).is_ok());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_wan_bridge_port() {
+        for wan in ["wan", "wan6"] {
+            let mut s = ssid_on("devices", false, 5);
+            s.bridge_ports = vec![wan.into()];
+            assert!(
+                validate_wireless(&wstate(vec![s])).is_err(),
+                "{wan} must be rejected as a bridge port (would bypass the gate)"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_wireless_rejects_br_lan_bridge_port() {
+        let mut s = ssid_on("devices", false, 5);
+        s.bridge_ports = vec!["br-lan".into()];
+        assert!(validate_wireless(&wstate(vec![s])).is_err());
+    }
+
+    #[test]
+    fn validate_wireless_rejects_non_lan_bridge_port() {
+        // Bare "lan" is the br-lan interface, not a switch port; and arbitrary
+        // netdevs (eth0, wlan0, "lan1x") are rejected.
+        for bad_port in ["lan", "eth0", "wlan0", "lan1x", "lanX", ""] {
+            let mut s = ssid_on("devices", false, 5);
+            s.bridge_ports = vec![bad_port.into()];
+            assert!(
+                validate_wireless(&wstate(vec![s])).is_err(),
+                "'{bad_port}' must be rejected as a bridge port"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_wireless_rejects_bridge_port_claimed_twice() {
+        // The same LAN netdev cannot be a member of two SSID bridges.
+        let mut a = ssid_on("devices", false, 5);
+        a.bridge_ports = vec!["lan1".into()];
+        let mut b = ssid_on("kiosk", false, 6);
+        b.bridge_ports = vec!["lan1".into()];
+        assert!(validate_wireless(&wstate(vec![a, b])).is_err());
     }
 
     #[test]

@@ -400,6 +400,8 @@ message WirelessNetwork {
   // Static leases (MAC -> fixed IP) on this subnet. Device SSIDs pin vending/POS/
   // camera/NVR to known IPs; rendered as `dhcp.pc_<slug>_host<i>` config host.
   repeated DhcpReservation reservations = 8;
+  bool static_only = 9;                // true => keep dnsmasq + static host leases but serve NO dynamic pool (render `option dynamicdhcp '0'`). Default false = dynamic pool as today. Distinct from dhcp_disabled (which drops the whole dnsmasq instance + leases).
+  repeated string bridge_ports = 10;   // physical LAN netdevs added as members of this SSID's bridge (DSA layout: "lan1".."lan3"). Empty = Wi-Fi-only bridge (today). Ports are freed from br-lan at BOOTSTRAP, never by the engine.
 }
 
 // One internal destination a device SSID may reach across zones (P2): e.g. a
