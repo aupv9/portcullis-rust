@@ -300,6 +300,8 @@ pub fn wireless_ssid_from_pb(s: pb::WirelessSsid) -> SsidSpec {
         dhcp_limit: net.dhcp_limit,
         dhcp_leasetime: net.dhcp_leasetime,
         dhcp_disabled: net.dhcp_disabled,
+        static_only: net.static_only,
+        bridge_ports: net.bridge_ports,
         reservations: net
             .reservations
             .into_iter()
@@ -439,6 +441,8 @@ fn ssid_spec_to_pb_redacted(s: &SsidSpec) -> pb::WirelessSsid {
             dhcp_limit: s.dhcp_limit.clone(),
             dhcp_leasetime: s.dhcp_leasetime.clone(),
             dhcp_disabled: s.dhcp_disabled,
+            static_only: s.static_only,
+            bridge_ports: s.bridge_ports.clone(),
             // Reservations carry no secret — echoed back verbatim (NOT redacted).
             reservations: s
                 .reservations
@@ -697,6 +701,8 @@ mod tests {
                 dhcp_limit: "200".into(),
                 dhcp_leasetime: "2h".into(),
                 dhcp_disabled: false,
+                static_only: false,
+                bridge_ports: Vec::new(),
                 reservations: Vec::new(),
             }),
             firewall: Some(pb::WirelessFirewall {
@@ -753,6 +759,32 @@ mod tests {
     }
 
     #[test]
+    fn wireless_config_from_pb_maps_device_network_fields() {
+        // static_only + bridge_ports flatten from pb::WirelessNetwork into SsidSpec.
+        let mut ssid = pb_ssid("devices", false, "supersecret");
+        let net = ssid.network.as_mut().unwrap();
+        net.static_only = true;
+        net.bridge_ports = vec!["lan1".into(), "lan2".into()];
+        let req = pb::SetWirelessConfigRequest {
+            config_version: "cfg-1".into(),
+            ssids: vec![ssid],
+            confirm_timeout_secs: 0,
+            peer_allows: Vec::new(),
+        };
+        let st = wireless_config_from_pb(req);
+        let dev = &st.ssids[0];
+        let want: Vec<String> = vec!["lan1".into(), "lan2".into()];
+        assert!(dev.static_only);
+        assert_eq!(dev.bridge_ports, want);
+
+        // ...and the get_wireless echo maps them back out (non-secret).
+        let pb = wireless_config_to_pb(&st);
+        let net = pb.ssids[0].network.as_ref().unwrap();
+        assert!(net.static_only);
+        assert_eq!(net.bridge_ports, want);
+    }
+
+    #[test]
     fn wireless_config_to_pb_redacts_keys() {
         // The get_wireless reply must NEVER echo a PSK back over the wire.
         let state = WirelessDesiredState {
@@ -775,6 +807,8 @@ mod tests {
                 dhcp_limit: "200".into(),
                 dhcp_leasetime: "2h".into(),
                 dhcp_disabled: false,
+                static_only: false,
+                bridge_ports: Vec::new(),
                 reservations: Vec::new(),
                 egress_zone: String::new(),
                 internal_targets: vec![portcullis_types::InternalTarget {

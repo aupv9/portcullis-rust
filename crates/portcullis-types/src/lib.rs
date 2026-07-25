@@ -851,9 +851,19 @@ pub struct SsidSpec {
     pub dhcp_leasetime: String,
     /// `true` = bridged, no DHCP pool rendered.
     pub dhcp_disabled: bool,
+    /// `true` = keep the dnsmasq instance + static `config host` leases but serve
+    /// NO dynamic pool (renders `option dynamicdhcp '0'`). Only meaningful when
+    /// `!dhcp_disabled`. Distinct from `dhcp_disabled`, which drops the whole
+    /// dnsmasq instance + leases. Default `false` = dynamic pool as today.
+    pub static_only: bool,
     /// Static DHCP leases (MAC → fixed IP) on this subnet — one dnsmasq `config
     /// host` per entry. Only rendered when `!dhcp_disabled`. Empty = none.
     pub reservations: Vec<DhcpReservation>,
+    /// Physical LAN netdevs added as members of this SSID's bridge (DSA layout:
+    /// `"lan1".."lan3"`) — one `add_list` on `network.pc_<slug>_dev.ports` per
+    /// entry. Empty = Wi-Fi-only bridge (today). Ports are freed from `br-lan` at
+    /// BOOTSTRAP, never by the engine.
+    pub bridge_ports: Vec<String>,
     /// Firewall zone this SSID forwards out through, e.g. `wan` (must NOT be
     /// `lan`). Empty => the engine default (`wan`).
     pub egress_zone: String,
@@ -901,7 +911,9 @@ impl std::fmt::Debug for SsidSpec {
             .field("dhcp_limit", &self.dhcp_limit)
             .field("dhcp_leasetime", &self.dhcp_leasetime)
             .field("dhcp_disabled", &self.dhcp_disabled)
+            .field("static_only", &self.static_only)
             .field("reservations", &self.reservations)
+            .field("bridge_ports", &self.bridge_ports)
             .field("egress_zone", &self.egress_zone)
             .field("internal_targets", &self.internal_targets)
             .field("max_clients", &self.max_clients)

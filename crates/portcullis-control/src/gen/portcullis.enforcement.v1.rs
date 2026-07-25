@@ -628,6 +628,12 @@ pub struct WirelessNetwork {
     /// camera/NVR to known IPs; rendered as `dhcp.pc_<slug>_host<i>` config host.
     #[prost(message, repeated, tag="8")]
     pub reservations: ::prost::alloc::vec::Vec<DhcpReservation>,
+    /// true => keep dnsmasq + static host leases but serve NO dynamic pool (render `option dynamicdhcp '0'`). Default false = dynamic pool as today. Distinct from dhcp_disabled (which drops the whole dnsmasq instance + leases).
+    #[prost(bool, tag="9")]
+    pub static_only: bool,
+    /// physical LAN netdevs added as members of this SSID's bridge (DSA layout: "lan1".."lan3"). Empty = Wi-Fi-only bridge (today). Ports are freed from br-lan at BOOTSTRAP, never by the engine.
+    #[prost(string, repeated, tag="10")]
+    pub bridge_ports: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// One internal destination a device SSID may reach across zones (P2): e.g. a
 /// local NVR / POS server sitting on br-lan or a management net. Rendered as an
