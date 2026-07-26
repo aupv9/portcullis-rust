@@ -111,7 +111,10 @@ impl Snapshot {
             if let Some((k, v)) = line.split_once('=') {
                 // `key+=value` (trailing `+` on the key) marks a LIST element.
                 if let Some(list_key) = k.strip_suffix('+') {
-                    snap.prior_lists.entry(list_key.to_string()).or_default().push(v.to_string());
+                    snap.prior_lists
+                        .entry(list_key.to_string())
+                        .or_default()
+                        .push(v.to_string());
                 } else {
                     snap.prior.insert(k.to_string(), v.to_string());
                 }
@@ -150,7 +153,10 @@ impl WirelessMarker {
         let mut s = String::new();
         s.push_str(&format!("config_version={}\n", self.config_version));
         s.push_str(&format!("radios={}\n", self.radios.join(",")));
-        s.push_str(&format!("current_sections={}\n", self.current_sections.join(",")));
+        s.push_str(&format!(
+            "current_sections={}\n",
+            self.current_sections.join(",")
+        ));
         s.push_str(&format!("gated_ifaces={}\n", self.gated_ifaces.join(",")));
         s.push_str(&format!("deadline_unix={}\n", self.deadline_unix));
         s.push_str("---\n");
@@ -170,15 +176,25 @@ impl WirelessMarker {
             match k {
                 "config_version" => config_version = v.to_string(),
                 "radios" => {
-                    radios = v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                    radios = v
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
                 }
                 "current_sections" => {
-                    current_sections =
-                        v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                    current_sections = v
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
                 }
                 "gated_ifaces" => {
-                    gated_ifaces =
-                        v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                    gated_ifaces = v
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
                 }
                 "deadline_unix" => deadline_unix = v.parse().ok(),
                 _ => {}
@@ -228,7 +244,12 @@ fn committed_gated_path(dir: &Path) -> PathBuf {
 /// a reboot `uci`'s committed config is the truth and the CP re-syncs).
 pub fn read_committed_gated(state_dir: &Path) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(committed_gated_path(state_dir)).ok()?;
-    Some(text.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+    Some(
+        text.split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Self-heal the gate scope from PERSISTENT UCI at boot (P1 reboot fix). A router
@@ -258,10 +279,35 @@ pub async fn derive_gated_from_uci<R: CommandRunner>(runner: &R) -> Vec<String> 
     uci::parse_gated_bridges_from_uci(&firewall, &network)
 }
 
+/// Rehydrate the COMMITTED `config_version` from PERSISTENT UCI at boot (P4). The
+/// version `last_committed` carries is only set on apply and lives in RAM, so a
+/// reboot would otherwise leave `GetWirelessConfig` / liveness reporting an empty
+/// version until the CP re-pushes — making an in-sync router look drifted. This
+/// shells out to `uci show wireless`, reads the owned `wireless.pc_meta`
+/// version stamp (written by [`uci::render_config_version_meta`] on every commit),
+/// and returns it via the pure [`uci::parse_config_version_from_uci`].
+///
+/// FAIL-SOFT: any error (missing `uci`, non-zero exit) or an absent stamp (fresh
+/// device) yields `None` — logged, `last_committed` stays `None` exactly as today.
+/// It NEVER panics and NEVER writes anything. Mirrors [`derive_gated_from_uci`].
+pub async fn derive_config_version_from_uci<R: CommandRunner>(runner: &R) -> Option<String> {
+    let wireless = match runner.run(UCI, &["show", "wireless"]).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => {
+            tracing::warn!(error = %e, "boot config_version rehydrate: `uci show wireless` failed; treating as absent");
+            return None;
+        }
+    };
+    uci::parse_config_version_from_uci(&wireless)
+}
 
 impl<R: CommandRunner> ProvisionMachine<R> {
     pub fn new(runner: R, state_dir: impl Into<PathBuf>, responder_port: u16) -> Self {
-        ProvisionMachine { runner, state_dir: state_dir.into(), responder_port }
+        ProvisionMachine {
+            runner,
+            state_dir: state_dir.into(),
+            responder_port,
+        }
     }
 
     /// Borrow the runner (tests inspect its recorded calls).
@@ -296,19 +342,23 @@ impl<R: CommandRunner> ProvisionMachine<R> {
                 if line.is_empty() {
                     continue;
                 }
-                let Some((key, raw_val)) = line.split_once('=') else { continue };
+                let Some((key, raw_val)) = line.split_once('=') else {
+                    continue;
+                };
                 if !uci::is_owned_wireless_section(key) {
                     continue; // guardrail: only owned wireless sections enter
                 }
                 // A section decl line has exactly one `.` (`config.section`).
-                if key.matches('.').count() == 1 && !snap.existing_sections.iter().any(|s| s == key) {
+                if key.matches('.').count() == 1 && !snap.existing_sections.iter().any(|s| s == key)
+                {
                     snap.existing_sections.push(key.to_string());
                 }
                 // LIST options (only `maclist` is owned) render as one `uci show`
                 // line with space-separated quoted elements: `…maclist='aa' 'bb'`.
                 // Capture them list-aware so rollback can replay them via add_list.
                 if key.ends_with(".maclist") {
-                    snap.prior_lists.insert(key.to_string(), parse_uci_list(raw_val));
+                    snap.prior_lists
+                        .insert(key.to_string(), parse_uci_list(raw_val));
                 } else {
                     snap.prior.insert(key.to_string(), unquote(raw_val));
                 }
@@ -418,7 +468,11 @@ impl<R: CommandRunner> ProvisionMachine<R> {
     /// drift can only make us MISS a dark radio, never falsely roll back a healthy
     /// push). See [`radios_reported_down`].
     async fn recover_dark_radios(&self, radios: &[String]) -> Option<ProvisionError> {
-        let status = self.runner.run(UBUS, &["call", "network.wireless", "status"]).await.ok()?;
+        let status = self
+            .runner
+            .run(UBUS, &["call", "network.wireless", "status"])
+            .await
+            .ok()?;
         let down = radios_reported_down(&String::from_utf8_lossy(&status), radios);
         if down.is_empty() {
             return None;
@@ -429,13 +483,20 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         }
         // Re-verify: only a radio STILL down after the forced bring-up is a real
         // fault worth rolling back for (the forced `wifi up` may have fixed it).
-        let status2 = self.runner.run(UBUS, &["call", "network.wireless", "status"]).await.ok()?;
+        let status2 = self
+            .runner
+            .run(UBUS, &["call", "network.wireless", "status"])
+            .await
+            .ok()?;
         let still_down = radios_reported_down(&String::from_utf8_lossy(&status2), radios);
         if still_down.is_empty() {
             None
         } else {
             tracing::error!(radios = ?still_down, "radios remain down after `wifi up`; will roll back");
-            Some(ProvisionError::Apply(format!("radios down after reload: {}", still_down.join(","))))
+            Some(ProvisionError::Apply(format!(
+                "radios down after reload: {}",
+                still_down.join(",")
+            )))
         }
     }
 
@@ -512,7 +573,10 @@ impl<R: CommandRunner> ProvisionMachine<R> {
     }
 
     /// Persist the wireless pending marker to tmpfs.
-    pub async fn write_wireless_marker(&self, marker: &WirelessMarker) -> Result<(), ProvisionError> {
+    pub async fn write_wireless_marker(
+        &self,
+        marker: &WirelessMarker,
+    ) -> Result<(), ProvisionError> {
         tokio::fs::create_dir_all(&self.state_dir)
             .await
             .map_err(|e| ProvisionError::Io(format!("create {}: {e}", self.state_dir.display())))?;
@@ -528,7 +592,10 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ProvisionError::Io(format!("remove {}: {e}", path.display()))),
+            Err(e) => Err(ProvisionError::Io(format!(
+                "remove {}: {e}",
+                path.display()
+            ))),
         }
     }
 
@@ -561,7 +628,10 @@ impl<R: CommandRunner> ProvisionMachine<R> {
 /// List elements owned here (MACs) contain no spaces, so whitespace-splitting then
 /// unquoting each token is unambiguous.
 fn parse_uci_list(raw: &str) -> Vec<String> {
-    raw.split_whitespace().map(unquote).filter(|s| !s.is_empty()).collect()
+    raw.split_whitespace()
+        .map(unquote)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Convert a raw confirm-timeout (seconds, `0` = default) into a `Duration` for
@@ -628,7 +698,9 @@ pub fn radios_reported_down(status_json: &str, radios: &[String]) -> Vec<String>
     radios
         .iter()
         .filter(|r| {
-            v.get(r.as_str()).and_then(|d| d.get("up")).and_then(serde_json::Value::as_bool)
+            v.get(r.as_str())
+                .and_then(|d| d.get("up"))
+                .and_then(serde_json::Value::as_bool)
                 == Some(false)
         })
         .cloned()
@@ -650,8 +722,10 @@ mod tests {
             existing_sections: vec!["network.hotspot".into(), "dhcp.hotspot".into()],
             ..Default::default()
         };
-        snap.prior.insert("network.hotspot".into(), "interface".into());
-        snap.prior.insert("network.hotspot.ipaddr".into(), "10.0.0.1".into());
+        snap.prior
+            .insert("network.hotspot".into(), "interface".into());
+        snap.prior
+            .insert("network.hotspot.ipaddr".into(), "10.0.0.1".into());
         // include a LIST option to prove prior_lists round-trips via `key+=value`.
         snap.prior_lists.insert(
             "wireless.pc_home_ap0.maclist".into(),
@@ -677,7 +751,9 @@ mod tests {
             if prog == "uci" && args.first() == Some(&"show") {
                 let body = match args.get(1).copied().unwrap_or("") {
                     "firewall" => "firewall.pc_public_portal=rule\nfirewall.pc_staff_zone=zone\n",
-                    "network" => "network.pc_public_dev.name='br-public'\nnetwork.lan.device='br-lan'\n",
+                    "network" => {
+                        "network.pc_public_dev.name='br-public'\nnetwork.lan.device='br-lan'\n"
+                    }
                     _ => "",
                 };
                 Ok(body.as_bytes().to_vec())
@@ -685,7 +761,10 @@ mod tests {
                 Ok(Vec::new())
             }
         });
-        assert_eq!(derive_gated_from_uci(&runner).await, vec!["br-public".to_string()]);
+        assert_eq!(
+            derive_gated_from_uci(&runner).await,
+            vec!["br-public".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -695,6 +774,41 @@ mod tests {
             Err(ProvisionError::Apply("uci not found".into()))
         });
         assert!(derive_gated_from_uci(&runner).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn derive_config_version_reads_pc_meta_stamp() {
+        // P4 reboot rehydrate: shell out to `uci show wireless` and read the owned
+        // pc_meta version stamp (via the pure parser).
+        let runner = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args == ["show", "wireless"] {
+                Ok(b"wireless.pc_public_ap0=wifi-iface\nwireless.pc_meta.config_version='cfg-boot'\n".to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        assert_eq!(
+            derive_config_version_from_uci(&runner).await,
+            Some("cfg-boot".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn derive_config_version_fail_soft() {
+        // A failing `uci show` → None (fresh-device semantics), never a panic.
+        let err_runner = RecordingRunner::with_responder(|_prog, _args| {
+            Err(ProvisionError::Apply("uci not found".into()))
+        });
+        assert_eq!(derive_config_version_from_uci(&err_runner).await, None);
+        // No stamp present → None too.
+        let bare = RecordingRunner::with_responder(|prog, args| {
+            if prog == "uci" && args == ["show", "wireless"] {
+                Ok(b"wireless.pc_public_ap0=wifi-iface\n".to_vec())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        assert_eq!(derive_config_version_from_uci(&bare).await, None);
     }
 
     // --- CP-managed wireless (P-W1) ----------------------------------------
@@ -719,13 +833,27 @@ mod tests {
         let snap = m.snapshot_wireless().await.unwrap();
         // pc_* captured; lan / admin NOT.
         assert!(snap.prior.contains_key("network.pc_public_if"));
-        assert_eq!(snap.prior.get("network.pc_public_if.ipaddr").map(String::as_str), Some("10.0.0.1"));
+        assert_eq!(
+            snap.prior
+                .get("network.pc_public_if.ipaddr")
+                .map(String::as_str),
+            Some("10.0.0.1")
+        );
         assert!(snap.prior.contains_key("wireless.pc_public_ap0"));
         assert!(!snap.prior.keys().any(|k| k.starts_with("network.lan")));
-        assert!(!snap.prior.keys().any(|k| k.starts_with("wireless.wifi_admin")));
+        assert!(!snap
+            .prior
+            .keys()
+            .any(|k| k.starts_with("wireless.wifi_admin")));
         // section decls recorded
-        assert!(snap.existing_sections.iter().any(|s| s == "network.pc_public_if"));
-        assert!(snap.existing_sections.iter().any(|s| s == "wireless.pc_public_ap0"));
+        assert!(snap
+            .existing_sections
+            .iter()
+            .any(|s| s == "network.pc_public_if"));
+        assert!(snap
+            .existing_sections
+            .iter()
+            .any(|s| s == "wireless.pc_public_ap0"));
         // radios extracted for the reload set
         assert_eq!(snapshot_radios(&snap), vec!["radio0".to_string()]);
     }
@@ -734,15 +862,23 @@ mod tests {
     async fn apply_wireless_reloads_each_radio_scoped() {
         let dir = temp_dir();
         let m = ProvisionMachine::new(RecordingRunner::new(), dir.path(), 8080);
-        m.apply_wireless(&[], false, &["radio0".to_string(), "radio1".to_string()]).await.unwrap();
+        m.apply_wireless(&[], false, &["radio0".to_string(), "radio1".to_string()])
+            .await
+            .unwrap();
         let flat = m.runner().flat();
         assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
         assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio1".to_string())));
         // NEVER a bare `wifi reload` (all radios).
         assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "reload"));
         // network reload precedes firewall reload.
-        let net = flat.iter().position(|(p, a)| p == "/etc/init.d/network" && a == "reload").unwrap();
-        let fw = flat.iter().position(|(p, a)| p == "/etc/init.d/firewall" && a == "reload").unwrap();
+        let net = flat
+            .iter()
+            .position(|(p, a)| p == "/etc/init.d/network" && a == "reload")
+            .unwrap();
+        let fw = flat
+            .iter()
+            .position(|(p, a)| p == "/etc/init.d/firewall" && a == "reload")
+            .unwrap();
         assert!(net < fw);
     }
 
@@ -754,19 +890,25 @@ mod tests {
         let dir = temp_dir();
         let runner = RecordingRunner::with_responder(|prog, args| {
             if prog == "/etc/init.d/dnsmasq" && args == ["restart"] {
-                Err(ProvisionError::Apply("dnsmasq exited 1 (non-fatal warning)".into()))
+                Err(ProvisionError::Apply(
+                    "dnsmasq exited 1 (non-fatal warning)".into(),
+                ))
             } else {
                 Ok(Vec::new()) // ubus status empty → no radio judged down
             }
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
         // dnsmasq failed → error surfaced.
-        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        let err = m
+            .apply_wireless(&[], false, &["radio0".to_string()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProvisionError::Apply(_)));
         // ...but the ubus liveness check STILL ran (previously the bare `?` returned first).
         let flat = m.runner().flat();
         assert!(
-            flat.iter().any(|(p, a)| p == "ubus" && a == "call network.wireless status"),
+            flat.iter()
+                .any(|(p, a)| p == "ubus" && a == "call network.wireless status"),
             "liveness must run even when dnsmasq restart fails: {flat:?}"
         );
     }
@@ -784,16 +926,23 @@ mod tests {
             }
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        let err = m
+            .apply_wireless(&[], false, &["radio0".to_string()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProvisionError::Apply(_)));
         let flat = m.runner().flat();
         // revert_owned ran: at least one `uci revert <cfg>` was issued.
         assert!(
-            flat.iter().any(|(p, a)| p == "uci" && a.starts_with("revert ")),
+            flat.iter()
+                .any(|(p, a)| p == "uci" && a.starts_with("revert ")),
             "commit failure must revert staged deltas: {flat:?}"
         );
         // And no reload sequence ran (we bailed at commit).
-        assert!(!flat.iter().any(|(p, _)| p == "/sbin/wifi"), "must not reload after commit failure: {flat:?}");
+        assert!(
+            !flat.iter().any(|(p, _)| p == "/sbin/wifi"),
+            "must not reload after commit failure: {flat:?}"
+        );
     }
 
     #[tokio::test]
@@ -808,12 +957,21 @@ mod tests {
             }
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let batch =
-            vec![UciCmd::Set { key: "wireless.pc_x_ap0".into(), value: "wifi-iface".into() }];
-        let err = m.apply_wireless(&batch, false, &["radio0".to_string()]).await.unwrap_err();
+        let batch = vec![UciCmd::Set {
+            key: "wireless.pc_x_ap0".into(),
+            value: "wifi-iface".into(),
+        }];
+        let err = m
+            .apply_wireless(&batch, false, &["radio0".to_string()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProvisionError::Apply(_)));
         let flat = m.runner().flat();
-        assert!(flat.iter().any(|(p, a)| p == "uci" && a.starts_with("revert ")), "{flat:?}");
+        assert!(
+            flat.iter()
+                .any(|(p, a)| p == "uci" && a.starts_with("revert ")),
+            "{flat:?}"
+        );
     }
 
     #[tokio::test]
@@ -830,16 +988,26 @@ mod tests {
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
         // `wifi up` succeeds → the radio recovers → apply reports success overall.
-        m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap();
+        m.apply_wireless(&[], false, &["radio0".to_string()])
+            .await
+            .unwrap();
         let flat = m.runner().flat();
-        let reloads = flat.iter().filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0").count();
-        assert_eq!(reloads, 2, "reload should be retried exactly once: {flat:?}");
+        let reloads = flat
+            .iter()
+            .filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0")
+            .count();
+        assert_eq!(
+            reloads, 2,
+            "reload should be retried exactly once: {flat:?}"
+        );
         assert!(
             flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())),
             "must escalate to a scoped `wifi up radio0`: {flat:?}"
         );
         // NEVER a bare `wifi reload` / `wifi up` (all radios) — stays scoped.
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && (a == "reload" || a == "up")));
+        assert!(!flat
+            .iter()
+            .any(|(p, a)| p == "/sbin/wifi" && (a == "reload" || a == "up")));
         // dnsmasq is still restarted despite the reload trouble.
         assert!(flat.contains(&("/etc/init.d/dnsmasq".to_string(), "restart".to_string())));
     }
@@ -858,11 +1026,19 @@ mod tests {
             }
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
+        let err = m
+            .apply_wireless(&[], false, &["radio0".to_string()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProvisionError::Apply(_)));
         let flat = m.runner().flat();
         // All three recovery rungs were tried before giving up.
-        assert_eq!(flat.iter().filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0").count(), 2);
+        assert_eq!(
+            flat.iter()
+                .filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0")
+                .count(),
+            2
+        );
         assert!(flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())));
     }
 
@@ -884,20 +1060,34 @@ mod tests {
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
         let snap = Snapshot::default();
-        m.rollback_to(&snap, &["network.pc_x_if".to_string()], &["radio0".to_string()])
-            .await
-            .unwrap();
+        m.rollback_to(
+            &snap,
+            &["network.pc_x_if".to_string()],
+            &["radio0".to_string()],
+        )
+        .await
+        .unwrap();
         let flat = m.runner().flat();
         // Retried the reload (2 attempts); no `wifi up` needed (2nd reload succeeded).
-        assert_eq!(flat.iter().filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0").count(), 2);
-        assert!(!flat.iter().any(|(p, a)| p == "/sbin/wifi" && a == "up radio0"));
+        assert_eq!(
+            flat.iter()
+                .filter(|(p, a)| p == "/sbin/wifi" && a == "reload radio0")
+                .count(),
+            2
+        );
+        assert!(!flat
+            .iter()
+            .any(|(p, a)| p == "/sbin/wifi" && a == "up radio0"));
     }
 
     #[test]
     fn radios_reported_down_only_flags_explicit_up_false() {
         let js = r#"{"radio0":{"up":false},"radio1":{"up":true}}"#;
         let radios = vec!["radio0".to_string(), "radio1".to_string()];
-        assert_eq!(radios_reported_down(js, &radios), vec!["radio0".to_string()]);
+        assert_eq!(
+            radios_reported_down(js, &radios),
+            vec!["radio0".to_string()]
+        );
         // Fail-open: unparseable / absent / missing-`up` never yields a "down".
         assert!(radios_reported_down("", &radios).is_empty());
         assert!(radios_reported_down("not json", &radios).is_empty());
@@ -920,14 +1110,25 @@ mod tests {
             }
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let err = m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap_err();
-        assert!(matches!(err, ProvisionError::Apply(_)), "want Apply err, got {err:?}");
+        let err = m
+            .apply_wireless(&[], false, &["radio0".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProvisionError::Apply(_)),
+            "want Apply err, got {err:?}"
+        );
         let flat = m.runner().flat();
         // The clean reload exited 0, so recovery is driven purely by the liveness
         // check: it forced a `wifi up radio0` and queried ubus twice.
-        assert!(flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())), "{flat:?}");
+        assert!(
+            flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())),
+            "{flat:?}"
+        );
         assert_eq!(
-            flat.iter().filter(|(p, a)| p == "ubus" && a == "call network.wireless status").count(),
+            flat.iter()
+                .filter(|(p, a)| p == "ubus" && a == "call network.wireless status")
+                .count(),
             2,
             "expected a verify-recover-reverify pair: {flat:?}"
         );
@@ -951,9 +1152,14 @@ mod tests {
             Ok(Vec::new())
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        m.apply_wireless(&[], false, &["radio0".to_string()]).await.unwrap();
+        m.apply_wireless(&[], false, &["radio0".to_string()])
+            .await
+            .unwrap();
         let flat = m.runner().flat();
-        assert!(flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())), "{flat:?}");
+        assert!(
+            flat.contains(&("/sbin/wifi".to_string(), "up radio0".to_string())),
+            "{flat:?}"
+        );
     }
 
     #[tokio::test]
@@ -965,20 +1171,32 @@ mod tests {
             existing_sections: vec!["network.pc_home_if".to_string()],
             ..Default::default()
         };
-        snap.prior.insert("network.pc_home_if".to_string(), "interface".to_string());
-        snap.prior.insert("network.pc_home_if.ipaddr".to_string(), "10.1.0.1".to_string());
+        snap.prior
+            .insert("network.pc_home_if".to_string(), "interface".to_string());
+        snap.prior.insert(
+            "network.pc_home_if.ipaddr".to_string(),
+            "10.1.0.1".to_string(),
+        );
         let current = vec![
             "network.pc_public_dev".to_string(),
             "network.pc_public_if".to_string(),
             "network.pc_home_if".to_string(),
         ];
-        m.rollback_to(&snap, &current, &["radio0".to_string()]).await.unwrap();
+        m.rollback_to(&snap, &current, &["radio0".to_string()])
+            .await
+            .unwrap();
         let flat = m.runner().flat();
         // Added sections deleted; the pre-existing one is NOT deleted, its value restored.
-        assert!(flat.contains(&("uci".to_string(), "delete network.pc_public_dev".to_string())));
+        assert!(flat.contains(&(
+            "uci".to_string(),
+            "delete network.pc_public_dev".to_string()
+        )));
         assert!(flat.contains(&("uci".to_string(), "delete network.pc_public_if".to_string())));
         assert!(!flat.contains(&("uci".to_string(), "delete network.pc_home_if".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "set network.pc_home_if.ipaddr=10.1.0.1".to_string())));
+        assert!(flat.contains(&(
+            "uci".to_string(),
+            "set network.pc_home_if.ipaddr=10.1.0.1".to_string()
+        )));
         assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
     }
 
@@ -996,10 +1214,18 @@ mod tests {
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
         let snap = m.snapshot_wireless().await.unwrap();
-        assert_eq!(snap.prior.get("wireless.pc_home_ap0.macfilter").map(String::as_str), Some("deny"));
+        assert_eq!(
+            snap.prior
+                .get("wireless.pc_home_ap0.macfilter")
+                .map(String::as_str),
+            Some("deny")
+        );
         assert_eq!(
             snap.prior_lists.get("wireless.pc_home_ap0.maclist"),
-            Some(&vec!["aa:bb:cc:dd:ee:ff".to_string(), "11:22:33:44:55:66".to_string()]),
+            Some(&vec![
+                "aa:bb:cc:dd:ee:ff".to_string(),
+                "11:22:33:44:55:66".to_string()
+            ]),
         );
         // the list key must NOT leak into the scalar map
         assert!(!snap.prior.contains_key("wireless.pc_home_ap0.maclist"));
@@ -1022,8 +1248,14 @@ mod tests {
             }
         });
         let m = ProvisionMachine::new(runner, dir.path(), 8080);
-        let snap = m.snapshot_wireless().await.expect("missing sqm must not fail snapshot");
-        assert!(snap.existing_sections.iter().any(|s| s == "wireless.pc_home_ap0"));
+        let snap = m
+            .snapshot_wireless()
+            .await
+            .expect("missing sqm must not fail snapshot");
+        assert!(snap
+            .existing_sections
+            .iter()
+            .any(|s| s == "wireless.pc_home_ap0"));
     }
 
     // F7: rollback restores a prior list via delete + add_list per element (a
@@ -1036,19 +1268,36 @@ mod tests {
             existing_sections: vec!["wireless.pc_home_ap0".to_string()],
             ..Default::default()
         };
-        snap.prior.insert("wireless.pc_home_ap0".to_string(), "wifi-iface".to_string());
+        snap.prior
+            .insert("wireless.pc_home_ap0".to_string(), "wifi-iface".to_string());
         snap.prior_lists.insert(
             "wireless.pc_home_ap0.maclist".to_string(),
-            vec!["aa:bb:cc:dd:ee:ff".to_string(), "11:22:33:44:55:66".to_string()],
+            vec![
+                "aa:bb:cc:dd:ee:ff".to_string(),
+                "11:22:33:44:55:66".to_string(),
+            ],
         );
-        m.rollback_to(&snap, &["wireless.pc_home_ap0".to_string()], &["radio0".to_string()])
-            .await
-            .unwrap();
+        m.rollback_to(
+            &snap,
+            &["wireless.pc_home_ap0".to_string()],
+            &["radio0".to_string()],
+        )
+        .await
+        .unwrap();
         let flat = m.runner().flat();
         // clear the list, then append each prior element
-        assert!(flat.contains(&("uci".to_string(), "delete wireless.pc_home_ap0.maclist".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "add_list wireless.pc_home_ap0.maclist=aa:bb:cc:dd:ee:ff".to_string())));
-        assert!(flat.contains(&("uci".to_string(), "add_list wireless.pc_home_ap0.maclist=11:22:33:44:55:66".to_string())));
+        assert!(flat.contains(&(
+            "uci".to_string(),
+            "delete wireless.pc_home_ap0.maclist".to_string()
+        )));
+        assert!(flat.contains(&(
+            "uci".to_string(),
+            "add_list wireless.pc_home_ap0.maclist=aa:bb:cc:dd:ee:ff".to_string()
+        )));
+        assert!(flat.contains(&(
+            "uci".to_string(),
+            "add_list wireless.pc_home_ap0.maclist=11:22:33:44:55:66".to_string()
+        )));
     }
 
     #[tokio::test]
@@ -1059,11 +1308,15 @@ mod tests {
             existing_sections: vec!["network.pc_home_if".into()],
             ..Default::default()
         };
-        snap.prior.insert("network.pc_home_if.ipaddr".into(), "10.1.0.1".into());
+        snap.prior
+            .insert("network.pc_home_if.ipaddr".into(), "10.1.0.1".into());
         let marker = WirelessMarker {
             config_version: "cfg-7".into(),
             radios: vec!["radio0".into(), "radio1".into()],
-            current_sections: vec!["network.pc_public_if".into(), "network.pc_public_dev".into()],
+            current_sections: vec![
+                "network.pc_public_if".into(),
+                "network.pc_public_dev".into(),
+            ],
             gated_ifaces: vec!["br-public".into()],
             deadline_unix: 1_700_000_000,
             snapshot: snap,
@@ -1080,8 +1333,20 @@ mod tests {
         let seq = reload_sequence_multi(&["radio0".to_string(), "radio1".to_string()]);
         assert_eq!(seq[0].0, "/etc/init.d/network");
         assert_eq!(seq[1].0, "/etc/init.d/firewall");
-        assert_eq!(seq[2], ("/sbin/wifi", vec!["reload".to_string(), "radio0".to_string()]));
-        assert_eq!(seq[3], ("/sbin/wifi", vec!["reload".to_string(), "radio1".to_string()]));
+        assert_eq!(
+            seq[2],
+            (
+                "/sbin/wifi",
+                vec!["reload".to_string(), "radio0".to_string()]
+            )
+        );
+        assert_eq!(
+            seq[3],
+            (
+                "/sbin/wifi",
+                vec!["reload".to_string(), "radio1".to_string()]
+            )
+        );
         assert_eq!(seq[4].0, "/etc/init.d/dnsmasq");
     }
 }
