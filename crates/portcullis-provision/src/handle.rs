@@ -95,12 +95,20 @@ impl ProvisionHandle {
 #[async_trait]
 impl Provisioner for ProvisionHandle {
     async fn set_wireless(&self, state: WirelessDesiredState) -> Result<(), ProvisionError> {
-        self.call(|reply| Command::Set { state: Box::new(state), reply }).await
+        self.call(|reply| Command::Set {
+            state: Box::new(state),
+            reply,
+        })
+        .await
     }
 
     async fn confirm_wireless(&self, config_version: &str) -> Result<(), ProvisionError> {
         let v = config_version.to_string();
-        self.call(|reply| Command::Confirm { config_version: v, reply }).await
+        self.call(|reply| Command::Confirm {
+            config_version: v,
+            reply,
+        })
+        .await
     }
 
     async fn get_wireless(&self) -> Result<WirelessDesiredState, ProvisionError> {
@@ -123,7 +131,11 @@ pub fn run_provision_subsystem<R>(
     runner: R,
     state_dir: impl Into<std::path::PathBuf>,
     responder_port: u16,
-) -> (ProvisionHandle, mpsc::Receiver<WirelessStatus>, tokio::task::JoinHandle<()>)
+) -> (
+    ProvisionHandle,
+    mpsc::Receiver<WirelessStatus>,
+    tokio::task::JoinHandle<()>,
+)
 where
     R: CommandRunner + 'static,
 {
@@ -140,7 +152,11 @@ pub fn run_provision_subsystem_with_policy<R>(
     state_dir: impl Into<std::path::PathBuf>,
     responder_port: u16,
     protected_radios: Vec<String>,
-) -> (ProvisionHandle, mpsc::Receiver<WirelessStatus>, tokio::task::JoinHandle<()>)
+) -> (
+    ProvisionHandle,
+    mpsc::Receiver<WirelessStatus>,
+    tokio::task::JoinHandle<()>,
+)
 where
     R: CommandRunner + 'static,
 {
@@ -151,13 +167,11 @@ where
         machine,
         cmd_rx,
         wireless_status_tx,
-        // TODO(reboot-gate): rehydrate last_committed version at boot. The boot
-        // gate self-heal restores the ENFORCEMENT gate scope from persistent UCI,
-        // but GetWirelessConfig still reports an empty config_version after a reboot
-        // until the CP re-pushes (last_committed only set on apply). Rehydrating it
-        // would mean persisting config_version in an owned UCI option and
-        // reconstructing the desired-state from `uci show` here — invasive, so
-        // deferred. The captive gate itself is correct post-reboot regardless.
+        // Rehydrated from persistent UCI in `run()` BEFORE the first command (the
+        // async boot step): the owned `wireless.pc_meta` version stamp survives a
+        // reboot, so `GetWirelessConfig` / liveness report the correct
+        // config_version without waiting on a CP re-push (P4). A fresh device with
+        // no stamp keeps `None` exactly as before. See `ProvisionActor::run`.
         last_committed: None,
         protected_radios,
     };
@@ -181,13 +195,39 @@ impl<R: CommandRunner> ProvisionActor<R> {
     async fn run(mut self) {
         // Apply-and-ACK (CP-SOT, P2): no commit-confirm watchdog, so nothing to
         // reconcile at start (an interrupted apply is just re-pushed by the CP).
+        //
+        // Reboot rehydrate (P4): the committed `config_version` is only set on apply
+        // and lives in RAM, so a reboot would leave `get_wireless` reporting an empty
+        // version until the CP re-pushes — making an in-sync router look drifted. The
+        // version is persisted on flash in the owned `wireless.pc_meta` section
+        // (written by every commit; reverted with the snapshot on rollback), so read
+        // it back here and seed `last_committed` with a version-only desired-state.
+        // Fail-soft: a missing stamp (fresh device) or a `uci` error leaves it `None`
+        // exactly as before. Only the config_version is reconstructed — the per-SSID
+        // config still comes from LIVE UCI (liveness) and the gate scope from the boot
+        // self-heal; a version-only committed view carries empty `ssids`, which the CP
+        // rescope path deliberately treats as "do not clobber the live gate scope".
+        if self.last_committed.is_none() {
+            if let Some(config_version) =
+                sm::derive_config_version_from_uci(self.machine.runner()).await
+            {
+                tracing::info!(config_version = %config_version, "rehydrated committed wireless config_version from persistent UCI at boot");
+                self.last_committed = Some(WirelessDesiredState {
+                    config_version,
+                    ..Default::default()
+                });
+            }
+        }
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 Command::Set { state, reply } => {
                     let r = self.handle_set_wireless(*state).await;
                     let _ = reply.send(r);
                 }
-                Command::Confirm { config_version, reply } => {
+                Command::Confirm {
+                    config_version,
+                    reply,
+                } => {
                     let r = self.handle_confirm_wireless(&config_version).await;
                     let _ = reply.send(r);
                 }
@@ -267,7 +307,11 @@ impl<R: CommandRunner> ProvisionActor<R> {
         // report FAILED — never leave a half-applied config on a CGNAT router.
         if let Err(e) = self.machine.apply_wireless(&batch, true, &radios).await {
             tracing::warn!(config_version = %state.config_version, error = %e, "wireless apply failed; rolling back");
-            if let Err(re) = self.machine.rollback_to(&snapshot, &current_sections, &radios).await {
+            if let Err(re) = self
+                .machine
+                .rollback_to(&snapshot, &current_sections, &radios)
+                .await
+            {
                 tracing::error!(config_version = %state.config_version, error = %re, "wireless rollback after failed apply ALSO failed");
             }
             self.emit_wireless(sm::wireless_status(
@@ -315,7 +359,10 @@ impl<R: CommandRunner> ProvisionActor<R> {
     /// committed on `set`). Kept for backward-compat with a CP that still sends a
     /// confirm after a push — it always succeeds. No pending state, nothing to do.
     async fn handle_confirm_wireless(&self, config_version: &str) -> Result<(), ProvisionError> {
-        tracing::debug!(config_version, "confirm_wireless: no-op (apply-and-ACK already committed)");
+        tracing::debug!(
+            config_version,
+            "confirm_wireless: no-op (apply-and-ACK already committed)"
+        );
         Ok(())
     }
 
@@ -339,7 +386,11 @@ mod tests {
             ssid: format!("WifiHub {slug}"),
             radios: vec!["radio0".into()],
             encryption: if gated { "none".into() } else { "psk2".into() },
-            key: if gated { String::new() } else { "supersecret".into() },
+            key: if gated {
+                String::new()
+            } else {
+                "supersecret".into()
+            },
             hidden: false,
             isolate: true,
             gated,
@@ -415,7 +466,10 @@ mod tests {
         assert_eq!(s.state, ProvisionState::Committed);
         assert_eq!(s.config_version, "cfg-1");
         // per-SSID ifaces reported (fed to enforcement scoping when gated).
-        assert!(s.per_ssid.iter().any(|r| r.slug == "public" && r.iface == "br-public"));
+        assert!(s
+            .per_ssid
+            .iter()
+            .any(|r| r.slug == "public" && r.iface == "br-public"));
         // No further status (no watchdog fire).
         assert!(wdrain(&mut wrx).is_empty());
 
@@ -442,13 +496,23 @@ mod tests {
 
         // Advance well past any old watchdog window — nothing rolls back.
         tokio::time::advance(std::time::Duration::from_secs(600)).await;
-        assert!(wdrain(&mut wrx).is_empty(), "no watchdog rollback after a flap");
+        assert!(
+            wdrain(&mut wrx).is_empty(),
+            "no watchdog rollback after a flap"
+        );
 
         // Gate scope held (derived from UCI on apply, persisted to tmpfs).
         let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
-        assert_eq!(gated, vec!["br-public".to_string()], "gate scope must hold, never []");
+        assert_eq!(
+            gated,
+            vec!["br-public".to_string()],
+            "gate scope must hold, never []"
+        );
         // Committed view intact.
-        assert_eq!(handle.get_wireless().await.unwrap().config_version, "cfg-flap");
+        assert_eq!(
+            handle.get_wireless().await.unwrap().config_version,
+            "cfg-flap"
+        );
 
         drop(handle);
         let _ = join.await;
@@ -464,17 +528,26 @@ mod tests {
         // surfaces the error → local revert + FAILED.
         let runner = RecordingRunner::with_responder(|prog, _args| {
             if prog == "/sbin/wifi" {
-                return Err(ProvisionError::Apply("radio dark: wifi bring-up failed".into()));
+                return Err(ProvisionError::Apply(
+                    "radio dark: wifi bring-up failed".into(),
+                ));
             }
             Ok(Vec::new())
         });
         let (handle, mut wrx, join) =
             run_provision_subsystem(runner, dir.path().to_path_buf(), 8080);
 
-        let err = handle.set_wireless(wstate("cfg-dark", 90)).await.unwrap_err();
+        let err = handle
+            .set_wireless(wstate("cfg-dark", 90))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProvisionError::Apply(_)));
         let s = wrx.recv().await.unwrap();
-        assert_eq!(s.state, ProvisionState::Failed, "apply failure → FAILED (local revert)");
+        assert_eq!(
+            s.state,
+            ProvisionState::Failed,
+            "apply failure → FAILED (local revert)"
+        );
         assert_eq!(s.config_version, "cfg-dark");
 
         drop(handle);
@@ -530,11 +603,26 @@ mod tests {
         );
 
         // wstate SSIDs default to radio0 → hits the protected radio → rejected.
-        let err = handle.set_wireless(wstate("cfg-prot", 90)).await.unwrap_err();
+        let err = handle
+            .set_wireless(wstate("cfg-prot", 90))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProvisionError::Invalid(_)));
-        assert!(wdrain(&mut wrx).is_empty(), "rejected push must apply nothing");
-        // Not a single uci/wifi command ran — the guard is pre-apply.
-        assert!(runner.flat().is_empty(), "protected-radio reject must touch nothing: {:?}", runner.flat());
+        assert!(
+            wdrain(&mut wrx).is_empty(),
+            "rejected push must apply nothing"
+        );
+        // The reject is pre-apply: nothing beyond the one read-only P4 boot rehydrate
+        // (`uci show wireless`) runs — no set/commit/reload/wifi at all.
+        let touched: Vec<_> = runner
+            .flat()
+            .into_iter()
+            .filter(|(p, a)| !(p == "uci" && a == "show wireless"))
+            .collect();
+        assert!(
+            touched.is_empty(),
+            "protected-radio reject must touch nothing: {touched:?}"
+        );
 
         drop(handle);
         let _ = join.await;
@@ -579,9 +667,15 @@ mod tests {
         let flat = runner.flat();
         let has = |p: &str, a: &str| flat.iter().any(|(pp, aa)| pp == p && aa == a);
         // Owned sections for BOTH ssids are rendered (pc_<slug>_*).
-        assert!(has("uci", "set wireless.pc_public_ap0=wifi-iface"), "{flat:?}");
+        assert!(
+            has("uci", "set wireless.pc_public_ap0=wifi-iface"),
+            "{flat:?}"
+        );
         assert!(has("uci", "set network.pc_home_dev=device"), "{flat:?}");
-        assert!(has("uci", "set firewall.pc_public_portal=rule"), "gated SSID gets a portal rule");
+        assert!(
+            has("uci", "set firewall.pc_public_portal=rule"),
+            "gated SSID gets a portal rule"
+        );
         // Per-config commits + ordered reload; wifi scoped to radio0, never bare.
         assert!(has("uci", "commit network"));
         assert!(has("uci", "commit firewall"));
@@ -609,6 +703,108 @@ mod tests {
         handle.confirm_wireless("cfg-real").await.unwrap();
         // No extra status frames from the no-op confirms.
         assert!(wdrain(&mut wrx).is_empty());
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    /// A runner that both serves the gate-derive read AND round-trips the P4
+    /// pc_meta version stamp: `uci show wireless` reports the stamped
+    /// `config_version` (as a real device would after a commit), so a freshly
+    /// constructed handle rehydrates `last_committed` at boot.
+    fn boot_rehydrate_runner(config_version: &'static str) -> RecordingRunner {
+        RecordingRunner::with_responder(move |prog, args| {
+            if prog == "uci" && args.first() == Some(&"show") {
+                let body = match args.get(1).copied().unwrap_or("") {
+                    "wireless" => {
+                        return Ok(format!(
+                            "wireless.pc_meta=pc_meta\nwireless.pc_meta.config_version='{config_version}'\n"
+                        )
+                        .into_bytes())
+                    }
+                    "firewall" => "firewall.pc_public_portal=rule\n",
+                    "network" => "network.pc_public_dev.name='br-public'\n",
+                    _ => "",
+                };
+                return Ok(body.as_bytes().to_vec());
+            }
+            Ok(Vec::new())
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_rehydrates_config_version_from_uci_without_repush() {
+        // P4: after a reboot the CP has NOT re-pushed, but the owned pc_meta version
+        // stamp persists on flash — so get_wireless reports the committed version
+        // immediately (what liveness / GetWirelessConfig echo), no re-push needed.
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _wrx, join) = run_provision_subsystem(
+            boot_rehydrate_runner("cfg-persisted"),
+            dir.path().to_path_buf(),
+            8080,
+        );
+
+        // No set_wireless call in this session — the version comes purely from the
+        // boot rehydrate reading persistent UCI.
+        let got = handle.get_wireless().await.unwrap();
+        assert_eq!(got.config_version, "cfg-persisted");
+        // Version-only view: ssids are NOT reconstructed (the CP rescope path treats
+        // empty ssids as "keep the live UCI-derived gate scope", never clobber).
+        assert!(got.ssids.is_empty());
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_no_stamp_leaves_last_committed_none() {
+        // A fresh device (no pc_meta stamp) → get_wireless returns a default
+        // (empty version) exactly as before the P4 change.
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _wrx, join) =
+            run_provision_subsystem(RecordingRunner::new(), dir.path().to_path_buf(), 8080);
+
+        let got = handle.get_wireless().await.unwrap();
+        assert_eq!(got.config_version, "");
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_failure_rollback_reverts_config_version_stamp() {
+        // The pc_meta version stamp is an OWNED section rendered in the batch, so a
+        // failed apply's rollback deletes it (it did not exist pre-apply) — a
+        // rolled-back apply must not leave a stale version stamped on flash.
+        let dir = tempfile::tempdir().unwrap();
+        // Dark radio → apply fails → rollback runs.
+        let runner = RecordingRunner::with_responder(|prog, _args| {
+            if prog == "/sbin/wifi" {
+                return Err(ProvisionError::Apply("radio dark".into()));
+            }
+            Ok(Vec::new())
+        });
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
+
+        let _ = handle
+            .set_wireless(wstate("cfg-rollback", 90))
+            .await
+            .unwrap_err();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Failed);
+
+        let flat = runner.flat();
+        // The stamp was set in the batch...
+        assert!(
+            flat.iter().any(|(p, a)| p == "uci" && a == "set wireless.pc_meta.config_version=cfg-rollback"),
+            "version stamp must be part of the applied batch: {flat:?}"
+        );
+        // ...and rollback deleted the added pc_meta section (not present pre-apply).
+        assert!(
+            flat.iter()
+                .any(|(p, a)| p == "uci" && a == "delete wireless.pc_meta"),
+            "rollback must delete the added pc_meta stamp: {flat:?}"
+        );
 
         drop(handle);
         let _ = join.await;

@@ -55,13 +55,19 @@ pub enum UciCmd {
 
 impl UciCmd {
     fn set(key: impl Into<String>, value: impl Into<String>) -> Self {
-        UciCmd::Set { key: key.into(), value: value.into() }
+        UciCmd::Set {
+            key: key.into(),
+            value: value.into(),
+        }
     }
     fn delete(key: impl Into<String>) -> Self {
         UciCmd::Delete { key: key.into() }
     }
     fn add_list(key: impl Into<String>, value: impl Into<String>) -> Self {
-        UciCmd::AddList { key: key.into(), value: value.into() }
+        UciCmd::AddList {
+            key: key.into(),
+            value: value.into(),
+        }
     }
 
     /// The explicit argv (excluding the `uci` program itself) for this command.
@@ -69,7 +75,9 @@ impl UciCmd {
     pub fn argv(&self) -> Vec<String> {
         match self {
             UciCmd::Set { key, value } => vec!["set".to_string(), format!("{key}={value}")],
-            UciCmd::AddList { key, value } => vec!["add_list".to_string(), format!("{key}={value}")],
+            UciCmd::AddList { key, value } => {
+                vec!["add_list".to_string(), format!("{key}={value}")]
+            }
             UciCmd::Delete { key } => vec!["delete".to_string(), key.clone()],
         }
     }
@@ -77,7 +85,6 @@ impl UciCmd {
 
 /// The engine's default wifi-device when an SSID leaves `radios` empty.
 pub const DEFAULT_RADIO: &str = "radio0";
-
 
 // ===========================================================================
 // CP-managed wireless (P-W1): arbitrary owned SSIDs.
@@ -97,6 +104,20 @@ pub const DEFAULT_RADIO: &str = "radio0";
 pub const WIRELESS_OWNER: &str = "portcullis-wireless";
 /// Name prefix on every owned wireless section (the ownership marker in the name).
 pub const WIRELESS_SECTION_PREFIX: &str = "pc_";
+
+/// The single owned "meta" section (in the `wireless` config) that persists the
+/// COMMITTED `config_version` across a reboot (P4). `wireless.pc_meta` is
+/// `pc_`-prefixed → owned (snapshot captures it, the reconcile delete-diff/teardown
+/// handles it, rollback restores/deletes it), and lives in an OWNED config
+/// (`wireless` ∈ [`OWNED_CONFIGS`], already committed + reloaded). It is config,
+/// not runtime state, so persisting it on flash honours invariant #1. Reloading
+/// `wireless` for a meta-only change is harmless (no wifi-iface touched).
+const META_SECTION: &str = "wireless.pc_meta";
+/// The UCI *type* of the meta section (arbitrary owned type; not a wifi-iface, so
+/// netifd/`wifi reload` ignore it — it carries no radio/device).
+const META_SECTION_TYPE: &str = "pc_meta";
+/// The owned option on [`META_SECTION`] holding the committed `config_version`.
+const META_CONFIG_VERSION: &str = "config_version";
 /// Max CP-managed SSID `wifi-iface`s the engine will place on one radio (the
 /// admin/management SSID already consumes one VIF on top of this).
 ///
@@ -204,7 +225,9 @@ pub fn parse_gated_bridges_from_uci(firewall_show: &str, network_show: &str) -> 
     let mut gated_slugs: Vec<String> = Vec::new();
     for line in firewall_show.lines() {
         let line = line.trim();
-        let Some((key, raw_val)) = line.split_once('=') else { continue };
+        let Some((key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
         // Only the section-decl line (`firewall.pc_<slug>_portal=rule`), never an
         // option line (`firewall.pc_<slug>_portal.target=…`).
         if key.matches('.').count() != 1 {
@@ -218,10 +241,16 @@ pub fn parse_gated_bridges_from_uci(firewall_show: &str, network_show: &str) -> 
         if unquote(raw_val) != "rule" {
             continue;
         }
-        let Some((_, section)) = key.split_once('.') else { continue };
+        let Some((_, section)) = key.split_once('.') else {
+            continue;
+        };
         // `pc_<slug>_portal` → `<slug>` (slug may itself contain `_`).
-        let Some(rest) = section.strip_prefix(WIRELESS_SECTION_PREFIX) else { continue };
-        let Some(slug) = rest.strip_suffix(PORTAL_SUFFIX) else { continue };
+        let Some(rest) = section.strip_prefix(WIRELESS_SECTION_PREFIX) else {
+            continue;
+        };
+        let Some(slug) = rest.strip_suffix(PORTAL_SUFFIX) else {
+            continue;
+        };
         if slug.is_empty() {
             continue;
         }
@@ -240,7 +269,9 @@ pub fn parse_gated_bridges_from_uci(firewall_show: &str, network_show: &str) -> 
         let want = format!("network.{WIRELESS_SECTION_PREFIX}{slug}_dev.name");
         for line in network_show.lines() {
             let line = line.trim();
-            let Some((key, raw_val)) = line.split_once('=') else { continue };
+            let Some((key, raw_val)) = line.split_once('=') else {
+                continue;
+            };
             if key != want {
                 continue;
             }
@@ -266,8 +297,16 @@ pub fn parse_gated_bridges_from_uci(firewall_show: &str, network_show: &str) -> 
 /// [`validate_wireless`] passed. `responder_port` is the LOCAL :8080 redirect port.
 pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     let s = spec.slug.as_str();
-    let enc = if spec.encryption.is_empty() { "none" } else { spec.encryption.as_str() };
-    let egress = if spec.egress_zone.is_empty() { WAN_ZONE } else { spec.egress_zone.as_str() };
+    let enc = if spec.encryption.is_empty() {
+        "none"
+    } else {
+        spec.encryption.as_str()
+    };
+    let egress = if spec.egress_zone.is_empty() {
+        WAN_ZONE
+    } else {
+        spec.egress_zone.as_str()
+    };
     let iface = format!("pc_{s}_if");
 
     let mut c = Vec::with_capacity(48);
@@ -303,7 +342,11 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         c.push(UciCmd::set(format!("{ap}.device"), *radio));
         // wifi-iface mode: `""` => `"ap"` (validation rejects anything but "ap"
         // today; "mesh" is plumbed but deferred).
-        let mode = if spec.mode.is_empty() { "ap" } else { spec.mode.as_str() };
+        let mode = if spec.mode.is_empty() {
+            "ap"
+        } else {
+            spec.mode.as_str()
+        };
         c.push(UciCmd::set(format!("{ap}.mode"), mode));
         c.push(UciCmd::set(format!("{ap}.network"), &iface));
         c.push(UciCmd::set(format!("{ap}.ssid"), &spec.ssid));
@@ -311,7 +354,10 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         if enc != "none" {
             c.push(UciCmd::set(format!("{ap}.key"), &spec.key));
         }
-        c.push(UciCmd::set(format!("{ap}.isolate"), if spec.isolate { "1" } else { "0" }));
+        c.push(UciCmd::set(
+            format!("{ap}.isolate"),
+            if spec.isolate { "1" } else { "0" },
+        ));
         if spec.hidden {
             c.push(UciCmd::set(format!("{ap}.hidden"), "1"));
         }
@@ -327,7 +373,10 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         // default above (a later `set` on the same key wins in the applied
         // batch). "" = no override (keep the encryption-derived default).
         if !spec.ieee80211w.is_empty() {
-            c.push(UciCmd::set(format!("{ap}.ieee80211w"), spec.ieee80211w.as_str()));
+            c.push(UciCmd::set(
+                format!("{ap}.ieee80211w"),
+                spec.ieee80211w.as_str(),
+            ));
         }
         // Phase 3: 802.11r Fast Transition.
         if spec.ieee80211r {
@@ -335,7 +384,10 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         }
         // maxassoc: cap associated stations per AP (0 = unlimited => unset).
         if spec.max_clients > 0 {
-            c.push(UciCmd::set(format!("{ap}.maxassoc"), spec.max_clients.to_string()));
+            c.push(UciCmd::set(
+                format!("{ap}.maxassoc"),
+                spec.max_clients.to_string(),
+            ));
         }
         // MAC access-control (hostapd macfilter): "allow" = only listed MACs may
         // associate; "deny" = listed MACs are blocked. maclist is a UCI *list* —
@@ -435,10 +487,16 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     if spec.gated {
         let rp = format!("firewall.pc_{s}_portal");
         c.push(UciCmd::set(&rp, "rule"));
-        c.push(UciCmd::set(format!("{rp}.name"), format!("Allow-{s}-portal")));
+        c.push(UciCmd::set(
+            format!("{rp}.name"),
+            format!("Allow-{s}-portal"),
+        ));
         c.push(UciCmd::set(format!("{rp}.src"), s));
         c.push(UciCmd::set(format!("{rp}.proto"), "tcp"));
-        c.push(UciCmd::set(format!("{rp}.dest_port"), responder_port.to_string()));
+        c.push(UciCmd::set(
+            format!("{rp}.dest_port"),
+            responder_port.to_string(),
+        ));
         c.push(UciCmd::set(format!("{rp}.target"), "ACCEPT"));
         c.push(UciCmd::set(format!("{rp}.owner"), WIRELESS_OWNER));
     }
@@ -451,7 +509,10 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     for (i, t) in spec.internal_targets.iter().enumerate() {
         let ra = format!("firewall.pc_{s}_allow{i}");
         c.push(UciCmd::set(&ra, "rule"));
-        c.push(UciCmd::set(format!("{ra}.name"), format!("Allow-{s}-int{i}")));
+        c.push(UciCmd::set(
+            format!("{ra}.name"),
+            format!("Allow-{s}-int{i}"),
+        ));
         c.push(UciCmd::set(format!("{ra}.src"), s));
         c.push(UciCmd::set(format!("{ra}.dest"), &t.zone));
         c.push(UciCmd::set(format!("{ra}.dest_ip"), &t.cidr));
@@ -468,8 +529,14 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         c.push(UciCmd::set(&q, "queue"));
         c.push(UciCmd::set(format!("{q}.interface"), &spec.bridge_name));
         c.push(UciCmd::set(format!("{q}.enabled"), "1"));
-        c.push(UciCmd::set(format!("{q}.download"), spec.rate_down_kbps.to_string())); // to client (ingress)
-        c.push(UciCmd::set(format!("{q}.upload"), spec.rate_up_kbps.to_string())); // from client (egress)
+        c.push(UciCmd::set(
+            format!("{q}.download"),
+            spec.rate_down_kbps.to_string(),
+        )); // to client (ingress)
+        c.push(UciCmd::set(
+            format!("{q}.upload"),
+            spec.rate_up_kbps.to_string(),
+        )); // from client (egress)
         c.push(UciCmd::set(format!("{q}.qdisc"), "cake"));
         c.push(UciCmd::set(format!("{q}.script"), "piece_of_cake.qos"));
         c.push(UciCmd::set(format!("{q}.owner"), WIRELESS_OWNER));
@@ -503,10 +570,55 @@ pub fn render_peer_allow(peer: &PeerAllow) -> Vec<UciCmd> {
     ]
 }
 
+/// Render the owned `wireless.pc_meta` section that PERSISTS the committed
+/// `config_version` across a reboot (P4): `wireless.pc_meta.config_version=<v>`,
+/// stamped with [`WIRELESS_OWNER`]. Empty `config_version` renders NOTHING (a
+/// fresh device / teardown with no version has nothing durable to stamp, and an
+/// empty option would round-trip as an empty version anyway). Read back at boot by
+/// [`parse_config_version_from_uci`] to rehydrate `last_committed`.
+pub fn render_config_version_meta(config_version: &str) -> Vec<UciCmd> {
+    if config_version.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        UciCmd::set(META_SECTION, META_SECTION_TYPE),
+        UciCmd::set(
+            format!("{META_SECTION}.{META_CONFIG_VERSION}"),
+            config_version,
+        ),
+        UciCmd::set(format!("{META_SECTION}.owner"), WIRELESS_OWNER),
+    ]
+}
+
+/// Read the committed `config_version` back from `uci show wireless` output (the
+/// reboot rehydration for P4). Returns the value of the owned
+/// `wireless.pc_meta.config_version` option, or `None` when absent (a fresh device
+/// that has never had a CP push — `last_committed` stays `None`). PURE: no I/O;
+/// [`crate::sm::derive_config_version_from_uci`] wraps it with the shell-out.
+/// Quotes are stripped via [`unquote`] to match how `uci show` renders the value.
+pub fn parse_config_version_from_uci(wireless_show: &str) -> Option<String> {
+    let want = format!("{META_SECTION}.{META_CONFIG_VERSION}");
+    for line in wireless_show.lines() {
+        let line = line.trim();
+        let Some((key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        if key != want {
+            continue;
+        }
+        let v = unquote(raw_val);
+        if v.is_empty() {
+            return None;
+        }
+        return Some(v);
+    }
+    None
+}
+
 /// Render the full desired-state `uci set` batch (every SSID, then every
-/// inter-SSID allow-forwarding). Pure; assumes [`validate_wireless`] passed. The
-/// set/delete DIFF against on-device owned state is computed in `sm.rs` — this
-/// renders the desired half.
+/// inter-SSID allow-forwarding, then the owned `pc_meta` version stamp). Pure;
+/// assumes [`validate_wireless`] passed. The set/delete DIFF against on-device
+/// owned state is computed in `sm.rs` — this renders the desired half.
 ///
 /// Inter-SSID isolation is the DEFAULT: with no `peer_allows` this renders no
 /// `pc_peer_*` forwardings, so fw3's default-deny keeps every owned SSID zone
@@ -514,6 +626,12 @@ pub fn render_peer_allow(peer: &PeerAllow) -> Vec<UciCmd> {
 /// [`PeerAllow`] opens exactly one direction; a removed allow disappears from this
 /// batch and the reconcile diff (owned-section recognition) deletes its stale
 /// forwarding on the next apply.
+///
+/// The trailing `pc_meta` section (P4) persists `config_version` on flash so a
+/// reboot can rehydrate `last_committed` without a CP re-push; it is owned, so the
+/// snapshot/rollback/reconcile machinery handles it exactly like any other owned
+/// section. A teardown-all (no ssids) with a version still stamps it — the last
+/// committed version is preserved until superseded.
 pub fn render_wireless(state: &WirelessDesiredState, responder_port: u16) -> Vec<UciCmd> {
     let mut c = Vec::new();
     for ssid in &state.ssids {
@@ -522,6 +640,7 @@ pub fn render_wireless(state: &WirelessDesiredState, responder_port: u16) -> Vec
     for peer in &state.peer_allows {
         c.extend(render_peer_allow(peer));
     }
+    c.extend(render_config_version_meta(&state.config_version));
     c
 }
 
@@ -570,13 +689,18 @@ pub fn render_ssid_teardown(slug: &str) -> Vec<UciCmd> {
 /// separated pairs of hex digits.
 fn is_mac_addr(s: &str) -> bool {
     let parts: Vec<&str> = s.split(':').collect();
-    parts.len() == 6 && parts.iter().all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A slug: `[a-z0-9_]` (lowercase only), 1..=16 chars.
 fn is_slug(s: &str) -> bool {
     let n = s.chars().count();
-    (1..=16).contains(&n) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    (1..=16).contains(&n)
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// Validate a whole [`WirelessDesiredState`] before ANY apply (fail-OPEN: reject
@@ -589,7 +713,8 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
     let bad = |m: String| Err(ProvisionError::Invalid(m));
 
     if state.confirm_timeout_secs != 0
-        && !(MIN_CONFIRM_TIMEOUT_SECS..=MAX_CONFIRM_TIMEOUT_SECS).contains(&state.confirm_timeout_secs)
+        && !(MIN_CONFIRM_TIMEOUT_SECS..=MAX_CONFIRM_TIMEOUT_SECS)
+            .contains(&state.confirm_timeout_secs)
     {
         return bad(format!(
             "confirm_timeout_secs must be 0 (default) or in [{MIN_CONFIRM_TIMEOUT_SECS}, {MAX_CONFIRM_TIMEOUT_SECS}], got {}",
@@ -604,7 +729,10 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
     // (P1 #8). Validated before the teardown-all early return — a teardown still
     // persists a marker keyed by config_version.
     if state.config_version.chars().count() > 128 {
-        return bad(format!("config_version too long ({} chars, max 128)", state.config_version.chars().count()));
+        return bad(format!(
+            "config_version too long ({} chars, max 128)",
+            state.config_version.chars().count()
+        ));
     }
     if state.config_version.chars().any(|c| c.is_control()) {
         return bad("config_version must not contain control characters".to_string());
@@ -641,43 +769,64 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             return bad(format!("ssid for '{s}' must be 1..=32 chars"));
         }
         if name.chars().any(|c| c.is_control()) {
-            return bad(format!("ssid for '{s}' must not contain control characters"));
+            return bad(format!(
+                "ssid for '{s}' must not contain control characters"
+            ));
         }
 
         let radios = effective_radios(ssid);
         if radios.len() > MAX_RADIOS_PER_SSID {
-            return bad(format!("slug '{s}' spans {} radios (max {MAX_RADIOS_PER_SSID})", radios.len()));
+            return bad(format!(
+                "slug '{s}' spans {} radios (max {MAX_RADIOS_PER_SSID})",
+                radios.len()
+            ));
         }
         for r in &radios {
             if !is_uci_ident(r) {
-                return bad(format!("radio '{r}' for slug '{s}' is not a UCI identifier"));
+                return bad(format!(
+                    "radio '{r}' for slug '{s}' is not a UCI identifier"
+                ));
             }
             *radio_vifs.entry(*r).or_insert(0) += 1;
         }
 
-        let enc = if ssid.encryption.is_empty() { "none" } else { ssid.encryption.as_str() };
+        let enc = if ssid.encryption.is_empty() {
+            "none"
+        } else {
+            ssid.encryption.as_str()
+        };
         if !matches!(enc, "none" | "psk2" | "psk2+ccmp" | "sae" | "sae-mixed") {
             return bad(format!("encryption '{enc}' for slug '{s}' unsupported"));
         }
         if enc != "none" {
             let kl = ssid.key.chars().count();
             if !(8..=63).contains(&kl) {
-                return bad(format!("encryption '{enc}' for slug '{s}' requires key 8..=63 chars, got {kl}"));
+                return bad(format!(
+                    "encryption '{enc}' for slug '{s}' requires key 8..=63 chars, got {kl}"
+                ));
             }
             // A WPA passphrase is printable ASCII (0x20..=0x7e). Rejecting
             // control chars / non-ASCII keeps a key from corrupting the rendered
             // config or the tmpfs marker's line-based round-trip (rollback safety).
             if ssid.key.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
-                return bad(format!("key for slug '{s}' must be printable ASCII (32..=126)"));
+                return bad(format!(
+                    "key for slug '{s}' must be printable ASCII (32..=126)"
+                ));
             }
         }
 
         // Phase 3: wireless mode. `""` => `"ap"` (the only supported value).
         // `"mesh"` is plumbed through proto/domain/render but DEFERRED — reject
         // it (and anything else) here so a mesh push never applies.
-        let mode = if ssid.mode.is_empty() { "ap" } else { ssid.mode.as_str() };
+        let mode = if ssid.mode.is_empty() {
+            "ap"
+        } else {
+            ssid.mode.as_str()
+        };
         if mode != "ap" {
-            return bad(format!("mode '{mode}' for slug '{s}' chưa hỗ trợ (chỉ 'ap')"));
+            return bad(format!(
+                "mode '{mode}' for slug '{s}' chưa hỗ trợ (chỉ 'ap')"
+            ));
         }
         // Belt-and-suspenders: a gated captive SSID must never be a mesh node
         // (mesh has no client iface to gate). Redundant with the check above
@@ -700,22 +849,33 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             "" | "disable" => {}
             "allow" | "deny" => {
                 if ssid.mac_list.is_empty() {
-                    return bad(format!("mac_policy '{}' for slug '{s}' requires a non-empty mac_list", ssid.mac_policy));
+                    return bad(format!(
+                        "mac_policy '{}' for slug '{s}' requires a non-empty mac_list",
+                        ssid.mac_policy
+                    ));
                 }
                 for m in &ssid.mac_list {
                     if !is_mac_addr(m) {
-                        return bad(format!("mac_list entry '{m}' for slug '{s}' is not a MAC (aa:bb:cc:dd:ee:ff)"));
+                        return bad(format!(
+                            "mac_list entry '{m}' for slug '{s}' is not a MAC (aa:bb:cc:dd:ee:ff)"
+                        ));
                     }
                 }
             }
-            other => return bad(format!("mac_policy '{other}' for slug '{s}' unsupported (allow|deny|disable)")),
+            other => {
+                return bad(format!(
+                    "mac_policy '{other}' for slug '{s}' unsupported (allow|deny|disable)"
+                ))
+            }
         }
 
         // Validate the RAW bridge_name (is_uci_ident already rejects whitespace)
         // so validation matches what render_ssid / rescope emit verbatim.
         let br = ssid.bridge_name.as_str();
         if !is_uci_ident(br) {
-            return bad(format!("bridge_name '{br}' for slug '{s}' is not a valid iface name"));
+            return bad(format!(
+                "bridge_name '{br}' for slug '{s}' is not a valid iface name"
+            ));
         }
         if RESERVED_BRIDGES.contains(&br) {
             return bad(format!("bridge_name '{br}' is reserved"));
@@ -757,27 +917,47 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             seen_ports.push(p);
         }
 
-        let egress = if ssid.egress_zone.is_empty() { WAN_ZONE } else { ssid.egress_zone.as_str() };
+        let egress = if ssid.egress_zone.is_empty() {
+            WAN_ZONE
+        } else {
+            ssid.egress_zone.as_str()
+        };
         if !is_uci_ident(egress) {
-            return bad(format!("egress_zone '{egress}' for slug '{s}' is not a valid zone name"));
+            return bad(format!(
+                "egress_zone '{egress}' for slug '{s}' is not a valid zone name"
+            ));
         }
         if RESERVED_EGRESS.contains(&egress) {
-            return bad(format!("egress_zone '{egress}' for slug '{s}' is not allowed (would bypass the gate)"));
+            return bad(format!(
+                "egress_zone '{egress}' for slug '{s}' is not allowed (would bypass the gate)"
+            ));
         }
 
         let gw = parse_ipv4(&ssid.ipaddr).ok_or_else(|| {
-            ProvisionError::Invalid(format!("ipaddr '{}' for slug '{s}' not a dotted-quad IPv4", ssid.ipaddr))
+            ProvisionError::Invalid(format!(
+                "ipaddr '{}' for slug '{s}' not a dotted-quad IPv4",
+                ssid.ipaddr
+            ))
         })?;
         let mask = parse_ipv4(&ssid.netmask).ok_or_else(|| {
-            ProvisionError::Invalid(format!("netmask '{}' for slug '{s}' not a dotted-quad IPv4", ssid.netmask))
+            ProvisionError::Invalid(format!(
+                "netmask '{}' for slug '{s}' not a dotted-quad IPv4",
+                ssid.netmask
+            ))
         })?;
         if !is_contiguous_mask(mask) {
-            return bad(format!("netmask '{}' for slug '{s}' is not a contiguous subnet mask", ssid.netmask));
+            return bad(format!(
+                "netmask '{}' for slug '{s}' is not a contiguous subnet mask",
+                ssid.netmask
+            ));
         }
         let net = mask_and(gw, mask);
         let bcast = or_inv(net, mask);
         if gw == net || gw == bcast {
-            return bad(format!("ipaddr '{}' for slug '{s}' is the network/broadcast address", ssid.ipaddr));
+            return bad(format!(
+                "ipaddr '{}' for slug '{s}' is the network/broadcast address",
+                ssid.ipaddr
+            ));
         }
         for (onet, obcast, oslug) in &subnets {
             if net <= *obcast && *onet <= bcast {
@@ -794,29 +974,51 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
             // Digits-only rejects any whitespace/control/sign.
             let is_digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
             if !is_digits(&ssid.dhcp_start) {
-                return bad(format!("dhcp_start '{}' for slug '{s}' must be digits only", ssid.dhcp_start));
+                return bad(format!(
+                    "dhcp_start '{}' for slug '{s}' must be digits only",
+                    ssid.dhcp_start
+                ));
             }
             if !is_digits(&ssid.dhcp_limit) {
-                return bad(format!("dhcp_limit '{}' for slug '{s}' must be digits only", ssid.dhcp_limit));
+                return bad(format!(
+                    "dhcp_limit '{}' for slug '{s}' must be digits only",
+                    ssid.dhcp_limit
+                ));
             }
             let start: u32 = ssid.dhcp_start.parse().map_err(|_| {
-                ProvisionError::Invalid(format!("dhcp_start '{}' for slug '{s}' not a number", ssid.dhcp_start))
+                ProvisionError::Invalid(format!(
+                    "dhcp_start '{}' for slug '{s}' not a number",
+                    ssid.dhcp_start
+                ))
             })?;
             let limit: u32 = ssid.dhcp_limit.parse().map_err(|_| {
-                ProvisionError::Invalid(format!("dhcp_limit '{}' for slug '{s}' not a number", ssid.dhcp_limit))
+                ProvisionError::Invalid(format!(
+                    "dhcp_limit '{}' for slug '{s}' not a number",
+                    ssid.dhcp_limit
+                ))
             })?;
             if start == 0 || start > 65535 {
-                return bad(format!("dhcp_start out of range (1..=65535) for slug '{s}': {start}"));
+                return bad(format!(
+                    "dhcp_start out of range (1..=65535) for slug '{s}': {start}"
+                ));
             }
             if limit == 0 || limit > 65535 {
-                return bad(format!("dhcp_limit out of range (1..=65535) for slug '{s}': {limit}"));
+                return bad(format!(
+                    "dhcp_limit out of range (1..=65535) for slug '{s}': {limit}"
+                ));
             }
             // leasetime is rendered raw too; `is_leasetime` trims internally, which
             // would mask a trailing newline — so reject whitespace/control up front.
-            if ssid.dhcp_leasetime.chars().any(|c| c.is_whitespace() || c.is_control())
+            if ssid
+                .dhcp_leasetime
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
                 || !is_leasetime(&ssid.dhcp_leasetime)
             {
-                return bad(format!("dhcp_leasetime '{}' for slug '{s}' is invalid", ssid.dhcp_leasetime));
+                return bad(format!(
+                    "dhcp_leasetime '{}' for slug '{s}' is invalid",
+                    ssid.dhcp_leasetime
+                ));
             }
 
             // P1 static DHCP reservations: each is a MAC -> fixed IP pinned on THIS
@@ -863,7 +1065,10 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
                     return bad(format!("duplicate reservation mac '{mac}' for slug '{s}'"));
                 }
                 if seen_res_ips.contains(&ip) {
-                    return bad(format!("duplicate reservation ipaddr '{}' for slug '{s}'", r.ipaddr));
+                    return bad(format!(
+                        "duplicate reservation ipaddr '{}' for slug '{s}'",
+                        r.ipaddr
+                    ));
                 }
                 // Overlap with the dynamic pool is legal (dnsmasq prefers the static
                 // lease) but a smell — warn so the operator can move it OUT of range.
@@ -888,7 +1093,9 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
         // that is not a bare IPv4 or IPv4/prefix CIDR.
         for t in &ssid.internal_targets {
             if t.zone.is_empty() {
-                return bad(format!("internal_target for slug '{s}' has an empty dest zone"));
+                return bad(format!(
+                    "internal_target for slug '{s}' has an empty dest zone"
+                ));
             }
             if t.zone == s {
                 return bad(format!(
@@ -907,7 +1114,9 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
 
     for (r, n) in &radio_vifs {
         if *n > MAX_SSIDS_PER_RADIO {
-            return bad(format!("radio '{r}' would carry {n} SSIDs (max {MAX_SSIDS_PER_RADIO})"));
+            return bad(format!(
+                "radio '{r}' would carry {n} SSIDs (max {MAX_SSIDS_PER_RADIO})"
+            ));
         }
     }
 
@@ -921,19 +1130,29 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
     for pa in &state.peer_allows {
         let (from, to) = (pa.from_slug.as_str(), pa.to_slug.as_str());
         if !is_slug(from) {
-            return bad(format!("peer_allow from_slug must match [a-z0-9_]{{1,16}}, got '{from}'"));
+            return bad(format!(
+                "peer_allow from_slug must match [a-z0-9_]{{1,16}}, got '{from}'"
+            ));
         }
         if !is_slug(to) {
-            return bad(format!("peer_allow to_slug must match [a-z0-9_]{{1,16}}, got '{to}'"));
+            return bad(format!(
+                "peer_allow to_slug must match [a-z0-9_]{{1,16}}, got '{to}'"
+            ));
         }
         if from == to {
-            return bad(format!("peer_allow from_slug == to_slug ('{from}'); a zone always reaches itself"));
+            return bad(format!(
+                "peer_allow from_slug == to_slug ('{from}'); a zone always reaches itself"
+            ));
         }
         if !seen_slugs.contains(&from) {
-            return bad(format!("peer_allow from_slug '{from}' is not a slug of any SSID in this push"));
+            return bad(format!(
+                "peer_allow from_slug '{from}' is not a slug of any SSID in this push"
+            ));
         }
         if !seen_slugs.contains(&to) {
-            return bad(format!("peer_allow to_slug '{to}' is not a slug of any SSID in this push"));
+            return bad(format!(
+                "peer_allow to_slug '{to}' is not a slug of any SSID in this push"
+            ));
         }
         if seen_pairs.contains(&(from, to)) {
             return bad(format!("duplicate peer_allow '{from}' -> '{to}'"));
@@ -976,7 +1195,9 @@ pub fn validate_protected_radios(
 
 /// A UCI section/device identifier: `[A-Za-z0-9_-]+`, non-empty.
 fn is_uci_ident(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Parse a strict dotted-quad IPv4 into a `u32` (host order). Rejects anything
@@ -1065,7 +1286,10 @@ mod tests {
     fn argv_is_explicit_no_shell() {
         assert_eq!(
             UciCmd::set("network.hotspot.ipaddr", "10.0.0.1").argv(),
-            vec!["set".to_string(), "network.hotspot.ipaddr=10.0.0.1".to_string()]
+            vec![
+                "set".to_string(),
+                "network.hotspot.ipaddr=10.0.0.1".to_string()
+            ]
         );
         assert_eq!(
             UciCmd::delete("dhcp.hotspot").argv(),
@@ -1081,7 +1305,11 @@ mod tests {
             ssid: format!("WifiHub {slug}"),
             radios: vec!["radio0".into()],
             encryption: if gated { "none".into() } else { "psk2".into() },
-            key: if gated { String::new() } else { "supersecret".into() },
+            key: if gated {
+                String::new()
+            } else {
+                "supersecret".into()
+            },
             hidden: false,
             isolate: true,
             gated,
@@ -1136,14 +1364,18 @@ mod tests {
     }
 
     fn peer(from: &str, to: &str) -> PeerAllow {
-        PeerAllow { from_slug: from.into(), to_slug: to.into() }
+        PeerAllow {
+            from_slug: from.into(),
+            to_slug: to.into(),
+        }
     }
 
     fn has_set(cmds: &[UciCmd], key: &str, value: &str) -> bool {
         cmds.iter().any(|c| *c == UciCmd::set(key, value))
     }
     fn has_key(cmds: &[UciCmd], key: &str) -> bool {
-        cmds.iter().any(|c| matches!(c, UciCmd::Set { key: k, .. } if k == key))
+        cmds.iter()
+            .any(|c| matches!(c, UciCmd::Set { key: k, .. } if k == key))
     }
     fn has_delete(cmds: &[UciCmd], key: &str) -> bool {
         cmds.iter().any(|c| *c == UciCmd::delete(key))
@@ -1170,9 +1402,17 @@ mod tests {
         assert!(has_set(&cmds, "firewall.pc_public_dhcp.dest_port", "67"));
         assert!(has_set(&cmds, "firewall.pc_public_dns.dest_port", "53"));
         // gated → portal rule opens the responder port
-        assert!(has_set(&cmds, "firewall.pc_public_portal.dest_port", "8080"));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_public_portal.dest_port",
+            "8080"
+        ));
         // every section stamped with the owner
-        assert!(has_set(&cmds, "firewall.pc_public_zone.owner", WIRELESS_OWNER));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_public_zone.owner",
+            WIRELESS_OWNER
+        ));
     }
 
     #[test]
@@ -1193,10 +1433,18 @@ mod tests {
         let cmds = render_ssid(&spec, 8080);
         // First reservation -> dhcp.pc_devices_host0 with a lowercased MAC + name.
         assert!(has_set(&cmds, "dhcp.pc_devices_host0", "host"));
-        assert!(has_set(&cmds, "dhcp.pc_devices_host0.mac", "aa:bb:cc:dd:ee:01"));
+        assert!(has_set(
+            &cmds,
+            "dhcp.pc_devices_host0.mac",
+            "aa:bb:cc:dd:ee:01"
+        ));
         assert!(has_set(&cmds, "dhcp.pc_devices_host0.ip", "10.0.0.240"));
         assert!(has_set(&cmds, "dhcp.pc_devices_host0.name", "vending-1"));
-        assert!(has_set(&cmds, "dhcp.pc_devices_host0.owner", WIRELESS_OWNER));
+        assert!(has_set(
+            &cmds,
+            "dhcp.pc_devices_host0.owner",
+            WIRELESS_OWNER
+        ));
         // Second reservation -> host1, no `name` option (empty hostname).
         assert!(has_set(&cmds, "dhcp.pc_devices_host1", "host"));
         assert!(has_set(&cmds, "dhcp.pc_devices_host1.ip", "10.0.0.241"));
@@ -1225,7 +1473,11 @@ mod tests {
             .filter(|c| matches!(c, UciCmd::AddList { key, .. } if key == "network.pc_devices_dev.ports"))
             .count();
         assert_eq!(n_ports, 3, "one add_list per bridge port");
-        assert!(has_set(&cmds, "network.pc_devices_dev.owner", WIRELESS_OWNER));
+        assert!(has_set(
+            &cmds,
+            "network.pc_devices_dev.owner",
+            WIRELESS_OWNER
+        ));
     }
 
     #[test]
@@ -1245,7 +1497,11 @@ mod tests {
         assert!(has_set(&cmds, "dhcp.pc_devices.dynamicdhcp", "0"));
         // Reservation still rendered as a `config host` under the same instance.
         assert!(has_set(&cmds, "dhcp.pc_devices_host0", "host"));
-        assert!(has_set(&cmds, "dhcp.pc_devices_host0.mac", "aa:bb:cc:dd:ee:11"));
+        assert!(has_set(
+            &cmds,
+            "dhcp.pc_devices_host0.mac",
+            "aa:bb:cc:dd:ee:11"
+        ));
         assert!(has_set(&cmds, "dhcp.pc_devices_host0.ip", "10.0.0.240"));
     }
 
@@ -1257,9 +1513,9 @@ mod tests {
         let spec = valid_ssid("public", true); // defaults: static_only=false, no ports
         let cmds = render_ssid(&spec, 8080);
         assert!(!has_key(&cmds, "network.pc_public_dev.ports"));
-        assert!(!cmds
-            .iter()
-            .any(|c| matches!(c, UciCmd::AddList { key, .. } if key == "network.pc_public_dev.ports")));
+        assert!(!cmds.iter().any(
+            |c| matches!(c, UciCmd::AddList { key, .. } if key == "network.pc_public_dev.ports")
+        ));
         assert!(!has_key(&cmds, "dhcp.pc_public.dynamicdhcp"));
     }
 
@@ -1267,22 +1523,48 @@ mod tests {
     fn render_ssid_emits_allow_rules_for_internal_targets() {
         let mut spec = valid_ssid("devices", false);
         spec.internal_targets = vec![
-            InternalTarget { zone: "lan".into(), cidr: "192.168.1.50".into() },
-            InternalTarget { zone: "mgmt".into(), cidr: "10.9.0.0/24".into() },
+            InternalTarget {
+                zone: "lan".into(),
+                cidr: "192.168.1.50".into(),
+            },
+            InternalTarget {
+                zone: "mgmt".into(),
+                cidr: "10.9.0.0/24".into(),
+            },
         ];
         let cmds = render_ssid(&spec, 8080);
         // First target -> firewall.pc_devices_allow0 (src=slug zone, dest=zone, dest_ip=cidr).
         assert!(has_set(&cmds, "firewall.pc_devices_allow0", "rule"));
-        assert!(has_set(&cmds, "firewall.pc_devices_allow0.name", "Allow-devices-int0"));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_devices_allow0.name",
+            "Allow-devices-int0"
+        ));
         assert!(has_set(&cmds, "firewall.pc_devices_allow0.src", "devices"));
         assert!(has_set(&cmds, "firewall.pc_devices_allow0.dest", "lan"));
-        assert!(has_set(&cmds, "firewall.pc_devices_allow0.dest_ip", "192.168.1.50"));
-        assert!(has_set(&cmds, "firewall.pc_devices_allow0.target", "ACCEPT"));
-        assert!(has_set(&cmds, "firewall.pc_devices_allow0.owner", WIRELESS_OWNER));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_devices_allow0.dest_ip",
+            "192.168.1.50"
+        ));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_devices_allow0.target",
+            "ACCEPT"
+        ));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_devices_allow0.owner",
+            WIRELESS_OWNER
+        ));
         // Second target -> allow1 with the CIDR dest_ip.
         assert!(has_set(&cmds, "firewall.pc_devices_allow1", "rule"));
         assert!(has_set(&cmds, "firewall.pc_devices_allow1.dest", "mgmt"));
-        assert!(has_set(&cmds, "firewall.pc_devices_allow1.dest_ip", "10.9.0.0/24"));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_devices_allow1.dest_ip",
+            "10.9.0.0/24"
+        ));
         // The allow section name carries the owned pc_ prefix (snapshot/cleanup).
         assert!(is_owned_wireless_section("firewall.pc_devices_allow0"));
     }
@@ -1297,8 +1579,11 @@ mod tests {
     fn render_ssid_no_host_sections_when_dhcp_disabled() {
         let mut spec = valid_ssid("devices", false);
         spec.dhcp_disabled = true;
-        spec.reservations =
-            vec![DhcpReservation { mac: "aa:bb:cc:dd:ee:01".into(), ipaddr: "10.0.0.240".into(), hostname: String::new() }];
+        spec.reservations = vec![DhcpReservation {
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            ipaddr: "10.0.0.240".into(),
+            hostname: String::new(),
+        }];
         let cmds = render_ssid(&spec, 8080);
         assert!(!has_key(&cmds, "dhcp.pc_devices_host0"));
     }
@@ -1327,15 +1612,29 @@ mod tests {
     fn render_ssid_pmf_ieee80211w_by_encryption() {
         let mut sae = valid_ssid("s3", false);
         sae.encryption = "sae".into();
-        assert!(has_set(&render_ssid(&sae, 8080), "wireless.pc_s3_ap0.ieee80211w", "2"));
+        assert!(has_set(
+            &render_ssid(&sae, 8080),
+            "wireless.pc_s3_ap0.ieee80211w",
+            "2"
+        ));
 
         let mut mixed = valid_ssid("mx", false);
         mixed.encryption = "sae-mixed".into();
-        assert!(has_set(&render_ssid(&mixed, 8080), "wireless.pc_mx_ap0.ieee80211w", "1"));
+        assert!(has_set(
+            &render_ssid(&mixed, 8080),
+            "wireless.pc_mx_ap0.ieee80211w",
+            "1"
+        ));
 
         // psk2 and open never set PMF.
-        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "wireless.pc_home_ap0.ieee80211w"));
-        assert!(!has_key(&render_ssid(&valid_ssid("public", true), 8080), "wireless.pc_public_ap0.ieee80211w"));
+        assert!(!has_key(
+            &render_ssid(&valid_ssid("home", false), 8080),
+            "wireless.pc_home_ap0.ieee80211w"
+        ));
+        assert!(!has_key(
+            &render_ssid(&valid_ssid("public", true), 8080),
+            "wireless.pc_public_ap0.ieee80211w"
+        ));
     }
 
     // Phase 3 (F-mode): mode defaults to "ap" when unset; a set value renders
@@ -1348,7 +1647,11 @@ mod tests {
         // explicit "ap" => "ap"
         let mut ap = valid_ssid("home", false);
         ap.mode = "ap".into();
-        assert!(has_set(&render_ssid(&ap, 8080), "wireless.pc_home_ap0.mode", "ap"));
+        assert!(has_set(
+            &render_ssid(&ap, 8080),
+            "wireless.pc_home_ap0.mode",
+            "ap"
+        ));
     }
 
     // Phase 3 (F-11r): ieee80211r=true emits `ieee80211r '1'`; false emits nothing.
@@ -1356,9 +1659,16 @@ mod tests {
     fn render_ssid_ieee80211r_fast_transition() {
         let mut ft = valid_ssid("home", false);
         ft.ieee80211r = true;
-        assert!(has_set(&render_ssid(&ft, 8080), "wireless.pc_home_ap0.ieee80211r", "1"));
+        assert!(has_set(
+            &render_ssid(&ft, 8080),
+            "wireless.pc_home_ap0.ieee80211r",
+            "1"
+        ));
         // default (false) => no key.
-        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "wireless.pc_home_ap0.ieee80211r"));
+        assert!(!has_key(
+            &render_ssid(&valid_ssid("home", false), 8080),
+            "wireless.pc_home_ap0.ieee80211r"
+        ));
     }
 
     // Phase 3 (F-11w): an explicit ieee80211w spec value OVERRIDES the
@@ -1375,7 +1685,9 @@ mod tests {
             .iter()
             .rev()
             .find_map(|c| match c {
-                UciCmd::Set { key, value } if key == "wireless.pc_s3_ap0.ieee80211w" => Some(value.clone()),
+                UciCmd::Set { key, value } if key == "wireless.pc_s3_ap0.ieee80211w" => {
+                    Some(value.clone())
+                }
                 _ => None,
             })
             .expect("ieee80211w must be set");
@@ -1384,12 +1696,20 @@ mod tests {
         // On open encryption (no default), an explicit "2" is emitted.
         let mut open = valid_ssid("public", true);
         open.ieee80211w = "2".into();
-        assert!(has_set(&render_ssid(&open, 8080), "wireless.pc_public_ap0.ieee80211w", "2"));
+        assert!(has_set(
+            &render_ssid(&open, 8080),
+            "wireless.pc_public_ap0.ieee80211w",
+            "2"
+        ));
 
         // Empty override => encryption default preserved (sae => "2"), no extra write.
         let mut plain_sae = valid_ssid("s3", false);
         plain_sae.encryption = "sae".into();
-        assert!(has_set(&render_ssid(&plain_sae, 8080), "wireless.pc_s3_ap0.ieee80211w", "2"));
+        assert!(has_set(
+            &render_ssid(&plain_sae, 8080),
+            "wireless.pc_s3_ap0.ieee80211w",
+            "2"
+        ));
     }
 
     // Phase 2 (F6): maxassoc set only when max_clients > 0.
@@ -1397,9 +1717,16 @@ mod tests {
     fn render_ssid_maxassoc_when_capped() {
         let mut capped = valid_ssid("home", false);
         capped.max_clients = 32;
-        assert!(has_set(&render_ssid(&capped, 8080), "wireless.pc_home_ap0.maxassoc", "32"));
+        assert!(has_set(
+            &render_ssid(&capped, 8080),
+            "wireless.pc_home_ap0.maxassoc",
+            "32"
+        ));
         // unlimited (0) => unset
-        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "wireless.pc_home_ap0.maxassoc"));
+        assert!(!has_key(
+            &render_ssid(&valid_ssid("home", false), 8080),
+            "wireless.pc_home_ap0.maxassoc"
+        ));
     }
 
     fn has_add_list(cmds: &[UciCmd], key: &str, value: &str) -> bool {
@@ -1414,8 +1741,16 @@ mod tests {
         s.mac_list = vec!["AA:BB:CC:DD:EE:FF".into(), "11:22:33:44:55:66".into()];
         let cmds = render_ssid(&s, 8080);
         assert!(has_set(&cmds, "wireless.pc_home_ap0.macfilter", "deny"));
-        assert!(has_add_list(&cmds, "wireless.pc_home_ap0.maclist", "aa:bb:cc:dd:ee:ff")); // lowercased
-        assert!(has_add_list(&cmds, "wireless.pc_home_ap0.maclist", "11:22:33:44:55:66"));
+        assert!(has_add_list(
+            &cmds,
+            "wireless.pc_home_ap0.maclist",
+            "aa:bb:cc:dd:ee:ff"
+        )); // lowercased
+        assert!(has_add_list(
+            &cmds,
+            "wireless.pc_home_ap0.maclist",
+            "11:22:33:44:55:66"
+        ));
     }
 
     #[test]
@@ -1452,12 +1787,17 @@ mod tests {
 
     #[test]
     fn render_ssid_no_sqm_when_uncapped() {
-        assert!(!has_key(&render_ssid(&valid_ssid("home", false), 8080), "sqm.pc_home"));
+        assert!(!has_key(
+            &render_ssid(&valid_ssid("home", false), 8080),
+            "sqm.pc_home"
+        ));
     }
 
     #[test]
     fn teardown_removes_sqm_section() {
-        assert!(render_ssid_teardown("home").iter().any(|c| *c == UciCmd::delete("sqm.pc_home")));
+        assert!(render_ssid_teardown("home")
+            .iter()
+            .any(|c| *c == UciCmd::delete("sqm.pc_home")));
     }
 
     #[test]
@@ -1517,12 +1857,18 @@ mod tests {
         for v in ["", "1", "2"] {
             let mut ok = valid_ssid("home", false);
             ok.ieee80211w = v.into();
-            assert!(validate_wireless(&wstate1(ok)).is_ok(), "ieee80211w '{v}' should pass");
+            assert!(
+                validate_wireless(&wstate1(ok)).is_ok(),
+                "ieee80211w '{v}' should pass"
+            );
         }
         for v in ["3", "yes", "0x"] {
             let mut bad = valid_ssid("home", false);
             bad.ieee80211w = v.into();
-            assert!(validate_wireless(&wstate1(bad)).is_err(), "ieee80211w '{v}' should fail");
+            assert!(
+                validate_wireless(&wstate1(bad)).is_err(),
+                "ieee80211w '{v}' should fail"
+            );
         }
     }
 
@@ -1722,8 +2068,16 @@ mod tests {
     fn validate_wireless_rejects_duplicate_reservation_ip() {
         let mut s = ssid_on("devices", false, 0);
         s.reservations = vec![
-            DhcpReservation { mac: "aa:bb:cc:dd:ee:01".into(), ipaddr: "10.0.0.240".into(), hostname: String::new() },
-            DhcpReservation { mac: "aa:bb:cc:dd:ee:02".into(), ipaddr: "10.0.0.240".into(), hostname: String::new() },
+            DhcpReservation {
+                mac: "aa:bb:cc:dd:ee:01".into(),
+                ipaddr: "10.0.0.240".into(),
+                hostname: String::new(),
+            },
+            DhcpReservation {
+                mac: "aa:bb:cc:dd:ee:02".into(),
+                ipaddr: "10.0.0.240".into(),
+                hostname: String::new(),
+            },
         ];
         assert!(validate_wireless(&wstate(vec![s])).is_err());
     }
@@ -1732,8 +2086,14 @@ mod tests {
     fn validate_wireless_accepts_valid_internal_targets() {
         let mut s = ssid_on("devices", false, 0);
         s.internal_targets = vec![
-            InternalTarget { zone: "lan".into(), cidr: "192.168.1.50".into() },
-            InternalTarget { zone: "mgmt".into(), cidr: "10.9.0.0/24".into() },
+            InternalTarget {
+                zone: "lan".into(),
+                cidr: "192.168.1.50".into(),
+            },
+            InternalTarget {
+                zone: "mgmt".into(),
+                cidr: "10.9.0.0/24".into(),
+            },
         ];
         assert!(validate_wireless(&wstate(vec![s])).is_ok());
     }
@@ -1741,7 +2101,10 @@ mod tests {
     #[test]
     fn validate_wireless_rejects_internal_target_empty_zone() {
         let mut s = ssid_on("devices", false, 0);
-        s.internal_targets = vec![InternalTarget { zone: String::new(), cidr: "192.168.1.50".into() }];
+        s.internal_targets = vec![InternalTarget {
+            zone: String::new(),
+            cidr: "192.168.1.50".into(),
+        }];
         assert!(validate_wireless(&wstate(vec![s])).is_err());
     }
 
@@ -1749,18 +2112,27 @@ mod tests {
     fn validate_wireless_rejects_internal_target_own_zone() {
         let mut s = ssid_on("devices", false, 0);
         // dest zone == the SSID's own slug (its own zone) — a foot-gun no-op.
-        s.internal_targets = vec![InternalTarget { zone: "devices".into(), cidr: "192.168.1.50".into() }];
+        s.internal_targets = vec![InternalTarget {
+            zone: "devices".into(),
+            cidr: "192.168.1.50".into(),
+        }];
         assert!(validate_wireless(&wstate(vec![s])).is_err());
     }
 
     #[test]
     fn validate_wireless_rejects_internal_target_bad_cidr() {
         let mut s = ssid_on("devices", false, 0);
-        s.internal_targets = vec![InternalTarget { zone: "lan".into(), cidr: "not-an-ip".into() }];
+        s.internal_targets = vec![InternalTarget {
+            zone: "lan".into(),
+            cidr: "not-an-ip".into(),
+        }];
         assert!(validate_wireless(&wstate(vec![s])).is_err());
         // A prefix out of range (/40) is also rejected.
         let mut s2 = ssid_on("devices", false, 0);
-        s2.internal_targets = vec![InternalTarget { zone: "lan".into(), cidr: "10.0.0.0/40".into() }];
+        s2.internal_targets = vec![InternalTarget {
+            zone: "lan".into(),
+            cidr: "10.0.0.0/40".into(),
+        }];
         assert!(validate_wireless(&wstate(vec![s2])).is_err());
     }
 
@@ -1831,6 +2203,80 @@ mod tests {
         assert!(!is_owned_wireless_section("firewall.wan"));
     }
 
+    // --- P4 reboot config_version persistence (pc_meta) --------------------
+
+    // render_wireless appends the owned `wireless.pc_meta` version stamp so the
+    // committed config_version survives a reboot; it is owned + on br-lan-free
+    // config (`wireless`), stamped with the owner.
+    #[test]
+    fn render_wireless_stamps_owned_config_version_meta() {
+        let st = wstate(vec![ssid_on("public", true, 0)]); // config_version = "cfg-1"
+        let cmds = render_wireless(&st, 8080);
+        assert!(has_set(&cmds, "wireless.pc_meta", "pc_meta"));
+        assert!(has_set(&cmds, "wireless.pc_meta.config_version", "cfg-1"));
+        assert!(has_set(&cmds, "wireless.pc_meta.owner", WIRELESS_OWNER));
+        // owned → snapshot/reconcile/rollback handle it like any other pc_ section.
+        assert!(is_owned_wireless_section("wireless.pc_meta"));
+        // Never br-lan / a non-owned section.
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UciCmd::Set { key, .. } if key.contains("br-lan"))));
+    }
+
+    // A teardown-all (no ssids) with a version still stamps pc_meta so the last
+    // committed version is preserved until superseded (rehydrate stays truthful).
+    #[test]
+    fn render_wireless_teardown_still_stamps_version() {
+        let mut st = wstate(vec![]); // empty ssids (teardown)
+        st.config_version = "cfg-teardown".into();
+        let cmds = render_wireless(&st, 8080);
+        assert!(has_set(
+            &cmds,
+            "wireless.pc_meta.config_version",
+            "cfg-teardown"
+        ));
+    }
+
+    // An empty config_version stamps nothing (fresh device / no committed version):
+    // an empty option would round-trip as an empty version anyway.
+    #[test]
+    fn render_config_version_meta_empty_renders_nothing() {
+        assert!(render_config_version_meta("").is_empty());
+        let mut st = wstate(vec![ssid_on("public", true, 0)]);
+        st.config_version = String::new();
+        assert!(!has_key(&render_wireless(&st, 8080), "wireless.pc_meta"));
+    }
+
+    // parse_config_version_from_uci reads back exactly what render stamps (quotes
+    // stripped, as `uci show` renders them).
+    #[test]
+    fn parse_config_version_roundtrips_render() {
+        // `uci show` quotes the value; the parser must strip it.
+        let show = "\
+wireless.pc_public_ap0=wifi-iface
+wireless.pc_meta=pc_meta
+wireless.pc_meta.config_version='cfg-42'
+wireless.pc_meta.owner='portcullis-wireless'
+";
+        assert_eq!(
+            parse_config_version_from_uci(show),
+            Some("cfg-42".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_config_version_absent_is_none() {
+        // No pc_meta stamp (fresh device) → None (last_committed stays None).
+        let show = "wireless.pc_public_ap0=wifi-iface\nwireless.radio0=wifi-device\n";
+        assert_eq!(parse_config_version_from_uci(show), None);
+        // An empty-valued stamp is also None (nothing meaningful to rehydrate).
+        assert_eq!(
+            parse_config_version_from_uci("wireless.pc_meta.config_version=''\n"),
+            None
+        );
+        assert_eq!(parse_config_version_from_uci(""), None);
+    }
+
     // --- P2 inter-SSID allow-pairs -----------------------------------------
 
     // A PeerAllow renders exactly one owned `config forwarding` src=from dest=to,
@@ -1842,10 +2288,26 @@ mod tests {
             vec![peer("public", "staff")],
         );
         let cmds = render_wireless(&st, 8080);
-        assert!(has_set(&cmds, "firewall.pc_peer_public_staff", "forwarding"));
-        assert!(has_set(&cmds, "firewall.pc_peer_public_staff.src", "public"));
-        assert!(has_set(&cmds, "firewall.pc_peer_public_staff.dest", "staff"));
-        assert!(has_set(&cmds, "firewall.pc_peer_public_staff.owner", WIRELESS_OWNER));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_peer_public_staff",
+            "forwarding"
+        ));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_peer_public_staff.src",
+            "public"
+        ));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_peer_public_staff.dest",
+            "staff"
+        ));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_peer_public_staff.owner",
+            WIRELESS_OWNER
+        ));
         // One direction only: the reverse forwarding is NOT rendered.
         assert!(!has_key(&cmds, "firewall.pc_peer_staff_public"));
     }
@@ -1858,8 +2320,16 @@ mod tests {
             vec![peer("public", "staff"), peer("staff", "public")],
         );
         let cmds = render_wireless(&st, 8080);
-        assert!(has_set(&cmds, "firewall.pc_peer_public_staff", "forwarding"));
-        assert!(has_set(&cmds, "firewall.pc_peer_staff_public", "forwarding"));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_peer_public_staff",
+            "forwarding"
+        ));
+        assert!(has_set(
+            &cmds,
+            "firewall.pc_peer_staff_public",
+            "forwarding"
+        ));
     }
 
     // Default (no peer_allows) renders NO peer sections — isolation via fw3
