@@ -454,6 +454,18 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         if let Some(e) = self.recover_dark_radios(radios).await {
             first_err.get_or_insert(e);
         }
+        // FINAL firewall reload — level-triggered, AFTER `wifi reload` created the
+        // owned bridges (br-ss<n>) and attached their VIF members. The earlier
+        // reload (above) runs BEFORE the wifi step, when a wifi-only bridge device
+        // does not exist yet, so fw3 can't bind that zone's `-i br-ss<n>` rules;
+        // netifd's per-ifup firewall reload is edge-triggered + coalesced and races
+        // the async bring-up, so the LAST bridge to appear (e.g. br-ss3) could end
+        // up with its zone in UCI but NO rules in iptables → clients get no DHCP /
+        // no forward (no IP, no internet). Re-resolving zones here, once the bridges
+        // exist, closes that race deterministically.
+        if let Err(e) = self.runner.run(INIT_FIREWALL, &["reload"]).await {
+            first_err.get_or_insert(e);
+        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -641,8 +653,11 @@ pub fn confirm_window_secs(secs: u32) -> Duration {
 }
 
 /// The reload argv sequence for a MULTI-radio wireless apply (order: network →
-/// firewall → `wifi reload <r>` per radio → dnsmasq). Order-assertion tests use
-/// this; [`ProvisionMachine::commit_and_reload_multi`] follows the same order.
+/// firewall → `wifi reload <r>` per radio → dnsmasq → firewall AGAIN). The final
+/// firewall reload is level-triggered AFTER the wifi step created the owned
+/// bridges, so fw3 binds every zone's `-i br-ss<n>` rules even for the last
+/// wifi-only bridge to appear. Order-assertion tests use this;
+/// [`ProvisionMachine::commit_and_reload_multi`] follows the same order.
 pub fn reload_sequence_multi(radios: &[String]) -> Vec<(&'static str, Vec<String>)> {
     let mut v = vec![
         (INIT_NETWORK, vec!["reload".to_string()]),
@@ -652,6 +667,10 @@ pub fn reload_sequence_multi(radios: &[String]) -> Vec<(&'static str, Vec<String
         v.push((WIFI, vec!["reload".to_string(), r.clone()]));
     }
     v.push((INIT_DNSMASQ, vec!["restart".to_string()]));
+    // Re-run the firewall reload LAST, after the wifi step brought the owned
+    // bridges up, so fw3 binds every zone's `-i br-ss<n>` rules (the earlier
+    // pre-wifi reload can't — a wifi-only bridge device doesn't exist yet).
+    v.push((INIT_FIREWALL, vec!["reload".to_string()]));
     v
 }
 
@@ -1348,5 +1367,9 @@ mod tests {
             )
         );
         assert_eq!(seq[4].0, "/etc/init.d/dnsmasq");
+        // Final firewall reload runs LAST (after the owned bridges exist) so fw3
+        // binds every zone's `-i br-ss<n>` rules — the fix for a wifi-only bridge
+        // (e.g. br-ss3) whose zone landed in UCI but never in iptables.
+        assert_eq!(seq[5].0, "/etc/init.d/firewall");
     }
 }
