@@ -454,15 +454,17 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         if let Some(e) = self.recover_dark_radios(radios).await {
             first_err.get_or_insert(e);
         }
-        // FINAL firewall reload — level-triggered, AFTER `wifi reload` created the
-        // owned bridges (br-ss<n>) and attached their VIF members. The earlier
-        // reload (above) runs BEFORE the wifi step, when a wifi-only bridge device
-        // does not exist yet, so fw3 can't bind that zone's `-i br-ss<n>` rules;
-        // netifd's per-ifup firewall reload is edge-triggered + coalesced and races
-        // the async bring-up, so the LAST bridge to appear (e.g. br-ss3) could end
-        // up with its zone in UCI but NO rules in iptables → clients get no DHCP /
-        // no forward (no IP, no internet). Re-resolving zones here, once the bridges
-        // exist, closes that race deterministically.
+        // FINAL firewall reload — level-triggered, AFTER the owned wifi-only bridges
+        // (br-ss<n>) have gained carrier. `wifi reload` returns BEFORE the VIF
+        // members attach — the bridge link comes up a few seconds later, ASYNC —
+        // and netifd's per-ifup firewall reload is edge-triggered + coalesced so it
+        // races that bring-up: the LAST bridge to appear (e.g. br-ss3 for a 3rd
+        // SSID) could end up with its zone in UCI but NO rules in iptables → clients
+        // get no DHCP / no forward (no IP, no internet). So WAIT (bounded) for the
+        // owned bridges to gain carrier, THEN reload, so fw3 binds every zone's
+        // `-i br-ss<n>` rules deterministically. Fail-open: the wait never blocks/
+        // fails an apply (times out → reload anyway).
+        self.wait_owned_bridges_up().await;
         if let Err(e) = self.runner.run(INIT_FIREWALL, &["reload"]).await {
             first_err.get_or_insert(e);
         }
@@ -510,6 +512,57 @@ impl<R: CommandRunner> ProvisionMachine<R> {
                 still_down.join(",")
             )))
         }
+    }
+
+    /// Wait (bounded) for the owned wifi-only bridges to gain carrier after the
+    /// `wifi reload`, so the FINAL firewall reload lands once fw3 can bind each
+    /// zone's `-i <bridge>` rules. Resolves owned bridges from the `pc_*` network
+    /// interfaces' `l3_device`, then polls each bridge's `carrier` via
+    /// `ubus call network.device status`. Fully fail-OPEN: any ubus/parse error, no
+    /// owned bridges, or a timeout just returns (the caller reloads regardless) — it
+    /// only ever DELAYS the reload until the bridges are ready, never blocks/fails.
+    async fn wait_owned_bridges_up(&self) {
+        let dump = match self
+            .runner
+            .run(UBUS, &["call", "network.interface", "dump"])
+            .await
+        {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let bridges = owned_bridge_devices(&String::from_utf8_lossy(&dump));
+        if bridges.is_empty() {
+            return;
+        }
+        // Up to ~15s (30 * 500ms). The bridge link typically comes up a few seconds
+        // after `wifi reload` returns (its VIF member attaches asynchronously).
+        for _ in 0..30 {
+            let mut all_up = true;
+            for b in &bridges {
+                if self.bridge_has_carrier(b).await != Some(true) {
+                    all_up = false;
+                    break;
+                }
+            }
+            if all_up {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// `Some(true)` when the bridge device reports `carrier: true` via
+    /// `ubus call network.device status`; `Some(false)` when explicitly not; `None`
+    /// on any ubus/parse error (the caller treats non-`Some(true)` as "not up yet").
+    async fn bridge_has_carrier(&self, bridge: &str) -> Option<bool> {
+        let arg = format!("{{\"name\":\"{bridge}\"}}");
+        let out = self
+            .runner
+            .run(UBUS, &["call", "network.device", "status", &arg])
+            .await
+            .ok()?;
+        let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out)).ok()?;
+        v.get("carrier").and_then(serde_json::Value::as_bool)
     }
 
     /// Drop any STAGED (uncommitted) `uci` deltas on the owned configs
@@ -697,6 +750,37 @@ pub fn snapshot_radios(snapshot: &Snapshot) -> Vec<String> {
     for (k, v) in &snapshot.prior {
         if k.starts_with("wireless.pc_") && k.ends_with(".device") && !out.contains(v) {
             out.push(v.clone());
+        }
+    }
+    out
+}
+
+/// The owned bridge devices (`l3_device`) of every `pc_*` network interface in a
+/// `ubus call network.interface dump` payload — deduped, in listing order, empty
+/// ones skipped. Pure + fail-open: an unparseable/unexpected payload yields an
+/// EMPTY list (the caller then skips the carrier wait and reloads immediately).
+/// These are the wifi-only bridges (br-ss<n>) whose firewall zones must bind once
+/// they gain carrier.
+pub fn owned_bridge_devices(dump_json: &str) -> Vec<String> {
+    let v: serde_json::Value = match serde_json::from_str(dump_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    if let Some(ifaces) = v.get("interface").and_then(serde_json::Value::as_array) {
+        for i in ifaces {
+            let name = i
+                .get("interface")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !name.starts_with("pc_") {
+                continue;
+            }
+            if let Some(dev) = i.get("l3_device").and_then(serde_json::Value::as_str) {
+                if !dev.is_empty() && !out.iter().any(|x| x == dev) {
+                    out.push(dev.to_string());
+                }
+            }
         }
     }
     out
@@ -1371,5 +1455,31 @@ mod tests {
         // binds every zone's `-i br-ss<n>` rules — the fix for a wifi-only bridge
         // (e.g. br-ss3) whose zone landed in UCI but never in iptables.
         assert_eq!(seq[5].0, "/etc/init.d/firewall");
+    }
+
+    #[test]
+    fn owned_bridge_devices_extracts_pc_bridges() {
+        let dump = r#"{"interface":[
+            {"interface":"lan","l3_device":"br-lan"},
+            {"interface":"pc_win_free_if","l3_device":"br-ss1"},
+            {"interface":"pc_win_if","l3_device":"br-ss2"},
+            {"interface":"pc_win_gia_dinh_if","l3_device":"br-ss3"},
+            {"interface":"wan","l3_device":"eth1"}
+        ]}"#;
+        assert_eq!(
+            owned_bridge_devices(dump),
+            vec![
+                "br-ss1".to_string(),
+                "br-ss2".to_string(),
+                "br-ss3".to_string()
+            ]
+        );
+        // Fail-open: garbage / no pc_* interface → empty (caller skips the carrier
+        // wait and reloads immediately).
+        assert!(owned_bridge_devices("not json").is_empty());
+        assert!(owned_bridge_devices(
+            r#"{"interface":[{"interface":"lan","l3_device":"br-lan"}]}"#
+        )
+        .is_empty());
     }
 }
