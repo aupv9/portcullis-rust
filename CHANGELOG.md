@@ -4,6 +4,24 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.20.0] — 2026-07-28
+
+### Fixed
+- **A wifi-only SSID bridge could get its firewall zone in UCI but not in the
+  running iptables ruleset — so clients associated but never got an IP or
+  internet.** The wireless apply reload sequence
+  (`commit_and_reload_multi`) reloaded the firewall BEFORE `wifi reload`, i.e.
+  before the owned wifi-only bridges (`br-ss<n>`) exist. fw3 cannot bind a zone's
+  `-i br-ss<n>` DHCP/forward rules to a device that isn't there yet, and netifd's
+  per-`ifup` firewall reload is edge-triggered + coalesced, so it races the async
+  bridge bring-up: the LAST bridge to appear (e.g. `br-ss3` for a 3rd SSID) could
+  end up with its zone committed to UCI but with NO rules attached to it — no
+  DHCP allow, no forward-to-WAN — so a phone joined the SSID (WPA2 handshake OK)
+  but got no lease and dropped after ~18 s. The engine now runs a FINAL,
+  level-triggered `/etc/init.d/firewall reload` AFTER the wifi step (once every
+  owned bridge exists), so fw3 binds every owned zone's rules deterministically,
+  independent of netifd's racy per-`ifup` reloads.
+
 ## [0.16.0] — 2026-07-23
 
 ### Fixed
