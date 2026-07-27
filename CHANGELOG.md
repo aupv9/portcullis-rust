@@ -4,6 +4,21 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.20.1] — 2026-07-28
+
+### Fixed
+- **Follow-up to 0.20.0: the final firewall reload must WAIT for the owned bridges
+  to gain carrier.** 0.20.0 moved the firewall reload to the end of the apply
+  sequence, but a wifi-only bridge attaches its VIF member ASYNChronously —
+  the bridge link (`br-ss<n>`) comes up a few seconds AFTER `wifi reload` returns,
+  so the reload still ran before the last bridge existed and its zone (e.g.
+  `br-ss3`'s) never bound. The engine now polls each owned (`pc_*`) interface's
+  bridge `carrier` via `ubus call network.device status` (bounded ~15 s,
+  fail-open) BEFORE the final `/etc/init.d/firewall reload`, so fw3 binds every
+  owned zone's `-i br-ss<n>` DHCP/forward rules deterministically. Confirmed
+  on-device: the bridge link came up ~3 s after the apply completed, so 0.20.0's
+  reload landed too early.
+
 ## [0.20.0] — 2026-07-28
 
 ### Fixed
