@@ -446,10 +446,14 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         }
     }
 
-    // firewall.pc_<s>_zone = zone  (SECURE posture; zone name = slug)
+    // firewall.pc_<s>_zone = zone  (SECURE posture). The fw3 zone NAME (`zn`) must
+    // stay ≤ 11 chars or its iptables chain overflows the 28-char limit and fw3
+    // silently drops the whole zone (see fw_zone_name). Short slugs stay verbatim;
+    // longer ones hash. Every `.src`/`.name` zone reference below uses `zn`.
+    let zn = fw_zone_name(s);
     let z = format!("firewall.pc_{s}_zone");
     c.push(UciCmd::set(&z, "zone"));
-    c.push(UciCmd::set(format!("{z}.name"), s));
+    c.push(UciCmd::set(format!("{z}.name"), &zn));
     c.push(UciCmd::set(format!("{z}.network"), &iface));
     c.push(UciCmd::set(format!("{z}.input"), "REJECT"));
     c.push(UciCmd::set(format!("{z}.output"), "ACCEPT"));
@@ -459,7 +463,7 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     // firewall.pc_<s>_fwd = forwarding  (zone -> egress; NAT inherited from egress)
     let f = format!("firewall.pc_{s}_fwd");
     c.push(UciCmd::set(&f, "forwarding"));
-    c.push(UciCmd::set(format!("{f}.src"), s));
+    c.push(UciCmd::set(format!("{f}.src"), &zn));
     c.push(UciCmd::set(format!("{f}.dest"), egress));
     c.push(UciCmd::set(format!("{f}.owner"), WIRELESS_OWNER));
 
@@ -467,7 +471,7 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     let rd = format!("firewall.pc_{s}_dhcp");
     c.push(UciCmd::set(&rd, "rule"));
     c.push(UciCmd::set(format!("{rd}.name"), format!("Allow-{s}-DHCP")));
-    c.push(UciCmd::set(format!("{rd}.src"), s));
+    c.push(UciCmd::set(format!("{rd}.src"), &zn));
     c.push(UciCmd::set(format!("{rd}.proto"), "udp"));
     c.push(UciCmd::set(format!("{rd}.dest_port"), "67"));
     c.push(UciCmd::set(format!("{rd}.target"), "ACCEPT"));
@@ -477,7 +481,7 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     let rn = format!("firewall.pc_{s}_dns");
     c.push(UciCmd::set(&rn, "rule"));
     c.push(UciCmd::set(format!("{rn}.name"), format!("Allow-{s}-DNS")));
-    c.push(UciCmd::set(format!("{rn}.src"), s));
+    c.push(UciCmd::set(format!("{rn}.src"), &zn));
     c.push(UciCmd::set(format!("{rn}.proto"), "tcp udp"));
     c.push(UciCmd::set(format!("{rn}.dest_port"), "53"));
     c.push(UciCmd::set(format!("{rn}.target"), "ACCEPT"));
@@ -491,7 +495,7 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
             format!("{rp}.name"),
             format!("Allow-{s}-portal"),
         ));
-        c.push(UciCmd::set(format!("{rp}.src"), s));
+        c.push(UciCmd::set(format!("{rp}.src"), &zn));
         c.push(UciCmd::set(format!("{rp}.proto"), "tcp"));
         c.push(UciCmd::set(
             format!("{rp}.dest_port"),
@@ -513,7 +517,7 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
             format!("{ra}.name"),
             format!("Allow-{s}-int{i}"),
         ));
-        c.push(UciCmd::set(format!("{ra}.src"), s));
+        c.push(UciCmd::set(format!("{ra}.src"), &zn));
         c.push(UciCmd::set(format!("{ra}.dest"), &t.zone));
         c.push(UciCmd::set(format!("{ra}.dest_ip"), &t.cidr));
         c.push(UciCmd::set(format!("{ra}.target"), "ACCEPT"));
@@ -545,6 +549,32 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     c
 }
 
+/// The fw3 firewall-zone NAME for an SSID slug. fw3 derives iptables chain names
+/// as `zone_<name>_<suffix>`; the longest suffix (`_postrouting`, 12 chars) plus
+/// the `zone_` prefix (5) adds 17, and iptables SILENTLY rejects a chain name over
+/// 28 chars. So the zone name must be ≤ 11. Slugs are validated `[a-z0-9_]{1,16}`,
+/// so a 12–16-char slug (e.g. "win_gia_dinh") yields a 29–33-char chain that fw3
+/// DROPS — the whole zone vanishes (no DHCP/forward rules → clients on that SSID
+/// get no IP and no internet). Short slugs are used verbatim (readable, and
+/// backward-compatible with already-deployed zones); longer ones collapse to a
+/// short stable hash that always fits and stays unique. EVERY reference to an
+/// SSID's zone — the zone itself, its forwarding, its DHCP/DNS/portal/internal
+/// rules, and inter-SSID peer allows — must go through this so they stay in sync.
+pub fn fw_zone_name(slug: &str) -> String {
+    const MAX: usize = 11;
+    if slug.len() <= MAX {
+        return slug.to_string();
+    }
+    // FNV-1a (32-bit) → "z" + 8 hex = 9 chars. Deterministic, dependency-free,
+    // collision-resistant for the handful of SSIDs on one store.
+    let mut h: u32 = 0x811c_9dc5;
+    for b in slug.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("z{h:08x}")
+}
+
 /// The owned `config.section` key for one inter-SSID allow-forwarding: unique per
 /// `(from, to)` direction. Both slugs are `[a-z0-9_]{1,16}` (validated), so this
 /// stays well within UCI section-name limits (`pc_peer_` + ≤16 + `_` + ≤16 ≈ 41).
@@ -553,19 +583,21 @@ fn peer_fwd_section(from: &str, to: &str) -> String {
 }
 
 /// Render ONE owned `config forwarding` opening a single inter-SSID direction
-/// (`from`'s zone → `to`'s zone). The zone name of an SSID IS its slug (see
-/// `render_ssid`'s `firewall.pc_<slug>_zone.name = slug`), so `.src = from` and
-/// `.dest = to` reference the two owned zones directly. Stamped with
-/// [`WIRELESS_OWNER`] and named `pc_peer_<from>_<to>` so the reconcile diff /
-/// [`is_owned_wireless_section`] recognise it as owned. Pure; assumes
+/// (`from`'s zone → `to`'s zone). The fw3 zone NAME of an SSID is `fw_zone_name`
+/// of its slug (NOT the raw slug — a long slug's zone name is hashed to fit the
+/// iptables chain-name limit), so `.src`/`.dest` must resolve BOTH endpoints
+/// through `fw_zone_name` to reference the two owned zones. The section KEY still
+/// uses the raw slugs (`peer_fwd_section`) — UCI section names have no such limit.
+/// Stamped with [`WIRELESS_OWNER`] and named `pc_peer_<from>_<to>` so the reconcile
+/// diff / [`is_owned_wireless_section`] recognise it as owned. Pure; assumes
 /// [`validate_wireless`] passed (both slugs name SSIDs in the same state).
 pub fn render_peer_allow(peer: &PeerAllow) -> Vec<UciCmd> {
     let (from, to) = (peer.from_slug.as_str(), peer.to_slug.as_str());
     let f = peer_fwd_section(from, to);
     vec![
         UciCmd::set(&f, "forwarding"),
-        UciCmd::set(format!("{f}.src"), from),
-        UciCmd::set(format!("{f}.dest"), to),
+        UciCmd::set(format!("{f}.src"), fw_zone_name(from)),
+        UciCmd::set(format!("{f}.dest"), fw_zone_name(to)),
         UciCmd::set(format!("{f}.owner"), WIRELESS_OWNER),
     ]
 }
@@ -1281,6 +1313,28 @@ fn is_leasetime(s: &str) -> bool {
 mod tests {
     use super::*;
     use portcullis_types::{DhcpReservation, InternalTarget};
+
+    #[test]
+    fn fw_zone_name_fits_iptables_chain_limit() {
+        // Short slugs (≤ 11) stay verbatim — readable + backward-compatible with
+        // already-deployed zones.
+        assert_eq!(fw_zone_name("win"), "win");
+        assert_eq!(fw_zone_name("win_free"), "win_free");
+        assert_eq!(fw_zone_name("elevenchars"), "elevenchars"); // 11, verbatim
+        // A 12+ char slug (the "win_gia_dinh" fw3 silently dropped) hashes to fit.
+        let z = fw_zone_name("win_gia_dinh");
+        assert_ne!(z, "win_gia_dinh");
+        assert!(z.len() <= 11, "zone name {z} too long");
+        // The derived iptables chain (`zone_<name>_postrouting`) must be ≤ 28 for
+        // EVERY validated slug ([a-z0-9_]{1,16}); the 16-char slug is the worst case.
+        for slug in ["win_gia_dinh", "a_very_long_slug", "sixteen_chars_x1"] {
+            let chain = format!("zone_{}_postrouting", fw_zone_name(slug));
+            assert!(chain.len() <= 28, "{chain} = {} chars > 28", chain.len());
+        }
+        // Deterministic; distinct long slugs get distinct zone names.
+        assert_eq!(fw_zone_name("win_gia_dinh"), fw_zone_name("win_gia_dinh"));
+        assert_ne!(fw_zone_name("longslug_aaaa"), fw_zone_name("longslug_bbbb"));
+    }
 
     #[test]
     fn argv_is_explicit_no_shell() {
