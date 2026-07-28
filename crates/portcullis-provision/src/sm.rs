@@ -688,6 +688,98 @@ impl<R: CommandRunner> ProvisionMachine<R> {
             .await
             .map_err(|e| ProvisionError::Io(format!("write {}: {e}", path.display())))
     }
+
+    // --- Scoped per-BSS reconfigure (P2) ----------------------------------
+    // UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+    // config.scoped_reconfigure.
+
+    /// Apply a batch of [`BssOp`]s per-BSS via hostapd's ubus surface WITHOUT
+    /// bouncing the whole radio, then persist the desired owned UCI (a `uci set`
+    /// batch reconciled delete-then-set, committed) so a LATER `wifi reload` or a
+    /// reboot reproduces the same state. Deliberately does NOT run `wifi reload` on
+    /// this path — that is the entire point (no PHY bounce).
+    ///
+    /// UNVALIDATED on mt76/RutOS: the exact hostapd ubus verbs
+    /// (`config_add`/`config_remove`/`hostapd.<vif> reload`) are the plausible
+    /// OpenWrt shape, not yet confirmed on-device. ANY ubus op error propagates so
+    /// the caller ([`crate::handle`]) immediately falls back to the full apply — the
+    /// radio is never left in a half-reconfigured state. The parallel UCI write runs
+    /// FIRST so that even if a ubus op then fails, the fallback full apply re-renders
+    /// from a consistent owned config.
+    ///
+    /// `desired`/`snapshot` drive the parallel UCI render (same reconcile the full
+    /// path uses: delete every pre-existing owned section, then set the desired).
+    pub async fn scoped_apply(
+        &self,
+        ops: &[BssOp],
+        snapshot: &Snapshot,
+        desired: &WirelessDesiredState,
+    ) -> Result<(), ProvisionError> {
+        // 1. Owned UCI in parallel (reuse the full renderer + delete-then-set diff)
+        //    then `uci commit` each owned config — but NO `wifi reload`, so the
+        //    running radio is untouched by this step. A `uci set`/`commit` error
+        //    reverts staged deltas + surfaces (caller falls back to the full apply).
+        let sets = uci::render_wireless(desired, self.responder_port);
+        let mut batch = uci::render_deletes(&snapshot.existing_sections);
+        batch.extend(sets);
+        for cmd in &batch {
+            let argv = cmd.argv();
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match self.runner.run(UCI, &argv_refs).await {
+                Ok(_) => {}
+                // Deletes of absent sections are expected (delete-then-set reconcile).
+                Err(_) if matches!(cmd, UciCmd::Delete { .. }) => {}
+                Err(e) => {
+                    self.revert_owned().await;
+                    return Err(e);
+                }
+            }
+        }
+        for cfg in OWNED_CONFIGS {
+            match self.runner.run(UCI, &["commit", cfg]).await {
+                Ok(_) => {}
+                Err(_) if cfg == "sqm" => {} // optional (sqm-scripts may be absent)
+                Err(e) => {
+                    self.revert_owned().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // 2. Per-BSS hostapd reconfigure over ubus (NO `wifi reload`). Any error
+        //    surfaces → caller falls back to the full apply (never dark).
+        for op in ops {
+            match op {
+                BssOp::AddBss { slug, ssid, key } => {
+                    // `ubus call hostapd config_add '{"iface":"<slug>", ...}'`.
+                    let payload = format!(
+                        "{{\"iface\":\"{}\",\"ssid\":\"{}\",\"key\":\"{}\"}}",
+                        slug, ssid, key
+                    );
+                    self.runner
+                        .run(UBUS, &["call", "hostapd", "config_add", &payload])
+                        .await?;
+                }
+                BssOp::RemoveBss { vif_or_slug } => {
+                    let payload = format!("{{\"iface\":\"{}\"}}", vif_or_slug);
+                    self.runner
+                        .run(UBUS, &["call", "hostapd", "config_remove", &payload])
+                        .await?;
+                }
+                BssOp::ReloadParams {
+                    vif_or_slug,
+                    ssid,
+                    key,
+                } => {
+                    // Reload the single BSS in place: `ubus call hostapd.<vif> reload`.
+                    let obj = format!("hostapd.{vif_or_slug}");
+                    let payload = format!("{{\"ssid\":\"{}\",\"key\":\"{}\"}}", ssid, key);
+                    self.runner.run(UBUS, &["call", &obj, "reload", &payload]).await?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Parse a `uci show` LIST value into its elements. `uci show` renders a list as
@@ -729,21 +821,21 @@ pub fn reload_sequence_multi(radios: &[String]) -> Vec<(&'static str, Vec<String
     v
 }
 
-/// The apply strategy chosen for a wireless push, computed by [`plan_apply`].
+/// The apply strategy chosen for a wireless push, computed by [`plan_apply`] (or,
+/// when an operator opts in, [`plan_apply_scoped`]).
 ///
-/// The engine has no cheaper reconcile than a full radio reload today, so the
-/// only two live variants are: SKIP entirely ([`ApplyPlan::NoChange`], the
-/// equality-gate) or do today's full re-render + `wifi reload <radio>`
-/// ([`ApplyPlan::FullReload`]). The gate is the load-bearing bit: without it an
-/// identical CP re-push (churn) re-applies and bounces the whole radio, which has
-/// driven overload reboots on-device.
+/// The always-available reconcile is a full radio reload: SKIP entirely
+/// ([`ApplyPlan::NoChange`], the equality-gate) or do today's full re-render +
+/// `wifi reload <radio>` ([`ApplyPlan::FullReload`]). The gate is the load-bearing
+/// bit: without it an identical CP re-push (churn) re-applies and bounces the
+/// whole radio, which has driven overload reboots on-device.
 ///
-// TODO(P0-gated): ApplyPlan::Scoped(...) — per-BSS hostapd reconfigure so an SSID
-// edit doesn't bounce the whole radio. Requires an on-device mt76/hostapd
-// feasibility spike (config_add/config_remove/hostapd.<vif> reload) before it can
-// be built; NOT implemented here because it manipulates the sole radio and cannot
-// be unit-tested.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// [`ApplyPlan::Scoped`] is the UNVALIDATED per-BSS hostapd reconfigure (P2/P3):
+/// only ever produced by [`plan_apply_scoped`] when the operator has opted in
+/// (`config.scoped_reconfigure`), the diff has no radio-level change, and every
+/// change maps to a [`BssOp`]. [`plan_apply`] itself NEVER returns it, so the
+/// default flag-off path is exactly today's two-variant behaviour.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyPlan {
     /// The desired config_version equals the last-committed one — skip the apply
     /// entirely (no render, no `uci`, no reload) and re-ACK.
@@ -751,6 +843,11 @@ pub enum ApplyPlan {
     /// Re-render every owned section and `wifi reload` each affected radio — the
     /// existing (only) apply path. Chosen whenever the equality-gate misses.
     FullReload,
+    /// UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+    /// config.scoped_reconfigure. Per-BSS hostapd reconfigure: apply the given
+    /// [`BssOp`]s (+ the owned UCI in parallel) WITHOUT bouncing the whole radio.
+    /// Any op error falls back to [`ApplyPlan::FullReload`]'s path (never dark).
+    Scoped(Vec<BssOp>),
 }
 
 /// Decide how to apply `desired` given the `last_committed` desired-state.
@@ -760,7 +857,8 @@ pub enum ApplyPlan {
 /// equal to the desired one — and [`ApplyPlan::FullReload`] otherwise (no prior
 /// commit, an empty prior version, or a differing version). An empty prior
 /// version never gates: it is the reboot-rehydrate / fresh-device sentinel, so a
-/// push must still fully apply.
+/// push must still fully apply. NEVER returns [`ApplyPlan::Scoped`] — that is
+/// [`plan_apply_scoped`]'s job, behind the opt-in flag.
 pub fn plan_apply(
     last_committed: Option<&WirelessDesiredState>,
     desired: &WirelessDesiredState,
@@ -772,6 +870,301 @@ pub fn plan_apply(
         {
             ApplyPlan::NoChange
         }
+        _ => ApplyPlan::FullReload,
+    }
+}
+
+// ===========================================================================
+// UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+// config.scoped_reconfigure.
+//
+// The scoped per-BSS reconfigure path (P1 diff → P2 ops → P3 dispatch). It
+// manipulates the router's SOLE radio via hostapd's ubus surface and has NOT been
+// validated on-device (mt76 / RutOS 21.02). Everything below is only ever reached
+// when an operator has explicitly set `config.scoped_reconfigure = true`; with the
+// flag off, `plan_apply` is used and none of this runs. Even opted in, any scoped
+// op error makes the caller fall back to the full apply so the radio is never left
+// dark. Keep the diff/mapping pure so they are unit-testable off-device.
+// ===========================================================================
+
+/// One SSID's current owned wireless view, reconstructed from a [`Snapshot`]'s
+/// flat `pc_*` option lines (P1 diff). Only the fields a per-BSS reconfigure can
+/// touch (ssid/key/network) plus the radio set (a change there forces a PHY
+/// bounce, see [`WifiDiff::has_radio_level_change`]). Built by [`current_ssids`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CurrentSsid {
+    ssid: String,
+    key: String,
+    /// The `pc_<slug>_if` network binding shared by every VIF of this SSID.
+    network: String,
+    /// The wifi-devices this SSID's `ap{i}` VIFs sit on, in `ap{i}` order.
+    radios: Vec<String>,
+}
+
+/// Reconstruct the current owned SSIDs (keyed by slug) from a pre-apply
+/// [`Snapshot`]. Reads only the owned `wireless.pc_<slug>_ap{i}.*` +
+/// `network.pc_<slug>_dev.name` lines the snapshot already captured, so it can
+/// never see a non-owned section. Pure; the inverse of [`uci::render_ssid`]'s
+/// naming for the handful of fields the diff compares.
+fn current_ssids(snap: &Snapshot) -> BTreeMap<String, CurrentSsid> {
+    let mut out: BTreeMap<String, CurrentSsid> = BTreeMap::new();
+    for (key, val) in &snap.prior {
+        // Owned wifi-iface option lines: `wireless.pc_<slug>_ap<i>.<opt>`.
+        let Some(rest) = key.strip_prefix("wireless.pc_") else {
+            continue;
+        };
+        let Some((section, opt)) = rest.split_once('.') else {
+            continue; // section-decl line (no option) — nothing to read
+        };
+        // `<slug>_ap<i>` → (`<slug>`, `<i>`); the slug itself may contain `_`.
+        let Some((slug, ap_idx)) = section.rsplit_once("_ap") else {
+            continue;
+        };
+        let Ok(idx) = ap_idx.parse::<usize>() else {
+            continue;
+        };
+        let e = out.entry(slug.to_string()).or_default();
+        match opt {
+            "ssid" => e.ssid = val.clone(),
+            "key" => e.key = val.clone(),
+            "network" => e.network = val.clone(),
+            "device" => {
+                // Keep radios in `ap{i}` order regardless of BTreeMap iteration.
+                if e.radios.len() <= idx {
+                    e.radios.resize(idx + 1, String::new());
+                }
+                e.radios[idx] = val.clone();
+            }
+            _ => {} // other options don't affect the scoped-vs-full decision
+        }
+    }
+    // Drop trailing empty radio slots (a sparse `ap{i}` set — shouldn't happen, but
+    // keep the comparison honest).
+    for c in out.values_mut() {
+        while c.radios.last().map(String::is_empty) == Some(true) {
+            c.radios.pop();
+        }
+    }
+    out
+}
+
+/// The desired-state's view of one SSID reduced to the same fields as
+/// [`CurrentSsid`], for the diff. `network` mirrors [`uci::render_ssid`]'s
+/// `pc_<slug>_if` binding; `radios` is the effective radio list.
+fn desired_ssid_view(spec: &portcullis_types::SsidSpec) -> CurrentSsid {
+    // `render_ssid` binds every VIF to `network = pc_<slug>_if`; an open SSID
+    // renders no `key` option, so its effective key is empty.
+    let key = if spec.encryption.is_empty() || spec.encryption == "none" {
+        String::new()
+    } else {
+        spec.key.clone()
+    };
+    CurrentSsid {
+        ssid: spec.ssid.clone(),
+        key,
+        network: format!("pc_{}_if", spec.slug),
+        radios: uci::effective_radios(spec)
+            .iter()
+            .map(|r| r.to_string())
+            .collect(),
+    }
+}
+
+/// One field that changed for a `modified` SSID (P1 diff). Drives both the
+/// human-readable diff and [`WifiDiff::has_radio_level_change`]: only `Radios`
+/// forces a PHY bounce (a per-BSS hostapd reconfigure can't move a VIF between
+/// radios); `Ssid`/`Key`/`Network` are BSS-level and scoped-reconfigurable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WifiField {
+    Ssid,
+    Key,
+    Network,
+    /// The set/order of wifi-devices the SSID sits on (channel/htmode/country/
+    /// radio-device class of change) — forces a full radio reload.
+    Radios,
+}
+
+/// A modified owned SSID: its slug + exactly which fields differ current→desired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModifiedSsid {
+    pub slug: String,
+    pub fields: Vec<WifiField>,
+}
+
+/// The slug-keyed delta of the owned `pc_*` SSIDs, current vs desired (P1). Pure
+/// data — [`wifi_diff`] builds it, and it is the sole input to
+/// [`diff_to_bss_ops`] / [`plan_apply_scoped`]. `added`/`removed` carry slugs;
+/// `modified` carries the changed fields per slug.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WifiDiff {
+    /// Slugs present in desired but not current (a new BSS to add).
+    pub added: Vec<String>,
+    /// Slugs present in current but not desired (a BSS to remove).
+    pub removed: Vec<String>,
+    /// Slugs present in both whose compared fields differ.
+    pub modified: Vec<ModifiedSsid>,
+}
+
+impl WifiDiff {
+    /// Whether any change touches a radio-level parameter (the radio/device set an
+    /// SSID sits on — the channel/htmode/country class that forces a PHY bounce).
+    /// A per-BSS hostapd reconfigure can only add/remove/reload a BSS on an
+    /// EXISTING radio; moving a VIF between radios (or changing the radio count)
+    /// needs a full `wifi reload`. Adds/removes never count as radio-level (a BSS
+    /// on an already-up radio), so this is driven purely by `modified` SSIDs whose
+    /// `radios` field changed.
+    pub fn has_radio_level_change(&self) -> bool {
+        self.modified
+            .iter()
+            .any(|m| m.fields.contains(&WifiField::Radios))
+    }
+}
+
+/// Diff the owned `pc_*` SSIDs of a pre-apply [`Snapshot`] against a desired
+/// state, by slug (P1). Pure + side-effect-free (unit-testable with hand-built
+/// inputs). Compares only the fields a per-BSS reconfigure cares about: ssid, key,
+/// network binding, and the radio set. Other rendered options (dhcp, firewall,
+/// isolate, pmf…) are NOT compared here — they are handled by the full apply, so
+/// a scoped plan is only chosen when the diff maps cleanly to [`BssOp`]s AND has
+/// no radio-level change (see [`plan_apply_scoped`]).
+pub fn wifi_diff(cur: &Snapshot, desired: &WirelessDesiredState) -> WifiDiff {
+    let current = current_ssids(cur);
+    let desired_by_slug: BTreeMap<String, CurrentSsid> = desired
+        .ssids
+        .iter()
+        .map(|s| (s.slug.clone(), desired_ssid_view(s)))
+        .collect();
+
+    let mut diff = WifiDiff::default();
+    // Added / modified: walk desired, compare against current.
+    for (slug, want) in &desired_by_slug {
+        match current.get(slug) {
+            None => diff.added.push(slug.clone()),
+            Some(have) if have != want => {
+                let mut fields = Vec::new();
+                if have.ssid != want.ssid {
+                    fields.push(WifiField::Ssid);
+                }
+                if have.key != want.key {
+                    fields.push(WifiField::Key);
+                }
+                if have.network != want.network {
+                    fields.push(WifiField::Network);
+                }
+                if have.radios != want.radios {
+                    fields.push(WifiField::Radios);
+                }
+                if !fields.is_empty() {
+                    diff.modified.push(ModifiedSsid {
+                        slug: slug.clone(),
+                        fields,
+                    });
+                }
+            }
+            Some(_) => {} // identical — nothing to do
+        }
+    }
+    // Removed: current slugs absent from desired.
+    for slug in current.keys() {
+        if !desired_by_slug.contains_key(slug) {
+            diff.removed.push(slug.clone());
+        }
+    }
+    diff
+}
+
+/// One per-BSS hostapd operation on the sole radio (P2, UNVALIDATED). Each maps to
+/// a plausible OpenWrt hostapd ubus call in [`ProvisionMachine::scoped_apply`].
+/// `vif_or_slug` carries the SSID slug — the engine's stable per-BSS handle — from
+/// which the ubus target (`hostapd.<vif>`) is derived on-device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BssOp {
+    /// Bring a new BSS up on an already-live radio (`ubus call hostapd config_add`).
+    AddBss {
+        slug: String,
+        ssid: String,
+        key: String,
+    },
+    /// Tear a BSS down (`ubus call hostapd config_remove`).
+    RemoveBss { vif_or_slug: String },
+    /// Reload an existing BSS's params in place (`ubus call hostapd.<vif> reload`),
+    /// e.g. a renamed SSID or a rotated PSK — no PHY bounce.
+    ReloadParams {
+        vif_or_slug: String,
+        ssid: String,
+        key: String,
+    },
+}
+
+/// Map a [`WifiDiff`] to the ordered [`BssOp`]s that realise it (P2). Returns
+/// `None` when ANY change isn't representable as a per-BSS op — specifically a
+/// radio-level change (a moved/added radio forces a full reload) — so the caller
+/// falls back to the full apply. Pure. `desired` supplies the ssid/key for the
+/// add/reload ops (looked up by slug).
+///
+/// Order: removals first (free BSS slots), then adds, then in-place reloads —
+/// mirroring how the full renderer recreates sections delete-then-set.
+fn diff_to_bss_ops(diff: &WifiDiff, desired: &WirelessDesiredState) -> Option<Vec<BssOp>> {
+    if diff.has_radio_level_change() {
+        return None; // not representable as per-BSS ops → caller falls back
+    }
+    let spec_for = |slug: &str| desired.ssids.iter().find(|s| s.slug == slug);
+    let mut ops = Vec::new();
+    for slug in &diff.removed {
+        ops.push(BssOp::RemoveBss {
+            vif_or_slug: slug.clone(),
+        });
+    }
+    for slug in &diff.added {
+        let spec = spec_for(slug)?; // must exist in desired (it was diffed from it)
+        let view = desired_ssid_view(spec);
+        ops.push(BssOp::AddBss {
+            slug: slug.clone(),
+            ssid: view.ssid,
+            key: view.key,
+        });
+    }
+    for m in &diff.modified {
+        let spec = spec_for(&m.slug)?;
+        let view = desired_ssid_view(spec);
+        ops.push(BssOp::ReloadParams {
+            vif_or_slug: m.slug.clone(),
+            ssid: view.ssid,
+            key: view.key,
+        });
+    }
+    Some(ops)
+}
+
+/// Decide the apply strategy WITH the scoped opt-in (P3). Returns
+/// [`ApplyPlan::Scoped`] ONLY when ALL of:
+/// 1. `scoped_reconfigure == true` (the operator opted into the UNVALIDATED path);
+/// 2. it is NOT a [`ApplyPlan::NoChange`] (the equality-gate still wins);
+/// 3. the diff has no radio-level change ([`WifiDiff::has_radio_level_change`]);
+/// 4. the diff maps cleanly to [`BssOp`]s ([`diff_to_bss_ops`] is `Some`) AND that
+///    op list is non-empty.
+///
+/// Otherwise it returns exactly what [`plan_apply`] would ([`ApplyPlan::NoChange`]
+/// or [`ApplyPlan::FullReload`]). With `scoped_reconfigure == false` this is
+/// [`plan_apply`] verbatim — the default path is byte-for-byte unchanged. Pure.
+pub fn plan_apply_scoped(
+    scoped_reconfigure: bool,
+    last_committed: Option<&WirelessDesiredState>,
+    snapshot: &Snapshot,
+    desired: &WirelessDesiredState,
+) -> ApplyPlan {
+    // The equality-gate and the flag-off case both defer to `plan_apply` — no
+    // scoped plan is ever produced from here unless the operator opted in.
+    let base = plan_apply(last_committed, desired);
+    if !scoped_reconfigure || base != ApplyPlan::FullReload {
+        return base;
+    }
+    // Opted in + a real change: try the scoped path. A radio-level change or an
+    // unrepresentable diff → `None` → stay on FullReload. An empty op list (nothing
+    // the scoped path can express) also stays on FullReload.
+    let diff = wifi_diff(snapshot, desired);
+    match diff_to_bss_ops(&diff, desired) {
+        Some(ops) if !ops.is_empty() => ApplyPlan::Scoped(ops),
         _ => ApplyPlan::FullReload,
     }
 }
@@ -1569,5 +1962,199 @@ mod tests {
         // NOT gate, even against an empty desired version, so a push still applies.
         assert_eq!(plan_apply(Some(&ver("")), &ver("cfg-1")), ApplyPlan::FullReload);
         assert_eq!(plan_apply(Some(&ver("")), &ver("")), ApplyPlan::FullReload);
+    }
+
+    // --- Scoped per-BSS reconfigure (P1 diff + P3 dispatch) ----------------
+    // UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+    // config.scoped_reconfigure. These are pure/host tests of the diff + planner.
+
+    /// A minimal owned-wireless SsidSpec for the diff/plan tests: one VIF on
+    /// `radios`, the given ssid/encryption/key. Bridge = `br-<slug>`.
+    fn spec(
+        slug: &str,
+        ssid: &str,
+        enc: &str,
+        key: &str,
+        radios: &[&str],
+    ) -> portcullis_types::SsidSpec {
+        portcullis_types::SsidSpec {
+            slug: slug.into(),
+            ssid: ssid.into(),
+            radios: radios.iter().map(|r| (*r).to_string()).collect(),
+            encryption: enc.into(),
+            key: key.into(),
+            bridge_name: format!("br-{slug}"),
+            ..Default::default()
+        }
+    }
+
+    /// A desired-state wrapping the given specs at `version`.
+    fn state_with(
+        version: &str,
+        ssids: Vec<portcullis_types::SsidSpec>,
+    ) -> WirelessDesiredState {
+        WirelessDesiredState {
+            config_version: version.into(),
+            ssids,
+            ..Default::default()
+        }
+    }
+
+    /// A pre-apply Snapshot carrying the owned `pc_*` option lines a given set of
+    /// (slug, ssid, key, radios) SSIDs would have left on-device — exactly what
+    /// `current_ssids` reads back. `key` empty renders no `.key` line (open SSID).
+    fn snap_with(ssids: &[(&str, &str, &str, &[&str])]) -> Snapshot {
+        let mut snap = Snapshot::default();
+        for (slug, ssid, key, radios) in ssids {
+            snap.existing_sections
+                .push(format!("network.pc_{slug}_dev"));
+            snap.prior
+                .insert(format!("network.pc_{slug}_dev.name"), format!("br-{slug}"));
+            for (i, radio) in radios.iter().enumerate() {
+                let ap = format!("wireless.pc_{slug}_ap{i}");
+                snap.existing_sections.push(ap.clone());
+                snap.prior.insert(format!("{ap}.ssid"), (*ssid).to_string());
+                snap.prior
+                    .insert(format!("{ap}.network"), format!("pc_{slug}_if"));
+                snap.prior.insert(format!("{ap}.device"), (*radio).to_string());
+                if !key.is_empty() {
+                    snap.prior.insert(format!("{ap}.key"), (*key).to_string());
+                }
+            }
+        }
+        snap
+    }
+
+    #[test]
+    fn wifi_diff_detects_add_remove_modify() {
+        // Current: `public` (open) + `home` (psk2). Desired: `public` unchanged,
+        // `home` REMOVED, `guest` ADDED, and `public`'s SSID name MODIFIED.
+        let cur = snap_with(&[
+            ("public", "WinX Free", "", &["radio0"]),
+            ("home", "WinX Home", "secret", &["radio0"]),
+        ]);
+        let desired = state_with(
+            "cfg-2",
+            vec![
+                spec("public", "WinX Public", "none", "", &["radio0"]), // ssid changed
+                spec("guest", "WinX Guest", "none", "", &["radio0"]),   // added
+            ],
+        );
+        let d = wifi_diff(&cur, &desired);
+        assert_eq!(d.added, vec!["guest".to_string()]);
+        assert_eq!(d.removed, vec!["home".to_string()]);
+        assert_eq!(d.modified.len(), 1);
+        assert_eq!(d.modified[0].slug, "public");
+        assert_eq!(d.modified[0].fields, vec![WifiField::Ssid]);
+        // An SSID-only rename is NOT a radio-level change.
+        assert!(!d.has_radio_level_change());
+    }
+
+    #[test]
+    fn wifi_diff_key_change_is_bss_level() {
+        // A rotated PSK on an otherwise-identical SSID → a Key-only modify, scoped.
+        let cur = snap_with(&[("home", "WinX Home", "old-psk", &["radio0"])]);
+        let desired = state_with(
+            "cfg-2",
+            vec![spec("home", "WinX Home", "psk2", "new-psk", &["radio0"])],
+        );
+        let d = wifi_diff(&cur, &desired);
+        assert!(d.added.is_empty() && d.removed.is_empty());
+        assert_eq!(d.modified.len(), 1);
+        assert_eq!(d.modified[0].fields, vec![WifiField::Key]);
+        assert!(!d.has_radio_level_change());
+    }
+
+    #[test]
+    fn wifi_diff_radio_change_is_radio_level() {
+        // Moving the VIF from radio0 → radio1 (or spanning both) forces a PHY bounce.
+        let cur = snap_with(&[("home", "WinX Home", "secret", &["radio0"])]);
+        let desired = state_with(
+            "cfg-2",
+            vec![spec("home", "WinX Home", "psk2", "secret", &["radio1"])],
+        );
+        let d = wifi_diff(&cur, &desired);
+        assert_eq!(d.modified.len(), 1);
+        assert!(d.modified[0].fields.contains(&WifiField::Radios));
+        assert!(d.has_radio_level_change());
+    }
+
+    #[test]
+    fn wifi_diff_identical_is_empty() {
+        let cur = snap_with(&[("home", "WinX Home", "secret", &["radio0"])]);
+        let desired = state_with(
+            "cfg-1",
+            vec![spec("home", "WinX Home", "psk2", "secret", &["radio0"])],
+        );
+        let d = wifi_diff(&cur, &desired);
+        assert!(d.added.is_empty() && d.removed.is_empty() && d.modified.is_empty());
+        assert!(!d.has_radio_level_change());
+    }
+
+    #[test]
+    fn plan_apply_scoped_flag_off_is_full_reload_even_when_scopeable() {
+        // Flag OFF: a clean SSID-only edit that WOULD be scopeable still returns
+        // FullReload — the default path is byte-for-byte today's behaviour.
+        let prev = ver("cfg-1");
+        let cur = snap_with(&[("home", "WinX Home", "secret", &["radio0"])]);
+        let desired = state_with(
+            "cfg-2",
+            vec![spec("home", "WinX Home 2", "psk2", "secret", &["radio0"])],
+        );
+        assert_eq!(
+            plan_apply_scoped(false, Some(&prev), &cur, &desired),
+            ApplyPlan::FullReload
+        );
+    }
+
+    #[test]
+    fn plan_apply_scoped_flag_on_all_scoped_returns_scoped() {
+        // Flag ON + all-scoped (SSID rename) + no radio-level change → Scoped(ops).
+        let prev = ver("cfg-1");
+        let cur = snap_with(&[("home", "WinX Home", "secret", &["radio0"])]);
+        let desired = state_with(
+            "cfg-2",
+            vec![spec("home", "WinX Home 2", "psk2", "secret", &["radio0"])],
+        );
+        match plan_apply_scoped(true, Some(&prev), &cur, &desired) {
+            ApplyPlan::Scoped(ops) => {
+                assert_eq!(ops.len(), 1);
+                assert!(matches!(&ops[0], BssOp::ReloadParams { vif_or_slug, ssid, .. }
+                    if vif_or_slug == "home" && ssid == "WinX Home 2"));
+            }
+            other => panic!("expected Scoped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_apply_scoped_flag_on_radio_level_falls_back_to_full() {
+        // Flag ON but the diff has a radio-level change → FullReload (not Scoped).
+        let prev = ver("cfg-1");
+        let cur = snap_with(&[("home", "WinX Home", "secret", &["radio0"])]);
+        let desired = state_with(
+            "cfg-2",
+            vec![spec("home", "WinX Home", "psk2", "secret", &["radio1"])],
+        );
+        assert_eq!(
+            plan_apply_scoped(true, Some(&prev), &cur, &desired),
+            ApplyPlan::FullReload
+        );
+    }
+
+    #[test]
+    fn plan_apply_scoped_still_gates_equal_version() {
+        // The equality-gate wins over the scoped path: identical NON-EMPTY version →
+        // NoChange, flag on or off.
+        let prev = ver("cfg-7");
+        let cur = snap_with(&[("home", "WinX Home", "secret", &["radio0"])]);
+        let desired = ver("cfg-7");
+        assert_eq!(
+            plan_apply_scoped(true, Some(&prev), &cur, &desired),
+            ApplyPlan::NoChange
+        );
+        assert_eq!(
+            plan_apply_scoped(false, Some(&prev), &cur, &desired),
+            ApplyPlan::NoChange
+        );
     }
 }
