@@ -4,6 +4,21 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.23.0] — 2026-07-28
+
+### Fixed
+- **Wire `scoped_reconfigure` from config into the running engine.** The
+  `option scoped_reconfigure` UCI flag parsed into `Config.scoped_reconfigure` but
+  never reached the provision actor: `compose` called
+  `run_provision_subsystem_with_policy`, which hardcodes `scoped_reconfigure = false`,
+  so the actor always took the full-reload path and setting the flag on-device was a
+  no-op. `compose` now calls `run_provision_subsystem_with_scoped(..., cfg.scoped_reconfigure)`
+  and the crate re-exports that entry point. With this, `option scoped_reconfigure '1'`
+  actually enables the per-BSS hostapd reconfigure path from 0.22.0.
+  **Still DEFAULT-OFF and UNVALIDATED** on mt76/RutOS hardware — any scoped-op error
+  still falls back to a full `wifi reload` (never leaves a radio dark). Run
+  `deploy/hostapd-scope-spike.sh` and get a GO before enabling.
+
 ## [0.22.0] — 2026-07-28
 
 ### Added
