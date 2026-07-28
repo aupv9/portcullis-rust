@@ -154,6 +154,17 @@ pub struct Config {
     /// `#[serde(default)]` (0) for back-compat.
     #[serde(default)]
     pub idle_timeout: u64,
+
+    /// Opt-in to the SCOPED per-BSS hostapd reconfigure path for CP-managed
+    /// wireless: an SSID-only edit (ssid/key/network) reconfigures just its BSS via
+    /// hostapd ubus instead of bouncing the whole radio with `wifi reload`. OFF by
+    /// default — the path manipulates the sole radio and is UNVALIDATED on mt76/
+    /// RutOS (pending an on-device feasibility spike), so `false` reproduces today's
+    /// behaviour (always a full reload) byte-for-byte. Even opted in, any scoped op
+    /// error falls back to the full apply, and a radio-level change (radio/device
+    /// set) always takes the full path. `#[serde(default)]` (false) for back-compat.
+    #[serde(default)]
+    pub scoped_reconfigure: bool,
 }
 
 fn default_reap_conntrack() -> bool {
@@ -215,6 +226,7 @@ impl Default for Config {
             shape_bandwidth: false,
             shape_iface: String::new(),
             idle_timeout: 0,
+            scoped_reconfigure: false,
         }
     }
 }
@@ -440,6 +452,7 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "shape_bandwidth" => cfg.shape_bandwidth = parse_bool(val)?,
         "shape_iface" => cfg.shape_iface = val.to_string(),
         "idle_timeout" => cfg.idle_timeout = parse_u64(val)?,
+        "scoped_reconfigure" => cfg.scoped_reconfigure = parse_bool(val)?,
         other => {
             return Err(Error::Config(format!(
                 "UCI line {lineno}: unknown option '{other}'"
@@ -695,6 +708,8 @@ config portcullis 'main'
             shape_bandwidth: true,
             shape_iface: "br-lan".to_string(),
             idle_timeout: 300,
+            // non-default so the roundtrip actually exercises the field.
+            scoped_reconfigure: true,
         };
         let toml = original.to_toml_string().unwrap();
         let parsed = Config::from_toml_str(&toml).unwrap();
@@ -830,6 +845,20 @@ config portcullis 'main'
             ..Config::default()
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn scoped_reconfigure_parses_and_defaults_false() {
+        // Absent (pre-existing configs): defaults to false (today's full-reload path).
+        let old =
+            Config::from_uci_str("config portcullis 'main'\n    option store_id 'S'\n").unwrap();
+        assert!(!old.scoped_reconfigure);
+        assert!(!Config::default().scoped_reconfigure);
+
+        // Explicit UCI option parses (opt-in to the UNVALIDATED scoped path).
+        let uci = "config portcullis 'main'\n    option store_id 'S'\n    option scoped_reconfigure '1'\n";
+        let cfg = Config::from_uci_str(uci).unwrap();
+        assert!(cfg.scoped_reconfigure);
     }
 
     #[test]

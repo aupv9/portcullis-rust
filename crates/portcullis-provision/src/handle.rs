@@ -147,11 +147,43 @@ where
 /// radio). An empty list is exactly [`run_provision_subsystem`]. Wired from
 /// [`portcullis_config::Config::wireless_protected_radios`] by the composition
 /// root; enforced by [`uci::validate_protected_radios`] before any apply.
+///
+/// Leaves the UNVALIDATED scoped per-BSS reconfigure OFF — exactly today's
+/// full-reload behaviour. An operator opts into it via
+/// [`run_provision_subsystem_with_scoped`].
 pub fn run_provision_subsystem_with_policy<R>(
     runner: R,
     state_dir: impl Into<std::path::PathBuf>,
     responder_port: u16,
     protected_radios: Vec<String>,
+) -> (
+    ProvisionHandle,
+    mpsc::Receiver<WirelessStatus>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    R: CommandRunner + 'static,
+{
+    // scoped_reconfigure = false → the scoped path is NEVER produced (byte-for-byte
+    // today's behaviour). See `run_provision_subsystem_with_scoped`.
+    run_provision_subsystem_with_scoped(runner, state_dir, responder_port, protected_radios, false)
+}
+
+/// [`run_provision_subsystem_with_policy`] plus the `scoped_reconfigure` opt-in
+/// (wired from [`portcullis_config::Config::scoped_reconfigure`], default `false`).
+///
+/// UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+/// config.scoped_reconfigure. When `false` (the default and every current caller)
+/// the actor always takes [`sm::plan_apply`] → today's full reload, so the
+/// observable behaviour is unchanged. When `true` an SSID-only edit may take the
+/// scoped per-BSS hostapd path ([`sm::plan_apply_scoped`]); ANY scoped op error
+/// falls back to the full apply so the radio is never left dark.
+pub fn run_provision_subsystem_with_scoped<R>(
+    runner: R,
+    state_dir: impl Into<std::path::PathBuf>,
+    responder_port: u16,
+    protected_radios: Vec<String>,
+    scoped_reconfigure: bool,
 ) -> (
     ProvisionHandle,
     mpsc::Receiver<WirelessStatus>,
@@ -174,6 +206,7 @@ where
         // no stamp keeps `None` exactly as before. See `ProvisionActor::run`.
         last_committed: None,
         protected_radios,
+        scoped_reconfigure,
     };
     let join = tokio::spawn(actor.run());
     (ProvisionHandle { tx: cmd_tx }, wireless_status_rx, join)
@@ -189,6 +222,11 @@ struct ProvisionActor<R: CommandRunner> {
     /// Layer A: radios owned SSIDs may not target (admin/management radio).
     /// Empty = no restriction. Enforced in [`Self::handle_set_wireless`].
     protected_radios: Vec<String>,
+    /// UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+    /// config.scoped_reconfigure. Opt-in to the scoped per-BSS reconfigure path in
+    /// [`Self::handle_set_wireless`]. `false` (the default) = always [`sm::plan_apply`]
+    /// → today's full reload; observable behaviour unchanged.
+    scoped_reconfigure: bool,
 }
 
 impl<R: CommandRunner> ProvisionActor<R> {
@@ -335,25 +373,60 @@ impl<R: CommandRunner> ProvisionActor<R> {
         let mut batch = uci::render_deletes(&snapshot.existing_sections);
         batch.extend(sets);
 
+        // Scoped per-BSS reconfigure (P3, UNVALIDATED — pending P0 on-device mt76/
+        // hostapd spike; default-OFF via config.scoped_reconfigure). Only consulted
+        // when the operator opted in; `plan_apply_scoped` returns `Scoped` ONLY for a
+        // real change with no radio-level change that maps cleanly to BssOps. With
+        // the flag OFF we NEVER even compute it — the plan is FullReload, so the code
+        // below is byte-for-byte today's path. If a scoped apply is chosen and
+        // SUCCEEDS we skip the full reload (no PHY bounce); on ANY error we fall
+        // through to the full apply immediately so the radio is never left dark.
+        let mut applied_via_scoped = false;
+        if self.scoped_reconfigure {
+            if let sm::ApplyPlan::Scoped(ops) =
+                sm::plan_apply_scoped(true, self.last_committed.as_ref(), &snapshot, &state)
+            {
+                match self.machine.scoped_apply(&ops, &snapshot, &state).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            config_version = %state.config_version,
+                            ops = ops.len(),
+                            "wireless applied via SCOPED per-BSS reconfigure (no radio reload)"
+                        );
+                        applied_via_scoped = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            config_version = %state.config_version, error = %e,
+                            "scoped per-BSS reconfigure failed; falling back to full apply (never dark)"
+                        );
+                    }
+                }
+            }
+        }
+
         // Apply + commit + multi-radio reload. On ANY failure, roll back and
         // report FAILED — never leave a half-applied config on a CGNAT router.
-        if let Err(e) = self.machine.apply_wireless(&batch, true, &radios).await {
-            tracing::warn!(config_version = %state.config_version, error = %e, "wireless apply failed; rolling back");
-            if let Err(re) = self
-                .machine
-                .rollback_to(&snapshot, &current_sections, &radios)
-                .await
-            {
-                tracing::error!(config_version = %state.config_version, error = %re, "wireless rollback after failed apply ALSO failed");
+        // Skipped only when the scoped path above already applied successfully.
+        if !applied_via_scoped {
+            if let Err(e) = self.machine.apply_wireless(&batch, true, &radios).await {
+                tracing::warn!(config_version = %state.config_version, error = %e, "wireless apply failed; rolling back");
+                if let Err(re) = self
+                    .machine
+                    .rollback_to(&snapshot, &current_sections, &radios)
+                    .await
+                {
+                    tracing::error!(config_version = %state.config_version, error = %re, "wireless rollback after failed apply ALSO failed");
+                }
+                self.emit_wireless(sm::wireless_status(
+                    &state.config_version,
+                    ProvisionState::Failed,
+                    Self::ssid_results(&state),
+                    e.to_string(),
+                ))
+                .await;
+                return Err(e);
             }
-            self.emit_wireless(sm::wireless_status(
-                &state.config_version,
-                ProvisionState::Failed,
-                Self::ssid_results(&state),
-                e.to_string(),
-            ))
-            .await;
-            return Err(e);
         }
 
         // wireless namespaced to owned pc_* (can't brick dial-out) → apply-and-ACK,
@@ -917,6 +990,130 @@ mod tests {
         // Derived from live UCI (the gated `public` SSID → br-public).
         let gated = crate::sm::read_committed_gated(dir.path()).unwrap();
         assert_eq!(gated, vec!["br-public".to_string()]);
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    // --- Scoped per-BSS reconfigure (P3 dispatch + fallback) ---------------
+    // UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
+    // config.scoped_reconfigure.
+
+    /// A runner that (a) rehydrates `last_committed` = `boot_version` and serves the
+    /// pre-apply snapshot of an existing `home` SSID from `uci show wireless`/
+    /// `network`, and (b) ERRORS on any `ubus call hostapd*` op (the scoped path) —
+    /// so a scoped plan is chosen but its ubus op fails, exercising the fallback.
+    fn scoped_ubus_fails_runner(boot_version: &'static str) -> RecordingRunner {
+        RecordingRunner::with_responder(move |prog, args| {
+            // Fail the per-BSS hostapd reconfigure so the handler must fall back.
+            if prog == "ubus" && args.get(1) == Some(&"hostapd")
+                || (prog == "ubus"
+                    && args.get(1).map(|s| s.starts_with("hostapd.")).unwrap_or(false))
+            {
+                return Err(ProvisionError::Apply("hostapd ubus not available".into()));
+            }
+            if prog == "uci" && args.first() == Some(&"show") {
+                let body = match args.get(1).copied().unwrap_or("") {
+                    "wireless" => format!(
+                        "wireless.pc_meta.config_version='{boot_version}'\n\
+                         wireless.pc_home_ap0=wifi-iface\n\
+                         wireless.pc_home_ap0.ssid='WinX Home'\n\
+                         wireless.pc_home_ap0.network='pc_home_if'\n\
+                         wireless.pc_home_ap0.device='radio0'\n\
+                         wireless.pc_home_ap0.encryption='psk2'\n\
+                         wireless.pc_home_ap0.key='secret'\n"
+                    ),
+                    "network" => "network.pc_home_dev.name='br-home'\n".to_string(),
+                    _ => String::new(),
+                };
+                return Ok(body.into_bytes());
+            }
+            Ok(Vec::new())
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_apply_failure_falls_back_to_full_reload() {
+        // Flag ON: an SSID-only rename (cfg-1 → cfg-2) is scope-able, so the handler
+        // tries the per-BSS ubus reconfigure FIRST — but the mock errors on it, so it
+        // must fall back to the full apply and issue `/sbin/wifi reload radio0`
+        // (never leave the radio dark). Boot rehydrate seeds last_committed=cfg-1.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = scoped_ubus_fails_runner("cfg-1");
+        let (handle, mut wrx, join) = run_provision_subsystem_with_scoped(
+            runner.clone(),
+            dir.path().to_path_buf(),
+            8080,
+            Vec::new(),
+            true, // opt in to the UNVALIDATED scoped path
+        );
+
+        // Rename the `home` SSID at a NEW config_version (a real, scope-able change).
+        let st = WirelessDesiredState {
+            config_version: "cfg-2".into(),
+            ssids: vec![{
+                let mut s = wssid("home", false, 1);
+                s.ssid = "WinX Home Renamed".into();
+                s
+            }],
+            confirm_timeout_secs: 90,
+            peer_allows: Vec::new(),
+        };
+        handle.set_wireless(st).await.unwrap();
+        // Still ACKs Committed — the fallback full apply succeeded.
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+
+        let flat = runner.flat();
+        // 1. The scoped path WAS attempted: a `ubus call hostapd*` op was issued...
+        assert!(
+            flat.iter()
+                .any(|(p, a)| p == "ubus" && a.starts_with("call hostapd")),
+            "scoped path must attempt a hostapd ubus op: {flat:?}"
+        );
+        // 2. ...and after it failed, the FULL reload ran: `/sbin/wifi reload radio0`.
+        assert!(
+            flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())),
+            "fallback must run the full reload sequence (never dark): {flat:?}"
+        );
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_off_never_issues_hostapd_ubus() {
+        // Flag OFF (the default): even a scope-able SSID-only rename takes the full
+        // reload — NO `ubus call hostapd*` op is ever issued (behaviour unchanged).
+        let dir = tempfile::tempdir().unwrap();
+        let runner = scoped_ubus_fails_runner("cfg-1");
+        // with_policy → scoped_reconfigure defaults false.
+        let (handle, mut wrx, join) = run_provision_subsystem_with_policy(
+            runner.clone(),
+            dir.path().to_path_buf(),
+            8080,
+            Vec::new(),
+        );
+
+        let st = WirelessDesiredState {
+            config_version: "cfg-2".into(),
+            ssids: vec![{
+                let mut s = wssid("home", false, 1);
+                s.ssid = "WinX Home Renamed".into();
+                s
+            }],
+            confirm_timeout_secs: 90,
+            peer_allows: Vec::new(),
+        };
+        handle.set_wireless(st).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+
+        let flat = runner.flat();
+        assert!(
+            !flat.iter().any(|(p, a)| p == "ubus" && a.starts_with("call hostapd")),
+            "flag-off must never touch hostapd ubus: {flat:?}"
+        );
+        // The full reload still ran.
+        assert!(flat.contains(&("/sbin/wifi".to_string(), "reload radio0".to_string())));
 
         drop(handle);
         let _ = join.await;
