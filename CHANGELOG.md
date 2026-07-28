@@ -4,6 +4,29 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.21.0] — 2026-07-28
+
+### Added
+- **Equality-gate on wireless apply — identical control-plane re-pushes no longer
+  bounce the radio.** The apply path now routes through `plan_apply()`: when the
+  control plane re-pushes a wireless config whose `config_version` equals the last
+  committed one (churn / detect-only reconcile), the engine SKIPS the whole apply —
+  no re-render, no `uci` write, no `wifi reload` — and just re-ACKs `Committed` so
+  the CP ledger still converges. Previously every re-push, even an identical one,
+  ran a full `wifi reload <radio>` that bounced every SSID on the (single) radio;
+  a churning store could flap the radio continuously and overload-reboot the
+  router. A genuine config change still takes the full reload unchanged. Safe with
+  the 0.20.2 firewall-zone fix (a successful apply now fully binds, so a skipped
+  duplicate leaves nothing half-applied). Operational note: to force a re-render of
+  an already-committed store on an unchanged `config_version` (e.g. after an engine
+  render-logic change), clear the persisted version — `uci delete wireless.pc_meta`
+  — so the engine reports an empty version and the CP re-pushes.
+- **`ApplyPlan` foundation** (`NoChange` / `FullReload`) for the apply path. A
+  `Scoped(..)` per-BSS hostapd variant — reconfigure one SSID without bouncing the
+  whole radio — is scaffolded as a `TODO` gated on an on-device mt76/hostapd
+  feasibility spike; no scoped/ubus code ships here (it manipulates the sole radio
+  and cannot be unit-tested).
+
 ## [0.20.2] — 2026-07-28
 
 ### Fixed
