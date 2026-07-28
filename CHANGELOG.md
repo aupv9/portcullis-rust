@@ -4,6 +4,24 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.20.2] — 2026-07-28
+
+### Fixed
+- **The REAL cause of "a device/family SSID can't get an IP": a long slug's
+  firewall zone silently vanished.** An SSID's fw3 zone was named after its slug,
+  and fw3 derives iptables chain names as `zone_<slug>_postrouting` (slug + 17
+  chars). iptables SILENTLY rejects a chain name over 28 chars, so a slug of
+  12–16 chars (slugs are validated `[a-z0-9_]{1,16}`) — e.g. `win_gia_dinh`
+  → `zone_win_gia_dinh_postrouting` (29) — made fw3 drop the ENTIRE zone: no DHCP
+  allow, no forward-to-WAN. A client joined the SSID (WPA2 OK) but got no lease
+  and no internet. `fw3 print` generated **zero** rules for that bridge while a
+  short-slug neighbour got 20. The zone name now goes through `fw_zone_name()`:
+  slugs ≤ 11 chars stay verbatim (readable, backward-compatible); longer ones
+  collapse to a short stable hash (`z<8 hex>`) that always fits. Every reference —
+  the zone, its forwarding, its DHCP/DNS/portal/internal rules, and inter-SSID
+  peer allows — resolves through it, so they stay consistent. (0.20.0/0.20.1 fixed
+  a real-but-separate firewall-reload TIMING race; this is the actual root cause.)
+
 ## [0.20.1] — 2026-07-28
 
 ### Fixed
