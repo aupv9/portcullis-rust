@@ -168,7 +168,7 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     //     authorized client. Spawned BEFORE the control channel so its handle +
     //     status stream can be wired in.
     let (provisioner, wireless_status_rx, provision_join) =
-        portcullis_provision::run_provision_subsystem_with_policy(
+        portcullis_provision::run_provision_subsystem_with_scoped(
             portcullis_provision::ProcessRunner,
             portcullis_provision::DEFAULT_STATE_DIR,
             // The redirect-responder port opened by the per-SSID portal firewall
@@ -178,6 +178,11 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
             // Layer A: radios the CP may not place owned SSIDs on (admin radio).
             // Empty by default — opt-in per deployment.
             cfg.wireless_protected_radios.clone(),
+            // P0 scoped per-BSS reconfigure opt-in (default false). Wired from the
+            // UCI `option scoped_reconfigure` so an SSID-only edit can take the
+            // hostapd per-BSS reload path instead of bouncing the whole radio; any
+            // scoped op error falls back to a full reload (never leaves a radio dark).
+            cfg.scoped_reconfigure,
         );
     let provisioner: Arc<dyn Provisioner> = Arc::new(provisioner);
     tasks.push(provision_join);
