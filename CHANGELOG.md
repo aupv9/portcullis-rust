@@ -4,6 +4,26 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.22.0] — 2026-07-28
+
+### Added
+- **Scoped hostapd reconfigure — scaffolding, DEFAULT-OFF and UNVALIDATED.** New
+  `scoped_reconfigure` config option (default `false`). When enabled, an SSID edit
+  reconfigures only the changed BSS via hostapd ubus (`config_add` /
+  `config_remove` / `<vif> reload`) instead of a radio-wide `wifi reload`, so the
+  other SSIDs' clients are not dropped. With the flag OFF (the default) the apply
+  path is byte-for-byte unchanged — always a full reload — and any scoped-op error
+  falls back to the full reload, so the radio is never left dark.
+  **⚠ Do NOT enable in production yet.** The mt76/RutOS hostapd behaviour is
+  unconfirmed: run the P0 feasibility harness `deploy/hostapd-scope-spike.sh` on
+  the target and get a GO before flipping the flag. Radio-level changes
+  (channel / HT mode / country) always take the full reload regardless of the flag.
+- `deploy/hostapd-scope-spike.sh` — on-device P0 feasibility harness. Probes
+  `wifi reconf`, hostapd `config_add`/`config_remove`/`<vif> reload`, and
+  `iw interface add`; snapshots + trap-restores wireless/network/firewall and
+  `wifi reload`s on exit; emits a GO/NO-GO matrix (whether one BSS can be
+  reconfigured without dropping the others).
+
 ## [0.21.0] — 2026-07-28
 
 ### Added
