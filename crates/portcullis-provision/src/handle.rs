@@ -267,6 +267,38 @@ impl<R: CommandRunner> ProvisionActor<R> {
         &mut self,
         state: WirelessDesiredState,
     ) -> Result<(), ProvisionError> {
+        // Equality-gate (the churn brake). Route through the pure apply planner
+        // FIRST — before any validate/snapshot/render/apply. An identical CP
+        // re-push (same NON-EMPTY config_version as the last commit) has nothing
+        // to change: the engine has no reconcile cheaper than a full `wifi reload`,
+        // and reloading bounces the WHOLE radio (drops every SSID), so re-applying
+        // an unchanged version is a self-inflicted radio flap — the loop that has
+        // driven overload reboots on-device. A prior fix (v0.20.2) makes a
+        // successful apply fully bind the firewall zones, so a duplicate apply
+        // leaves nothing half-done that a re-push would need to heal → skipping is
+        // safe. Skip the apply and re-ACK Committed so the CP ledger still
+        // converges.
+        //
+        // Operational caveat: to force a re-render of an already-committed store
+        // (e.g. after a render-logic change WITHOUT a config_version bump), an
+        // operator clears the persisted stamp (`uci delete wireless.pc_meta`) — the
+        // engine then reports an empty version, the gate misses, and the CP
+        // re-push applies for real.
+        if let sm::ApplyPlan::NoChange = sm::plan_apply(self.last_committed.as_ref(), &state) {
+            tracing::info!(
+                config_version = %state.config_version,
+                "wireless push matches committed config_version; skipping apply (no render/uci/reload) and re-ACKing Committed"
+            );
+            self.emit_wireless(sm::wireless_status(
+                &state.config_version,
+                ProvisionState::Committed,
+                Self::ssid_results(&state),
+                "already committed (identical config_version; apply skipped)",
+            ))
+            .await;
+            return Ok(());
+        }
+
         // Validate FIRST — a bad desired-state writes nothing (fail-OPEN reject).
         uci::validate_wireless(&state)?;
         // Layer A: never let an owned SSID land on a protected (admin) radio, so a
@@ -567,6 +599,66 @@ mod tests {
         handle.set_wireless(wstate("cfg-b", 90)).await.unwrap();
         assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
         assert_eq!(handle.get_wireless().await.unwrap().config_version, "cfg-b");
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_identical_repush_is_gated_no_second_reload() {
+        // Equality-gate: pushing the SAME config_version twice applies + reloads
+        // ONCE. The second (identical) push is short-circuited before any
+        // render/uci/reload, but STILL re-ACKs Committed so the CP ledger converges.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = RecordingRunner::new();
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
+
+        handle.set_wireless(wstate("cfg-same", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+
+        // Snapshot the command count after the first (real) apply.
+        let after_first = runner.flat();
+        let commits_first = after_first
+            .iter()
+            .filter(|(p, a)| p == "uci" && a.starts_with("commit "))
+            .count();
+        let wifi_first = after_first.iter().filter(|(p, _)| p == "/sbin/wifi").count();
+        assert!(commits_first > 0, "first push must commit: {after_first:?}");
+        assert!(wifi_first > 0, "first push must reload wifi: {after_first:?}");
+
+        // Second push: identical config_version → gated.
+        handle.set_wireless(wstate("cfg-same", 90)).await.unwrap();
+        // It re-ACKs Committed (ledger convergence) even though nothing was applied.
+        let s2 = wrx.recv().await.unwrap();
+        assert_eq!(s2.state, ProvisionState::Committed);
+        assert_eq!(s2.config_version, "cfg-same");
+        assert!(wdrain(&mut wrx).is_empty());
+
+        // No NEW commit / wifi burst: the gate ran no render/uci/reload.
+        let after_second = runner.flat();
+        let commits_second = after_second
+            .iter()
+            .filter(|(p, a)| p == "uci" && a.starts_with("commit "))
+            .count();
+        let wifi_second = after_second.iter().filter(|(p, _)| p == "/sbin/wifi").count();
+        assert_eq!(
+            commits_second, commits_first,
+            "identical re-push must not commit again: {after_second:?}"
+        );
+        assert_eq!(
+            wifi_second, wifi_first,
+            "identical re-push must not reload wifi again: {after_second:?}"
+        );
+
+        // A DIFFERENT version still applies (gate misses) — proves it's not a hard stop.
+        handle.set_wireless(wstate("cfg-next", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+        let wifi_third = runner.flat().iter().filter(|(p, _)| p == "/sbin/wifi").count();
+        assert!(
+            wifi_third > wifi_second,
+            "a changed version must reload again"
+        );
 
         drop(handle);
         let _ = join.await;
