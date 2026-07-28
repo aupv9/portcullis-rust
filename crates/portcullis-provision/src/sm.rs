@@ -26,7 +26,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use portcullis_types::{ProvisionError, ProvisionState, SsidResult, WirelessStatus};
+use portcullis_types::{
+    ProvisionError, ProvisionState, SsidResult, WirelessDesiredState, WirelessStatus,
+};
 
 use crate::runner::CommandRunner;
 use crate::uci::{self, unquote, UciCmd, OWNED_CONFIGS};
@@ -725,6 +727,53 @@ pub fn reload_sequence_multi(radios: &[String]) -> Vec<(&'static str, Vec<String
     // pre-wifi reload can't — a wifi-only bridge device doesn't exist yet).
     v.push((INIT_FIREWALL, vec!["reload".to_string()]));
     v
+}
+
+/// The apply strategy chosen for a wireless push, computed by [`plan_apply`].
+///
+/// The engine has no cheaper reconcile than a full radio reload today, so the
+/// only two live variants are: SKIP entirely ([`ApplyPlan::NoChange`], the
+/// equality-gate) or do today's full re-render + `wifi reload <radio>`
+/// ([`ApplyPlan::FullReload`]). The gate is the load-bearing bit: without it an
+/// identical CP re-push (churn) re-applies and bounces the whole radio, which has
+/// driven overload reboots on-device.
+///
+// TODO(P0-gated): ApplyPlan::Scoped(...) — per-BSS hostapd reconfigure so an SSID
+// edit doesn't bounce the whole radio. Requires an on-device mt76/hostapd
+// feasibility spike (config_add/config_remove/hostapd.<vif> reload) before it can
+// be built; NOT implemented here because it manipulates the sole radio and cannot
+// be unit-tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyPlan {
+    /// The desired config_version equals the last-committed one — skip the apply
+    /// entirely (no render, no `uci`, no reload) and re-ACK.
+    NoChange,
+    /// Re-render every owned section and `wifi reload` each affected radio — the
+    /// existing (only) apply path. Chosen whenever the equality-gate misses.
+    FullReload,
+}
+
+/// Decide how to apply `desired` given the `last_committed` desired-state.
+///
+/// Pure + side-effect-free: returns [`ApplyPlan::NoChange`] exactly when the
+/// equality-gate holds — `last_committed` carries a NON-EMPTY `config_version`
+/// equal to the desired one — and [`ApplyPlan::FullReload`] otherwise (no prior
+/// commit, an empty prior version, or a differing version). An empty prior
+/// version never gates: it is the reboot-rehydrate / fresh-device sentinel, so a
+/// push must still fully apply.
+pub fn plan_apply(
+    last_committed: Option<&WirelessDesiredState>,
+    desired: &WirelessDesiredState,
+) -> ApplyPlan {
+    match last_committed {
+        Some(prev)
+            if !prev.config_version.is_empty()
+                && prev.config_version == desired.config_version =>
+        {
+            ApplyPlan::NoChange
+        }
+        _ => ApplyPlan::FullReload,
+    }
 }
 
 /// Build a [`WirelessStatus`] for a state transition.
@@ -1481,5 +1530,44 @@ mod tests {
             r#"{"interface":[{"interface":"lan","l3_device":"br-lan"}]}"#
         )
         .is_empty());
+    }
+
+    /// A minimal desired-state carrying only the `config_version` — the only field
+    /// the equality-gate reads.
+    fn ver(v: &str) -> WirelessDesiredState {
+        WirelessDesiredState {
+            config_version: v.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_apply_gates_equal_non_empty_versions() {
+        // Identical NON-EMPTY config_version → NoChange (the churn brake).
+        let prev = ver("cfg-7");
+        let desired = ver("cfg-7");
+        assert_eq!(plan_apply(Some(&prev), &desired), ApplyPlan::NoChange);
+    }
+
+    #[test]
+    fn plan_apply_reloads_on_differing_version() {
+        // A different version → FullReload (a real change to apply).
+        let prev = ver("cfg-7");
+        let desired = ver("cfg-8");
+        assert_eq!(plan_apply(Some(&prev), &desired), ApplyPlan::FullReload);
+    }
+
+    #[test]
+    fn plan_apply_reloads_when_no_prior_commit() {
+        // Fresh device (no last_committed) → always FullReload.
+        assert_eq!(plan_apply(None, &ver("cfg-1")), ApplyPlan::FullReload);
+    }
+
+    #[test]
+    fn plan_apply_empty_prior_version_never_gates() {
+        // The reboot-rehydrate / fresh sentinel is an empty prior version — it must
+        // NOT gate, even against an empty desired version, so a push still applies.
+        assert_eq!(plan_apply(Some(&ver("")), &ver("cfg-1")), ApplyPlan::FullReload);
+        assert_eq!(plan_apply(Some(&ver("")), &ver("")), ApplyPlan::FullReload);
     }
 }
