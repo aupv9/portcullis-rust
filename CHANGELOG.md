@@ -4,6 +4,23 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.24.1] — 2026-07-29
+
+### Fixed
+- **Sanitize DHCP reservation names — a device named with a space no longer kills
+  DHCP for the whole router.** A device static-IP reservation whose name held an
+  illegal hostname character (a SPACE, e.g. "Pos device", or a non-ASCII diacritic,
+  e.g. "Máy in") was rendered VERBATIM as the dnsmasq `dhcp-host` name. dnsmasq
+  refuses to start on a bad host name ("bad DHCP host name") and crash-loops — taking
+  DHCP down for EVERY SSID on the router, including the stock LAN, so clients
+  associate but never get an IP and drop after ~18s. Observed live on a RUT906.
+  `render_reservation_host` (the single source of truth for both the full apply path
+  and the DHCP-only diff-gate) now runs the name through `sanitize_dhcp_hostname`:
+  keep `[A-Za-z0-9_]` (underscores are accepted, so "camera_2" is unchanged), map
+  every other rune to '-', collapse runs, trim, cap to a 63-char DNS label; if
+  nothing legal survives, omit `.name` entirely (a nameless `dhcp-host=<mac>,<ip>`
+  is valid). Idempotent on already-legal names so the diff-gate render stays stable.
+
 ## [0.24.0] — 2026-07-29
 
 ### Fixed
