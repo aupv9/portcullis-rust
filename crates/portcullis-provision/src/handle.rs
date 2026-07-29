@@ -343,6 +343,49 @@ impl<R: CommandRunner> ProvisionActor<R> {
         // `wifi reload <radio>` can't bounce/dark the admin SSID. No-op when unset.
         uci::validate_protected_radios(&state, &self.protected_radios)?;
 
+        // DHCP-only diff-gate (P0). Priority: NoChange (handled above) > DhcpOnly >
+        // (scoped, stays off) > FullReload. When the ONLY difference from the last
+        // commit is per-SSID static DHCP reservations (MAC→IP), apply just the
+        // `dhcp.pc_<slug>_host*` delta + version-stamp bump and reload dnsmasq via
+        // SIGHUP — NO `wifi reload`, so no PHY bounce and no SSID drop (the fragile
+        // mt76/RUT906 case). On ANY error we fall through to the full apply below
+        // (never a half-applied config, never a fail-open gate).
+        if let sm::ApplyPlan::DhcpOnly(cmds) =
+            sm::plan_apply_dhcp(self.last_committed.as_ref(), &state)
+        {
+            match self.machine.apply_dhcp_only(&cmds).await {
+                Ok(()) => {
+                    // Gate scope is unchanged by a reservation edit (no radio/zone
+                    // touched), but re-derive+persist from LIVE UCI for parity with
+                    // the full path. Best-effort throughout.
+                    let gated_ifaces = sm::derive_gated_from_uci(self.machine.runner()).await;
+                    if let Err(e) = self.machine.write_committed_gated(&gated_ifaces).await {
+                        tracing::warn!(error = %e, "could not persist committed gated ifaces (dhcp-only path)");
+                    }
+                    tracing::info!(
+                        config_version = %state.config_version,
+                        cmds = cmds.len(),
+                        "wireless applied via DHCP-ONLY diff-gate (dnsmasq reload, no wifi reload)"
+                    );
+                    self.last_committed = Some(state.clone());
+                    self.emit_wireless(sm::wireless_status(
+                        &state.config_version,
+                        ProvisionState::Committed,
+                        Self::ssid_results(&state),
+                        "applied + committed (dhcp reservations only; no radio reload)",
+                    ))
+                    .await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        config_version = %state.config_version, error = %e,
+                        "dhcp-only apply failed; falling back to full apply (never half-applied)"
+                    );
+                }
+            }
+        }
+
         // Snapshot the CURRENT owned wireless state (pre-apply).
         let snapshot = self.machine.snapshot_wireless().await?;
 
@@ -527,6 +570,25 @@ mod tests {
             config_version: version.into(),
             confirm_timeout_secs: timeout,
             ssids: vec![wssid("public", true, 0), wssid("home", false, 1)],
+            peer_allows: Vec::new(),
+        }
+    }
+
+    /// `wstate` but with `home` carrying the given static DHCP reservations —
+    /// identical to `wstate` in every other field, so the ONLY delta between a
+    /// `wstate(v)` and a `wstate_resv(v')` push is the reservation list (the
+    /// DHCP-only diff-gate's exact special case).
+    fn wstate_resv(
+        version: &str,
+        timeout: u32,
+        reservations: Vec<portcullis_types::DhcpReservation>,
+    ) -> WirelessDesiredState {
+        let mut home = wssid("home", false, 1);
+        home.reservations = reservations;
+        WirelessDesiredState {
+            config_version: version.into(),
+            confirm_timeout_secs: timeout,
+            ssids: vec![wssid("public", true, 0), home],
             peer_allows: Vec::new(),
         }
     }
@@ -732,6 +794,70 @@ mod tests {
             wifi_third > wifi_second,
             "a changed version must reload again"
         );
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wireless_dhcp_only_change_reloads_dnsmasq_no_wifi_reload() {
+        // P0 diff-gate: a push that differs from the last commit ONLY in a static
+        // DHCP reservation applies via the dnsmasq-only path — ZERO `wifi reload`
+        // and exactly ONE `dnsmasq reload` — instead of bouncing the radio.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = gated_derive_runner();
+        let (handle, mut wrx, join) =
+            run_provision_subsystem(runner.clone(), dir.path().to_path_buf(), 8080);
+
+        // First push: full apply (baseline, no reservations).
+        handle.set_wireless(wstate("cfg-1", 90)).await.unwrap();
+        assert_eq!(wrx.recv().await.unwrap().state, ProvisionState::Committed);
+        let after_first = runner.flat();
+        let wifi_first = after_first.iter().filter(|(p, _)| p == "/sbin/wifi").count();
+        assert!(wifi_first > 0, "baseline push must reload wifi: {after_first:?}");
+
+        // Second push: SAME config except one added reservation on `home`, new
+        // version → DHCP-only diff-gate.
+        let resv = portcullis_types::DhcpReservation {
+            mac: "aa:bb:cc:dd:ee:01".into(),
+            ipaddr: "10.0.1.50".into(),
+            hostname: "vend-1".into(),
+        };
+        handle
+            .set_wireless(wstate_resv("cfg-2", 90, vec![resv]))
+            .await
+            .unwrap();
+        let s2 = wrx.recv().await.unwrap();
+        assert_eq!(s2.state, ProvisionState::Committed);
+        assert_eq!(s2.config_version, "cfg-2");
+        assert!(wdrain(&mut wrx).is_empty());
+
+        // Only the DHCP-only path's commands ran between the two pushes.
+        let delta: Vec<(String, String)> = runner.flat().into_iter().skip(after_first.len()).collect();
+        let wifi_delta = delta.iter().filter(|(p, _)| p == "/sbin/wifi").count();
+        assert_eq!(wifi_delta, 0, "dhcp-only push must NOT reload wifi: {delta:?}");
+        let dnsmasq_reloads = delta
+            .iter()
+            .filter(|(p, a)| p == "/etc/init.d/dnsmasq" && a == "reload")
+            .count();
+        assert_eq!(
+            dnsmasq_reloads, 1,
+            "dhcp-only push must reload dnsmasq exactly once: {delta:?}"
+        );
+        // And it committed dhcp (never a `dnsmasq restart`, never a bare `wifi`).
+        assert!(
+            delta.iter().any(|(p, a)| p == "uci" && a == "commit dhcp"),
+            "dhcp-only push must commit dhcp: {delta:?}"
+        );
+        assert!(
+            !delta.iter().any(|(p, a)| p == "/etc/init.d/dnsmasq" && a == "restart"),
+            "dhcp-only push must NOT restart dnsmasq: {delta:?}"
+        );
+
+        // Committed view reflects the reservation-bearing state.
+        let got = handle.get_wireless().await.unwrap();
+        assert_eq!(got.config_version, "cfg-2");
+        assert!(got.ssids.iter().any(|s| s.slug == "home" && s.reservations.len() == 1));
 
         drop(handle);
         let _ = join.await;

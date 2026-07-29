@@ -14,7 +14,9 @@
 //! by the snapshot filter too, so a snapshot can never capture a non-owned
 //! section).
 
-use portcullis_types::{PeerAllow, ProvisionError, SsidSpec, WirelessDesiredState};
+use portcullis_types::{
+    DhcpReservation, PeerAllow, ProvisionError, SsidSpec, WirelessDesiredState,
+};
 
 /// The UCI `config`s (top-level files) the reload touches. Commit order:
 /// `uci commit network wireless dhcp firewall sqm` (firewall before sqm; sqm
@@ -434,15 +436,10 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
         // the owned prefix so snapshot/cleanup's delete-diff removes stale ones
         // (verified via is_owned_wireless_section). Gated on !dhcp_disabled — a
         // bridged (no-pool) SSID has no dnsmasq instance to serve a lease.
+        // Rendered via [`render_reservation_host`] so the DHCP-only diff-gate path
+        // (`sm::plan_apply_dhcp`) emits byte-identical host sections.
         for (i, r) in spec.reservations.iter().enumerate() {
-            let h = format!("dhcp.pc_{s}_host{i}");
-            c.push(UciCmd::set(&h, "host"));
-            c.push(UciCmd::set(format!("{h}.mac"), r.mac.to_lowercase()));
-            c.push(UciCmd::set(format!("{h}.ip"), &r.ipaddr));
-            if !r.hostname.is_empty() {
-                c.push(UciCmd::set(format!("{h}.name"), &r.hostname));
-            }
-            c.push(UciCmd::set(format!("{h}.owner"), WIRELESS_OWNER));
+            c.extend(render_reservation_host(s, i, r));
         }
     }
 
@@ -547,6 +544,34 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     }
 
     c
+}
+
+/// Render ONE owned static-lease `config host` section
+/// (`dhcp.pc_<slug>_host<i>`) for reservation `r`. The SINGLE source of truth for
+/// a reservation's UCI shape — used by [`render_ssid`] (the full path) AND by the
+/// DHCP-only diff-gate (`sm::plan_apply_dhcp`), so both emit byte-identical
+/// sections/keys. Stamped [`WIRELESS_OWNER`] and `pc_`-namespaced so the reconcile
+/// diff / [`is_owned_wireless_section`] recognise it as owned. Pure; the caller
+/// guarantees the enclosing SSID is not `dhcp_disabled` (a bridged no-pool SSID
+/// has no dnsmasq instance to serve a lease).
+pub fn render_reservation_host(slug: &str, idx: usize, r: &DhcpReservation) -> Vec<UciCmd> {
+    let h = format!("dhcp.pc_{slug}_host{idx}");
+    let mut c = Vec::with_capacity(5);
+    c.push(UciCmd::set(&h, "host"));
+    c.push(UciCmd::set(format!("{h}.mac"), r.mac.to_lowercase()));
+    c.push(UciCmd::set(format!("{h}.ip"), &r.ipaddr));
+    if !r.hostname.is_empty() {
+        c.push(UciCmd::set(format!("{h}.name"), &r.hostname));
+    }
+    c.push(UciCmd::set(format!("{h}.owner"), WIRELESS_OWNER));
+    c
+}
+
+/// The owned `config.section` key for one static lease (`dhcp.pc_<slug>_host<i>`).
+/// Shared by the renderer + the DHCP-only diff-gate's delete-diff so a stale host
+/// section is targeted with the exact key [`render_reservation_host`] created.
+pub fn reservation_host_section(slug: &str, idx: usize) -> String {
+    format!("dhcp.pc_{slug}_host{idx}")
 }
 
 /// The fw3 firewall-zone NAME for an SSID slug. fw3 derives iptables chain names
