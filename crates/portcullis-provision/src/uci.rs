@@ -546,6 +546,36 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     c
 }
 
+/// Sanitize a reservation's display name into a DHCP-legal hostname for the
+/// `dhcp.pc_<slug>_host<i>.name` field. dnsmasq REFUSES to start ("bad DHCP host
+/// name") when a `dhcp-host` name holds an illegal character — most commonly a
+/// SPACE (a device named "Pos device") or a non-ASCII diacritic ("Máy in") — and a
+/// single bad reservation takes DHCP down for the WHOLE router, every SSID incl the
+/// stock LAN. So the display name is NEVER passed through raw: keep `[A-Za-z0-9_]`
+/// (underscores are accepted, so "camera_2" is preserved), map every other rune to
+/// '-', collapse runs, trim leading/trailing '-', and cap to one 63-char DNS label.
+/// Idempotent on an already-legal name (keeps the DHCP-only diff-gate's render
+/// byte-stable). Returns "" when nothing legal survives — the caller then omits
+/// `.name` (a nameless `dhcp-host=<mac>,<ip>` is valid and never crashes dnsmasq).
+pub fn sanitize_dhcp_hostname(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let mut s: String = out.trim_matches('-').chars().take(63).collect();
+    while s.ends_with('-') {
+        s.pop();
+    }
+    s
+}
+
 /// Render ONE owned static-lease `config host` section
 /// (`dhcp.pc_<slug>_host<i>`) for reservation `r`. The SINGLE source of truth for
 /// a reservation's UCI shape — used by [`render_ssid`] (the full path) AND by the
@@ -560,8 +590,13 @@ pub fn render_reservation_host(slug: &str, idx: usize, r: &DhcpReservation) -> V
     c.push(UciCmd::set(&h, "host"));
     c.push(UciCmd::set(format!("{h}.mac"), r.mac.to_lowercase()));
     c.push(UciCmd::set(format!("{h}.ip"), &r.ipaddr));
-    if !r.hostname.is_empty() {
-        c.push(UciCmd::set(format!("{h}.name"), &r.hostname));
+    // Sanitize the display name into a DHCP-legal hostname: an illegal `.name` (a
+    // space in "Pos device", a diacritic in "Máy in") makes dnsmasq refuse to start
+    // and takes DHCP down for the WHOLE router. Omit `.name` entirely if nothing
+    // legal survives (`dhcp-host=<mac>,<ip>` is valid without a name).
+    let host = sanitize_dhcp_hostname(&r.hostname);
+    if !host.is_empty() {
+        c.push(UciCmd::set(format!("{h}.name"), host));
     }
     c.push(UciCmd::set(format!("{h}.owner"), WIRELESS_OWNER));
     c
@@ -1530,6 +1565,47 @@ mod tests {
         assert!(!has_key(&cmds, "dhcp.pc_devices_host1.name"));
         // The host section name carries the owned pc_ prefix (snapshot/cleanup).
         assert!(is_owned_wireless_section("dhcp.pc_devices_host0"));
+    }
+
+    #[test]
+    fn sanitize_dhcp_hostname_maps_illegal_to_legal() {
+        // Already-legal names pass through unchanged (idempotent — keeps the
+        // DHCP-only diff-gate render byte-stable so it doesn't re-render forever).
+        assert_eq!(sanitize_dhcp_hostname("phone"), "phone");
+        assert_eq!(sanitize_dhcp_hostname("camera_2"), "camera_2"); // underscore kept
+        assert_eq!(sanitize_dhcp_hostname("pos-device"), "pos-device");
+        // A SPACE (the "Pos device" crash that took down DHCP) -> hyphen.
+        assert_eq!(sanitize_dhcp_hostname("Pos device"), "Pos-device");
+        assert_eq!(sanitize_dhcp_hostname("Mac mini"), "Mac-mini");
+        // Diacritics / punctuation / runs collapse to one '-', trimmed at the ends.
+        assert_eq!(sanitize_dhcp_hostname("Máy in"), "M-y-in");
+        assert_eq!(sanitize_dhcp_hostname("  hi!! there  "), "hi-there");
+        // Nothing legal survives -> empty string (caller omits `.name`).
+        assert_eq!(sanitize_dhcp_hostname("   "), "");
+        assert_eq!(sanitize_dhcp_hostname("☕😀"), "");
+        // Capped to a single 63-char DNS label, never ending on '-'.
+        assert_eq!(sanitize_dhcp_hostname(&"a".repeat(100)).len(), 63);
+    }
+
+    #[test]
+    fn render_reservation_host_sanitizes_illegal_name() {
+        // A device named with a space must NOT reach dnsmasq verbatim — that is the
+        // "bad DHCP host name" crash that kills DHCP for the whole router.
+        let r = DhcpReservation {
+            mac: "c8:fb:54:00:ce:03".into(),
+            ipaddr: "10.21.0.172".into(),
+            hostname: "Pos device".into(),
+        };
+        let cmds = render_reservation_host("win", 3, &r);
+        assert!(has_set(&cmds, "dhcp.pc_win_host3.name", "Pos-device"));
+        // An all-illegal name -> no `.name` key at all (nameless dhcp-host is legal).
+        let r2 = DhcpReservation {
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            ipaddr: "10.21.0.9".into(),
+            hostname: "☕".into(),
+        };
+        let cmds2 = render_reservation_host("win", 9, &r2);
+        assert!(!has_key(&cmds2, "dhcp.pc_win_host9.name"));
     }
 
     // --- device network: wired bridge ports + static-only DHCP -------------
