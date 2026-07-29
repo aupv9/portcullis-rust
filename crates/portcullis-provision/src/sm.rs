@@ -398,6 +398,54 @@ impl<R: CommandRunner> ProvisionMachine<R> {
         self.commit_and_reload_multi(radios).await
     }
 
+    /// Apply a DHCP-reservations-only delta ([`crate::sm::plan_apply_dhcp`] →
+    /// [`ApplyPlan::DhcpOnly`]): stage the `dhcp.pc_<slug>_host*` add/delete (+ the
+    /// `wireless.pc_meta` version-stamp bump) `cmds`, `uci commit` the touched
+    /// configs, then reload dnsmasq via SIGHUP (`/etc/init.d/dnsmasq reload` — NOT
+    /// `restart`, NOT any `wifi` command). NO `wifi reload`, so no PHY bounce and no
+    /// SSID drop; and NO dark-radio recovery / carrier wait (no radio touched).
+    ///
+    /// Fail-SAFE: on ANY error (a `uci set/delete`, a `commit`, or the dnsmasq
+    /// reload) it reverts the still-staged owned configs and returns `Err`, so the
+    /// caller can fall back to the full apply+reload — never a half-applied config,
+    /// never a fail-open gate. `dhcp` and `wireless` are the only configs a DhcpOnly
+    /// batch writes; committing them is enough (the delta touches nothing else).
+    pub async fn apply_dhcp_only(&self, cmds: &[UciCmd]) -> Result<(), ProvisionError> {
+        for cmd in cmds {
+            let argv = cmd.argv();
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match self.runner.run(UCI, &argv_refs).await {
+                Ok(_) => {}
+                // A delete of an absent host section is not an error (a shortened
+                // reservation list deletes indices that may already be gone).
+                Err(_) if matches!(cmd, UciCmd::Delete { .. }) => {
+                    tracing::debug!(cmd = ?cmd, "uci delete of absent dhcp host section ignored");
+                }
+                Err(e) => {
+                    // Drop the staged remainder so a later external `uci commit`
+                    // can't flush a half-batch (mirrors `apply_wireless`, P0 #3).
+                    self.revert_owned().await;
+                    return Err(e);
+                }
+            }
+        }
+        // Commit ONLY the two configs a DhcpOnly batch writes: the host sections
+        // (`dhcp`) and the version stamp (`wireless`). Committing `wireless` here
+        // reloads NOTHING — no wifi-iface changed and we never call `wifi`.
+        for cfg in ["dhcp", "wireless"] {
+            if let Err(e) = self.runner.run(UCI, &["commit", cfg]).await {
+                self.revert_owned().await;
+                return Err(e);
+            }
+        }
+        // SIGHUP dnsmasq: it re-reads its config (picking up the new/removed static
+        // leases) WITHOUT dropping the running instance — no client on any SSID is
+        // disturbed. `reload`, not `restart` (restart bounces the daemon), and not
+        // `wifi` (which bounces the radio).
+        self.runner.run(INIT_DNSMASQ, &["reload"]).await?;
+        Ok(())
+    }
+
     /// `uci commit` per owned config then the reload sequence, scoping the wifi
     /// step to EACH radio in `radios` (never bare `wifi reload`). Shared by
     /// [`Self::apply_wireless`] + [`Self::rollback_to`].
@@ -843,6 +891,15 @@ pub enum ApplyPlan {
     /// Re-render every owned section and `wifi reload` each affected radio — the
     /// existing (only) apply path. Chosen whenever the equality-gate misses.
     FullReload,
+    /// The ONLY difference from the last commit is per-SSID DHCP **reservations**
+    /// (static MAC→IP leases) — every wireless/network/firewall/peer field is
+    /// identical. Apply just the carried `dhcp.pc_<slug>_host*` UCI delta + the
+    /// version-stamp bump, `uci commit`, and reload dnsmasq via SIGHUP
+    /// (`/etc/init.d/dnsmasq reload`). NO `wifi reload`, so no PHY bounce and no
+    /// SSID drop (the fragile mt76/RUT906 case). Produced by [`plan_apply_dhcp`].
+    /// Any error on this path falls back to [`ApplyPlan::FullReload`] (never a
+    /// half-applied config, never a fail-open gate).
+    DhcpOnly(Vec<UciCmd>),
     /// UNVALIDATED — pending P0 on-device mt76/hostapd spike; default-OFF via
     /// config.scoped_reconfigure. Per-BSS hostapd reconfigure: apply the given
     /// [`BssOp`]s (+ the owned UCI in parallel) WITHOUT bouncing the whole radio.
@@ -872,6 +929,132 @@ pub fn plan_apply(
         }
         _ => ApplyPlan::FullReload,
     }
+}
+
+/// True when every field of two [`SsidSpec`]s is identical EXCEPT `reservations`.
+/// The whitelist below must name EVERY field the full renderer reads besides
+/// `reservations`; a new field on `SsidSpec` MUST be added here (else a change to
+/// it would be silently mis-classified as DHCP-only and skip the `wifi reload` it
+/// needs). Fail-safe by construction: any field not compared equal → not DHCP-only.
+fn ssid_eq_except_reservations(
+    a: &portcullis_types::SsidSpec,
+    b: &portcullis_types::SsidSpec,
+) -> bool {
+    a.slug == b.slug
+        && a.ssid == b.ssid
+        && a.radios == b.radios
+        && a.encryption == b.encryption
+        && a.key == b.key
+        && a.hidden == b.hidden
+        && a.isolate == b.isolate
+        && a.gated == b.gated
+        && a.bridge_name == b.bridge_name
+        // Network / subnet / pool — a change here is NOT DHCP-only (fail-safe to a
+        // full reload): the reservation may no longer sit in-subnet, and the
+        // interface/zone/pool re-render needs the full path.
+        && a.ipaddr == b.ipaddr
+        && a.netmask == b.netmask
+        && a.dhcp_start == b.dhcp_start
+        && a.dhcp_limit == b.dhcp_limit
+        && a.dhcp_leasetime == b.dhcp_leasetime
+        && a.dhcp_disabled == b.dhcp_disabled
+        && a.static_only == b.static_only
+        && a.bridge_ports == b.bridge_ports
+        && a.egress_zone == b.egress_zone
+        && a.internal_targets == b.internal_targets
+        && a.max_clients == b.max_clients
+        && a.mac_policy == b.mac_policy
+        && a.mac_list == b.mac_list
+        && a.rate_down_kbps == b.rate_down_kbps
+        && a.rate_up_kbps == b.rate_up_kbps
+        && a.mode == b.mode
+        && a.ieee80211r == b.ieee80211r
+        && a.ieee80211w == b.ieee80211w
+    // NOTE: `reservations` intentionally NOT compared — that is the delta.
+}
+
+/// Decide whether `desired` can be applied as a DHCP-reservations-only change —
+/// the P0 diff-gate that spares a `wifi reload` (and the SSID drop it causes on
+/// mt76/RUT906) when the ONLY difference from the last commit is static DHCP
+/// leases (MAC→fixed-IP).
+///
+/// Pure + side-effect-free. Priority (the caller enforces the same order):
+/// [`ApplyPlan::NoChange`] (the equality-gate) ALWAYS wins; else, if a prior
+/// commit exists and the two desired-states are IDENTICAL in every field except
+/// per-SSID `reservations` (same SSID slug SET, same order, every non-reservation
+/// field equal per SSID — see [`ssid_eq_except_reservations`] — and identical
+/// `confirm_timeout_secs` + `peer_allows`), returns [`ApplyPlan::DhcpOnly`]
+/// carrying the `dhcp.pc_<slug>_host*` UCI delta (delete the prior host sections
+/// of each changed SSID, re-set the new ones) PLUS the `wireless.pc_meta` version
+/// stamp bump; otherwise [`ApplyPlan::FullReload`]. A subnet/pool change alongside
+/// a reservation change is NOT DHCP-only → `FullReload` (fail-safe).
+pub fn plan_apply_dhcp(
+    last_committed: Option<&WirelessDesiredState>,
+    desired: &WirelessDesiredState,
+) -> ApplyPlan {
+    // The equality-gate always wins — an identical version has nothing to apply.
+    if plan_apply(last_committed, desired) == ApplyPlan::NoChange {
+        return ApplyPlan::NoChange;
+    }
+    let Some(prev) = last_committed else {
+        return ApplyPlan::FullReload; // no baseline to diff against
+    };
+    // Same SSID set (same slugs, same order) or it is a structural change.
+    if prev.ssids.len() != desired.ssids.len() {
+        return ApplyPlan::FullReload;
+    }
+    // Global (non-SSID) fields must match — a peer-rule / timeout change is not
+    // DHCP-only. (config_version differs by definition here; it is the version
+    // stamp we bump, handled below.)
+    if prev.confirm_timeout_secs != desired.confirm_timeout_secs
+        || prev.peer_allows != desired.peer_allows
+    {
+        return ApplyPlan::FullReload;
+    }
+
+    // Per-SSID: every non-reservation field must be equal (and the slug order must
+    // line up — [`ssid_eq_except_reservations`] compares `slug`). Collect the
+    // reservation delta for the SSIDs that actually changed.
+    let mut cmds: Vec<UciCmd> = Vec::new();
+    let mut changed = false;
+    for (p, d) in prev.ssids.iter().zip(desired.ssids.iter()) {
+        if !ssid_eq_except_reservations(p, d) {
+            return ApplyPlan::FullReload;
+        }
+        if p.reservations == d.reservations {
+            continue; // this SSID's leases are unchanged
+        }
+        // A reservation change on a bridged (no-pool) SSID has no dnsmasq instance
+        // / host sections to render — that is a structural mismatch, so fall back.
+        if d.dhcp_disabled {
+            return ApplyPlan::FullReload;
+        }
+        changed = true;
+        // Delete the prior host sections (position-indexed) then re-set the new
+        // ones, so a shortened / reordered list leaves no orphan `host<i>`. Keys
+        // come from the SAME renderer the full path uses, so they match exactly.
+        let stale: Vec<String> = (0..p.reservations.len())
+            .map(|i| uci::reservation_host_section(&d.slug, i))
+            .collect();
+        cmds.extend(uci::render_deletes(&stale));
+        for (i, r) in d.reservations.iter().enumerate() {
+            cmds.extend(uci::render_reservation_host(&d.slug, i, r));
+        }
+    }
+
+    if !changed {
+        // Nothing in `reservations` differs, yet the versions differ and every
+        // other field matched — a bare version bump. Not our special case; let the
+        // full path re-render + reload (it also re-stamps the version). Rare.
+        return ApplyPlan::FullReload;
+    }
+
+    // Bump the persisted committed version stamp so a reboot rehydrates the NEW
+    // version (and the next identical re-push equality-gates). Lives in `wireless`
+    // but touches only the owned `pc_meta` scalar — committing `wireless` for it
+    // triggers NO `wifi reload` (we never call one on this path).
+    cmds.extend(uci::render_config_version_meta(&desired.config_version));
+    ApplyPlan::DhcpOnly(cmds)
 }
 
 // ===========================================================================
@@ -1962,6 +2145,146 @@ mod tests {
         // NOT gate, even against an empty desired version, so a push still applies.
         assert_eq!(plan_apply(Some(&ver("")), &ver("cfg-1")), ApplyPlan::FullReload);
         assert_eq!(plan_apply(Some(&ver("")), &ver("")), ApplyPlan::FullReload);
+    }
+
+    // --- DHCP-only diff-gate (P0: reservation edit spares a `wifi reload`) --
+
+    fn resv(mac: &str, ip: &str, name: &str) -> portcullis_types::DhcpReservation {
+        portcullis_types::DhcpReservation {
+            mac: mac.into(),
+            ipaddr: ip.into(),
+            hostname: name.into(),
+        }
+    }
+
+    /// A device SSID with a static-lease pool (`static_only`) and the given
+    /// reservations — the shape a DHCP-only edit mutates.
+    fn dev_spec(slug: &str, reservations: Vec<portcullis_types::DhcpReservation>) -> portcullis_types::SsidSpec {
+        portcullis_types::SsidSpec {
+            slug: slug.into(),
+            ssid: format!("WinX {slug}"),
+            radios: vec!["radio0".into()],
+            encryption: "psk2".into(),
+            key: "supersecret".into(),
+            bridge_name: format!("br-{slug}"),
+            ipaddr: "10.40.0.1".into(),
+            netmask: "255.255.255.0".into(),
+            dhcp_start: "10".into(),
+            dhcp_limit: "200".into(),
+            dhcp_leasetime: "12h".into(),
+            static_only: true,
+            reservations,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_apply_dhcp_only_reservations_differ_is_dhcp_only() {
+        // Same SSID, same everything EXCEPT one added reservation → DhcpOnly, and the
+        // carried cmds target `dhcp.pc_<slug>_host*` (+ the version-stamp bump).
+        let prev = state_with("cfg-1", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "vend-1")])]);
+        let desired = state_with(
+            "cfg-2",
+            vec![dev_spec(
+                "pos",
+                vec![
+                    resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "vend-1"),
+                    resv("aa:bb:cc:dd:ee:02", "10.40.0.12", "vend-2"),
+                ],
+            )],
+        );
+        let plan = plan_apply_dhcp(Some(&prev), &desired);
+        let ApplyPlan::DhcpOnly(cmds) = plan else {
+            panic!("expected DhcpOnly, got {plan:?}");
+        };
+        // Every host-touching cmd targets the owned dhcp host sections.
+        assert!(
+            cmds.iter().any(|c| matches!(c, UciCmd::Set { key, .. } if key.starts_with("dhcp.pc_pos_host"))),
+            "must set new host sections: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, UciCmd::Delete { key } if key.starts_with("dhcp.pc_pos_host"))),
+            "must delete prior host sections (position-indexed re-set): {cmds:?}"
+        );
+        // The version stamp is bumped so a reboot rehydrates the new version.
+        assert!(
+            cmds.iter().any(|c| matches!(c, UciCmd::Set { key, value } if key == "wireless.pc_meta.config_version" && value == "cfg-2")),
+            "must bump the persisted version stamp: {cmds:?}"
+        );
+        // And it NEVER touches a non-dhcp/non-meta owned section (no wifi-iface).
+        assert!(
+            !cmds.iter().any(|c| matches!(c, UciCmd::Set { key, .. } if key.starts_with("wireless.pc_pos_ap"))),
+            "dhcp-only delta must not touch wifi-iface sections: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn plan_apply_dhcp_ssid_param_change_is_full_reload() {
+        // A reservation change AND an SSID name change → NOT dhcp-only → FullReload.
+        let prev = state_with("cfg-1", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "")])]);
+        let mut changed = dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "")]);
+        changed.ssid = "WinX Renamed".into();
+        let desired = state_with("cfg-2", vec![changed]);
+        assert_eq!(plan_apply_dhcp(Some(&prev), &desired), ApplyPlan::FullReload);
+    }
+
+    #[test]
+    fn plan_apply_dhcp_subnet_change_alongside_reservation_is_full_reload() {
+        // A subnet/pool field changed alongside the reservation → FullReload
+        // (fail-safe: the reservation may no longer sit in-subnet).
+        let prev = state_with("cfg-1", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "")])]);
+        let mut changed = dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:02", "10.50.0.11", "")]);
+        changed.ipaddr = "10.50.0.1".into(); // subnet moved
+        let desired = state_with("cfg-2", vec![changed]);
+        assert_eq!(plan_apply_dhcp(Some(&prev), &desired), ApplyPlan::FullReload);
+    }
+
+    #[test]
+    fn plan_apply_dhcp_identical_version_is_no_change() {
+        // The equality-gate always wins over the dhcp-only path.
+        let prev = state_with("cfg-1", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "")])]);
+        // Same version but a (would-be) reservation delta — the gate still wins.
+        let desired = state_with("cfg-1", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:02", "10.40.0.12", "")])]);
+        assert_eq!(plan_apply_dhcp(Some(&prev), &desired), ApplyPlan::NoChange);
+    }
+
+    #[test]
+    fn plan_apply_dhcp_no_prior_commit_is_full_reload() {
+        // A fresh device (no baseline to diff against) is never dhcp-only.
+        let desired = state_with("cfg-1", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "")])]);
+        assert_eq!(plan_apply_dhcp(None, &desired), ApplyPlan::FullReload);
+    }
+
+    #[test]
+    fn plan_apply_dhcp_added_ssid_is_full_reload() {
+        // Adding a whole SSID (not just a reservation) is structural → FullReload.
+        let prev = state_with("cfg-1", vec![dev_spec("pos", vec![])]);
+        let desired = state_with("cfg-2", vec![dev_spec("pos", vec![]), dev_spec("cam", vec![])]);
+        assert_eq!(plan_apply_dhcp(Some(&prev), &desired), ApplyPlan::FullReload);
+    }
+
+    #[test]
+    fn plan_apply_dhcp_removed_reservation_deletes_stale_host() {
+        // Shrinking the list from 2→1 must delete BOTH prior host indices and re-set
+        // only the surviving one (no orphan host1 left behind).
+        let prev = state_with(
+            "cfg-1",
+            vec![dev_spec(
+                "pos",
+                vec![
+                    resv("aa:bb:cc:dd:ee:01", "10.40.0.11", ""),
+                    resv("aa:bb:cc:dd:ee:02", "10.40.0.12", ""),
+                ],
+            )],
+        );
+        let desired = state_with("cfg-2", vec![dev_spec("pos", vec![resv("aa:bb:cc:dd:ee:01", "10.40.0.11", "")])]);
+        let ApplyPlan::DhcpOnly(cmds) = plan_apply_dhcp(Some(&prev), &desired) else {
+            panic!("expected DhcpOnly");
+        };
+        assert!(
+            cmds.iter().any(|c| matches!(c, UciCmd::Delete { key } if key == "dhcp.pc_pos_host1")),
+            "stale host1 must be deleted: {cmds:?}"
+        );
     }
 
     // --- Scoped per-BSS reconfigure (P1 diff + P3 dispatch) ----------------
