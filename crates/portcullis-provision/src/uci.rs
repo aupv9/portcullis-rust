@@ -144,6 +144,12 @@ pub const RESERVED_BRIDGES: [&str; 1] = ["br-lan"];
 /// WAN netdevs a `bridge_ports` entry may never name — bridging the uplink into a
 /// client SSID would bypass the gate and expose the WAN L2 to clients.
 pub const RESERVED_WAN_NETDEVS: [&str; 2] = ["wan", "wan6"];
+/// Wired LAN-port-joins-SSID feature: TEMPORARILY DISABLED 2026-07-29 (RUT906 is
+/// swconfig, no DSA lanN netdevs to bridge; the control-plane is also gated to stop
+/// sending `bridge_ports`). When `false`, a spec's `bridge_ports` are IGNORED — no
+/// `network.pc_<slug>_dev.ports` is ever rendered, and carrying them is accepted (not
+/// an error). Flip to `true` to restore the full feature (render + strict validation).
+const WIRED_BRIDGE_PORTS_ENABLED: bool = false;
 
 /// Whether `s` names a LAN switch port a device-network SSID may bridge in: the
 /// DSA per-port netdev layout `lan1`..`lanN` (`^lan[0-9]+$`). Bare `lan` is NOT a
@@ -323,8 +329,12 @@ pub fn render_ssid(spec: &SsidSpec, responder_port: u16) -> Vec<UciCmd> {
     // Empty (default) = a Wi-Fi-only bridge — byte-identical to before. The ports
     // are freed from br-lan at BOOTSTRAP; the engine only ADDS them here, never
     // removes them from br-lan (invariant: never touch br-lan).
-    for port in &spec.bridge_ports {
-        c.push(UciCmd::add_list(format!("{dev}.ports"), port.as_str()));
+    // Gated OFF (see WIRED_BRIDGE_PORTS_ENABLED): when disabled, no `.ports` is
+    // rendered even for a spec that carries bridge_ports — a Wi-Fi-only bridge.
+    if WIRED_BRIDGE_PORTS_ENABLED {
+        for port in &spec.bridge_ports {
+            c.push(UciCmd::add_list(format!("{dev}.ports"), port.as_str()));
+        }
     }
     c.push(UciCmd::set(format!("{dev}.owner"), WIRELESS_OWNER));
 
@@ -984,29 +994,34 @@ pub fn validate_wireless(state: &WirelessDesiredState) -> Result<(), ProvisionEr
         // uplink into a client SSID and bypass the gate), MUST NOT be a reserved
         // bridge (br-lan), and MUST NOT be claimed by another SSID in this push
         // (one netdev cannot be a member of two bridges).
-        for port in &ssid.bridge_ports {
-            let p = port.as_str();
-            if RESERVED_WAN_NETDEVS.contains(&p) {
-                return bad(format!(
-                    "bridge_ports entry '{p}' for slug '{s}' is a WAN netdev (would bypass the gate)"
-                ));
+        // Gated OFF (see WIRED_BRIDGE_PORTS_ENABLED): when disabled, bridge_ports
+        // are ignored by the renderer, so a spec carrying them is ACCEPTED (not an
+        // error) and simply produces a Wi-Fi-only bridge. Skip validation entirely.
+        if WIRED_BRIDGE_PORTS_ENABLED {
+            for port in &ssid.bridge_ports {
+                let p = port.as_str();
+                if RESERVED_WAN_NETDEVS.contains(&p) {
+                    return bad(format!(
+                        "bridge_ports entry '{p}' for slug '{s}' is a WAN netdev (would bypass the gate)"
+                    ));
+                }
+                if RESERVED_BRIDGES.contains(&p) {
+                    return bad(format!(
+                        "bridge_ports entry '{p}' for slug '{s}' is a reserved bridge"
+                    ));
+                }
+                if !is_lan_netdev(p) {
+                    return bad(format!(
+                        "bridge_ports entry '{p}' for slug '{s}' is not a LAN netdev (expected lan1..lanN)"
+                    ));
+                }
+                if seen_ports.contains(&p) {
+                    return bad(format!(
+                        "bridge_ports entry '{p}' for slug '{s}' is already bridged into another SSID"
+                    ));
+                }
+                seen_ports.push(p);
             }
-            if RESERVED_BRIDGES.contains(&p) {
-                return bad(format!(
-                    "bridge_ports entry '{p}' for slug '{s}' is a reserved bridge"
-                ));
-            }
-            if !is_lan_netdev(p) {
-                return bad(format!(
-                    "bridge_ports entry '{p}' for slug '{s}' is not a LAN netdev (expected lan1..lanN)"
-                ));
-            }
-            if seen_ports.contains(&p) {
-                return bad(format!(
-                    "bridge_ports entry '{p}' for slug '{s}' is already bridged into another SSID"
-                ));
-            }
-            seen_ports.push(p);
         }
 
         let egress = if ssid.egress_zone.is_empty() {
@@ -1612,22 +1627,23 @@ mod tests {
 
     #[test]
     fn render_ssid_adds_a_list_entry_per_bridge_port() {
-        // Multiple wired LAN ports -> one add_list on .ports each; the bridge
-        // device section is otherwise unchanged (owner still stamped).
+        // Wired LAN-port-joins-SSID is TEMPORARILY DISABLED (WIRED_BRIDGE_PORTS_ENABLED
+        // = false): a spec carrying bridge_ports renders NO `.ports` add_list at all —
+        // a Wi-Fi-only bridge. The bridge device section is otherwise unchanged (owner
+        // still stamped). Flip the const to `true` to restore one add_list per port
+        // (then this assertion becomes has_add_list "lan1".."lan3" + n_ports == 3).
         let mut spec = valid_ssid("devices", false);
         spec.bridge_ports = vec!["lan1".into(), "lan2".into(), "lan3".into()];
         let cmds = render_ssid(&spec, 8080);
         assert!(has_set(&cmds, "network.pc_devices_dev", "device"));
         assert!(has_set(&cmds, "network.pc_devices_dev.type", "bridge"));
-        assert!(has_add_list(&cmds, "network.pc_devices_dev.ports", "lan1"));
-        assert!(has_add_list(&cmds, "network.pc_devices_dev.ports", "lan2"));
-        assert!(has_add_list(&cmds, "network.pc_devices_dev.ports", "lan3"));
-        // exactly three .ports add_lists (no stray/duplicate members)
+        // Feature OFF: no `.ports` key / add_list, even though bridge_ports is non-empty.
+        assert!(!has_key(&cmds, "network.pc_devices_dev.ports"));
         let n_ports = cmds
             .iter()
             .filter(|c| matches!(c, UciCmd::AddList { key, .. } if key == "network.pc_devices_dev.ports"))
             .count();
-        assert_eq!(n_ports, 3, "one add_list per bridge port");
+        assert_eq!(n_ports, 0, "feature disabled: no bridge port is rendered");
         assert!(has_set(
             &cmds,
             "network.pc_devices_dev.owner",
@@ -2120,55 +2136,67 @@ mod tests {
     }
 
     // --- device network: bridge_ports validation ---------------------------
+    //
+    // Wired LAN-port-joins-SSID is TEMPORARILY DISABLED (WIRED_BRIDGE_PORTS_ENABLED
+    // = false), so validation SKIPS bridge_ports entirely: any spec is accepted and
+    // its ports are ignored by the renderer (never bridged). The tests below assert
+    // that accepted-but-ignored behavior. When the const is flipped back to `true`,
+    // restore the reject assertions (see the commented `.is_err()` variants).
 
     #[test]
     fn validate_wireless_accepts_valid_lan_bridge_ports() {
+        // Still accepted (was: rendered as bridge members; now: ignored).
         let mut s = ssid_on("devices", false, 5);
         s.bridge_ports = vec!["lan1".into(), "lan2".into(), "lan3".into()];
         assert!(validate_wireless(&wstate(vec![s])).is_ok());
     }
 
     #[test]
-    fn validate_wireless_rejects_wan_bridge_port() {
+    fn validate_wireless_ignores_wan_bridge_port_when_disabled() {
+        // Feature OFF: a WAN netdev in bridge_ports is accepted-but-ignored (the
+        // renderer emits no `.ports`, so the gate is never bypassed). When the
+        // feature is re-enabled this must again be `.is_err()`.
         for wan in ["wan", "wan6"] {
             let mut s = ssid_on("devices", false, 5);
             s.bridge_ports = vec![wan.into()];
             assert!(
-                validate_wireless(&wstate(vec![s])).is_err(),
-                "{wan} must be rejected as a bridge port (would bypass the gate)"
+                validate_wireless(&wstate(vec![s])).is_ok(),
+                "{wan}: bridge_ports ignored while feature disabled"
             );
         }
     }
 
     #[test]
-    fn validate_wireless_rejects_br_lan_bridge_port() {
+    fn validate_wireless_ignores_br_lan_bridge_port_when_disabled() {
+        // Feature OFF: accepted-but-ignored. Re-enable -> must be `.is_err()`.
         let mut s = ssid_on("devices", false, 5);
         s.bridge_ports = vec!["br-lan".into()];
-        assert!(validate_wireless(&wstate(vec![s])).is_err());
+        assert!(validate_wireless(&wstate(vec![s])).is_ok());
     }
 
     #[test]
-    fn validate_wireless_rejects_non_lan_bridge_port() {
-        // Bare "lan" is the br-lan interface, not a switch port; and arbitrary
-        // netdevs (eth0, wlan0, "lan1x") are rejected.
+    fn validate_wireless_ignores_non_lan_bridge_port_when_disabled() {
+        // Feature OFF: even malformed / non-LAN netdevs are accepted-but-ignored
+        // (nothing is rendered). Re-enable -> each of these must be `.is_err()`.
         for bad_port in ["lan", "eth0", "wlan0", "lan1x", "lanX", ""] {
             let mut s = ssid_on("devices", false, 5);
             s.bridge_ports = vec![bad_port.into()];
             assert!(
-                validate_wireless(&wstate(vec![s])).is_err(),
-                "'{bad_port}' must be rejected as a bridge port"
+                validate_wireless(&wstate(vec![s])).is_ok(),
+                "'{bad_port}': bridge_ports ignored while feature disabled"
             );
         }
     }
 
     #[test]
-    fn validate_wireless_rejects_bridge_port_claimed_twice() {
-        // The same LAN netdev cannot be a member of two SSID bridges.
+    fn validate_wireless_ignores_bridge_port_claimed_twice_when_disabled() {
+        // Feature OFF: the "one netdev, two bridges" collision can't happen because
+        // nothing is bridged; accepted-but-ignored. Re-enable -> must be `.is_err()`.
         let mut a = ssid_on("devices", false, 5);
         a.bridge_ports = vec!["lan1".into()];
         let mut b = ssid_on("kiosk", false, 6);
         b.bridge_ports = vec!["lan1".into()];
-        assert!(validate_wireless(&wstate(vec![a, b])).is_err());
+        assert!(validate_wireless(&wstate(vec![a, b])).is_ok());
     }
 
     #[test]
