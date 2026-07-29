@@ -4,6 +4,23 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.24.0] — 2026-07-29
+
+### Fixed
+- **DHCP-only apply path — a device reservation edit no longer bounces the radio.**
+  Any wireless change (including adding/editing a device static-IP reservation)
+  previously bumped the config_version and took the full re-render + `wifi reload
+  <radio>` path, dropping every SSID on that radio (fragile on mt76/RUT906; rapid
+  edits could collide mid-reload and wedge the radio). A new `ApplyPlan::DhcpOnly`
+  planner (`plan_apply_dhcp`) detects when the ONLY delta between the committed and
+  desired wireless spec is DHCP reservations — every SSID/radio/encryption/bridge/
+  subnet/pool field identical — and applies just the `dhcp.pc_<slug>_host*` sections
+  followed by `dnsmasq reload` (SIGHUP): no `wifi reload`, no PHY bounce, no SSID
+  drop. Any non-DHCP-only diff (subnet/pool/SSID change, dhcp-disabled SSID, no
+  prior commit) falls back to the full reload path (fail-safe). Priority:
+  NoChange > DhcpOnly > scoped(off) > FullReload; a DhcpOnly apply error falls
+  through to the full path (never half-applied).
+
 ## [0.23.0] — 2026-07-28
 
 ### Fixed
