@@ -4,6 +4,20 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.24.2] — 2026-07-29
+
+### Changed
+- **Temporarily disable wired LAN-port-joins-SSID (`bridge_ports`) behind a flag.**
+  The feature that bridges a physical LAN port onto an SSID's bridge assumes a DSA
+  switch (netdevs `lan1..lanN`); on a swconfig board like the RUT906 those netdevs
+  don't exist (LAN ports are switch ports on `eth0.1`), so a `bridge_ports` entry is
+  meaningless and can break the bridge. A new const `WIRED_BRIDGE_PORTS_ENABLED =
+  false` gates both the render (no `network.pc_<slug>_dev.ports` is emitted) and the
+  validation (a spec carrying `bridge_ports` is accepted-but-ignored, never an
+  error). Reversible: flip the const to `true` to restore. The proto field and all
+  code are retained. The control plane also stops sending `bridge_ports`
+  (defence-in-depth); this is the engine-side guard.
+
 ## [0.24.1] — 2026-07-29
 
 ### Fixed
