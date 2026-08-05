@@ -161,9 +161,10 @@ use axum::routing::any;
 use axum::Router;
 
 /// Convert a [`RedirectOutcome`] into an axum [`Response`]. Redirects set the
-/// `Location` header; errors return a fixed status with an empty body.
+/// `Location` header; errors return a fixed status with an empty body. EVERY
+/// response also carries `Connection: close` (see below).
 fn into_response(outcome: RedirectOutcome) -> Response {
-    match outcome {
+    let mut resp = match outcome {
         RedirectOutcome::Redirect { location } => {
             // The location was percent-encoded so this can't fail in practice;
             // staying total, an invalid header value degrades to 500, not panic.
@@ -179,7 +180,19 @@ fn into_response(outcome: RedirectOutcome) -> Response {
         RedirectOutcome::Error { status, .. } => {
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST).into_response()
         }
-    }
+    };
+    // Force a one-shot connection on every captive-probe response. An OS captive
+    // detector (esp. iOS's Captive Network Assistant / captive daemon) probes
+    // `http://captive.apple.com/...`; while un-authed it is DNAT-redirected here and
+    // gets this 302. With HTTP/1.1 keep-alive it would REUSE that same TCP connection
+    // for its next probe — whose conntrack tuple is still pinned (DNAT) to the portal —
+    // so even AFTER the grant lands the probe keeps landing on the portal, never sees
+    // the real "Success", and the captive sheet never dismisses (Android re-probes on a
+    // fresh socket, so it isn't stuck). `Connection: close` makes the client open a
+    // FRESH connection next time: a new conntrack tuple, re-evaluated post-grant as
+    // authed → RETURN (no DNAT) → reaches the real endpoint → the sheet dismisses.
+    resp.headers_mut().insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+    resp
 }
 
 /// The single catch-all handler. Method, path, query, headers, and body are
@@ -358,6 +371,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_response_closes_the_connection() {
+        // Captive probes must not keep-alive + reuse the DNAT'd connection across a
+        // grant — otherwise the probe stays pinned to the portal and the captive sheet
+        // never dismisses (the iOS "connect → popup won't close" bug). Both the redirect
+        // and the error responses must carry Connection: close.
+        let redirect = into_response(RedirectOutcome::Redirect { location: "https://p/portal?x=1".into() });
+        assert_eq!(redirect.status(), StatusCode::FOUND);
+        assert_eq!(redirect.headers().get(header::CONNECTION).expect("Connection header"), "close");
+
+        let err = into_response(RedirectOutcome::Error { status: 404, reason: "unknown client" });
+        assert_eq!(err.headers().get(header::CONNECTION).expect("Connection header"), "close");
     }
 
     #[test]
