@@ -201,19 +201,26 @@ impl SessionManager {
         self.reaper.lock().expect("reaper mutex poisoned").clone()
     }
 
-    /// Reap the established conntrack flows for `ip` (invariant #9). Called after
-    /// `del_auth` on every de-auth path. Fail-closed: a reap error is logged +
-    /// metered and swallowed — it never aborts the revoke or unblocks the gate.
-    async fn reap_flows(&self, ip: std::net::IpAddr) {
+    /// Reap the established conntrack flows for `ip`. On de-auth (invariant #9,
+    /// `reason="deauth"`) this stops an already-established flow sailing through the
+    /// `ct established,related accept` fast-path after the MAC leaves `@auth`. On a
+    /// FRESH grant (`reason="grant"`) it clears the flows the client opened while it was
+    /// still walled — its OS captive-detection probes (e.g. iOS `captive.apple.com`)
+    /// were DNAT-redirected to the `:8080` responder and PINNED in conntrack; those
+    /// pinned flows outlive the grant, so the client's captive daemon keeps seeing the
+    /// portal (or a black-holed connection) instead of the real endpoint and its captive
+    /// sheet never dismisses. Fail-closed either way: a reap error is logged + metered
+    /// and swallowed — it never aborts the revoke/grant or unblocks the gate.
+    async fn reap_flows(&self, ip: std::net::IpAddr, reason: &'static str) {
         match self.reaper().reap_by_ip(ip).await {
             Ok(n) => {
                 if n > 0 {
                     self.metrics().incr(Metric::FlowsReaped);
-                    tracing::debug!(%ip, reaped = n, "reaped conntrack flows on de-auth");
+                    tracing::debug!(%ip, reaped = n, reason, "reaped conntrack flows");
                 }
             }
             Err(e) => {
-                tracing::warn!(%ip, error = %e, "conntrack reap failed; gate still holds (fail-closed)");
+                tracing::warn!(%ip, error = %e, reason, "conntrack reap failed; gate still holds (fail-closed)");
                 self.metrics().incr(Metric::ReapFailed);
             }
         }
@@ -299,8 +306,9 @@ impl SessionManager {
     pub async fn grant_at(&self, params: GrantParams, now: Instant) -> Result<SessionId> {
         // Reject past the RAM cap before touching the kernel. Re-granting an
         // existing MAC is allowed (it refreshes the element) and does not count
-        // against the cap.
-        {
+        // against the cap. `is_new` (MAC not already tracked) drives the conntrack
+        // reap below: a fresh grant / grant-after-revoke, not an idempotent refresh.
+        let is_new = {
             let map = self.sessions.lock().expect("sessions mutex poisoned");
             if !map.contains_key(&params.mac) && map.len() >= MAX_SESSIONS {
                 tracing::warn!(
@@ -312,10 +320,26 @@ impl SessionManager {
                     "session cap {MAX_SESSIONS} reached"
                 )));
             }
-        }
+            !map.contains_key(&params.mac)
+        };
 
         // Kernel mutation first — fail closed on error.
         self.writer.add_auth(params.mac, params.ttl).await?;
+
+        // On a FRESH grant, reap the flows the client opened while it was still walled.
+        // Its captive-detection probes (iOS `captive.apple.com`, Android generate_204)
+        // were DNAT-redirected to the `:8080` responder and pinned in conntrack; those
+        // pinned entries survive the grant, so the client's OS captive daemon keeps
+        // hitting the portal (or a black-holed connection) on the old tuple and never
+        // sees the real endpoint → the captive sheet never dismisses. Clearing them here
+        // forces the next probe onto a fresh tuple that is re-evaluated as authed. Only
+        // on `is_new` — an idempotent re-grant of an already-authed MAC has no stale DNAT
+        // to clear, and reaping would needlessly reset a live session's flows.
+        if is_new {
+            if let Some(ip) = params.ip {
+                self.reap_flows(ip, "grant").await;
+            }
+        }
 
         let session_id = params.session_id.clone();
         let session = Session {
@@ -383,7 +407,7 @@ impl SessionManager {
         // Invariant #9: gating the MAC only stops *new* connections — sever the
         // client's already-established flows so a revoked client actually drops.
         if let Some(ip) = session.ip {
-            self.reap_flows(ip).await;
+            self.reap_flows(ip, "deauth").await;
         }
         // G5: drop the client's bandwidth cap.
         self.unshape(mac).await;
@@ -431,7 +455,7 @@ impl SessionManager {
             // Invariant #9: sever any established flow so an expired client's
             // long-lived sockets stop, not just its new connections.
             if let Some(ip) = session.ip {
-                self.reap_flows(ip).await;
+                self.reap_flows(ip, "deauth").await;
             }
             // G5: drop the client's bandwidth cap.
             self.unshape(session.mac).await;
@@ -857,6 +881,11 @@ mod tests {
         fn ips(&self) -> Vec<std::net::IpAddr> {
             self.reaped.lock().unwrap().clone()
         }
+        /// Forget recorded reaps — used to isolate the de-auth reap from the
+        /// reap-on-grant that now fires when a fresh grant carries a client IP.
+        fn reset(&self) {
+            self.reaped.lock().unwrap().clear();
+        }
     }
     #[async_trait]
     impl FlowReaper for RecordingReaper {
@@ -937,6 +966,7 @@ mod tests {
         m.set_reaper(reaper.clone());
         let now = Instant::now();
         m.grant_at(grant_params_ip(mac(5), "10.0.0.5", 60), now).await.unwrap();
+        reaper.reset(); // discard the reap-on-grant so we assert only the de-auth reap
 
         m.revoke(mac(5), RevokeReason::Admin).await.unwrap();
         // Invariant #9: del_auth happened AND the client's IP was reaped.
@@ -975,8 +1005,45 @@ mod tests {
         m.set_reaper(reaper.clone());
         let now = Instant::now();
         m.grant_at(grant_params_ip(mac(8), "10.0.0.8", 10), now).await.unwrap();
+        reaper.reset(); // discard the reap-on-grant so we assert only the expiry reap
         m.tick_expiry(now + Duration::from_secs(10)).await;
         assert_eq!(reaper.ips(), vec!["10.0.0.8".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn fresh_grant_reaps_stale_flows() {
+        // A fresh grant carrying a client IP reaps the flows the client opened while
+        // walled (its captive-detection probes DNAT-pinned to the :8080 responder), so
+        // the OS captive daemon's next probe lands on a fresh, authed tuple.
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        m.grant_at(grant_params_ip(mac(9), "10.0.0.9", 60), Instant::now()).await.unwrap();
+        assert_eq!(reaper.ips(), vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn idempotent_regrant_does_not_reap() {
+        // Re-granting an already-authed MAC (TTL refresh) must NOT reap: there is no
+        // stale DNAT to clear, and reaping would reset a live session's flows.
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        let now = Instant::now();
+        m.grant_at(grant_params_ip(mac(10), "10.0.0.10", 60), now).await.unwrap();
+        reaper.reset();
+        m.grant_at(grant_params_ip(mac(10), "10.0.0.10", 60), now).await.unwrap();
+        assert!(reaper.ips().is_empty(), "idempotent re-grant must not reap");
+    }
+
+    #[tokio::test]
+    async fn grant_without_ip_does_not_reap() {
+        // No client IP resolved → nothing to reap on grant.
+        let (m, _writer, _sink) = mgr();
+        let reaper = Arc::new(RecordingReaper::default());
+        m.set_reaper(reaper.clone());
+        m.grant_at(grant_params(mac(11), 60, 0), Instant::now()).await.unwrap();
+        assert!(reaper.ips().is_empty(), "grant without a client IP has nothing to reap");
     }
 
     #[derive(Default)]
