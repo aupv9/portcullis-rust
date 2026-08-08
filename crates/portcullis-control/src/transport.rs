@@ -147,19 +147,29 @@ pub fn client_tls_config(
 /// connected [`Channel`] ready to build an `EnforcementClient` on.
 ///
 /// HTTP/2 keepalive is enabled with `keepalive` and kept alive while idle so the
-/// carrier CGNAT mapping for this outbound connection stays fresh; without it a
-/// silent idle timeout would drop the control channel with no local signal.
+/// carrier CGNAT mapping for this outbound connection stays fresh.
+///
+/// `keepalive_timeout` is the crucial half: it bounds how long we wait for a
+/// keepalive PING ack before declaring the connection dead and tearing it down.
+/// Without it a WAN/NAT rebind can leave a **zombie half-open stream** — the PING
+/// is sent into a black hole, never acked, yet the connection is never closed, so
+/// the control loop blocks forever with no local signal and never reconnects
+/// (root cause of the site-.22 57-minute outage). We also enable OS-level
+/// `tcp_keepalive` as a second line of defence.
 pub async fn connect(
     endpoint: &str,
     tls: ClientTlsConfig,
     keepalive: Duration,
+    keepalive_timeout: Duration,
 ) -> Result<Channel> {
     let ep = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| Error::Config(format!("invalid control_endpoint '{endpoint}': {e}")))?
         .tls_config(tls)
         .map_err(|e| Error::Config(format!("invalid client TLS config: {e}")))?
         .http2_keep_alive_interval(keepalive)
+        .keep_alive_timeout(keepalive_timeout)
         .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(keepalive))
         .connect_timeout(Duration::from_secs(10));
 
     ep.connect()
@@ -218,7 +228,9 @@ mod tests {
     #[tokio::test]
     async fn connect_rejects_malformed_endpoint() {
         let tls = client_tls_config(b"c", b"k", b"ca", "cp").unwrap();
-        let err = connect("not a url", tls, Duration::from_secs(20)).await.unwrap_err();
+        let err = connect("not a url", tls, Duration::from_secs(20), Duration::from_secs(20))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }
 }
