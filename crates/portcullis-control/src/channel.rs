@@ -57,8 +57,20 @@ pub struct ControlChannelConfig {
     pub store_id: String,
     /// HTTP/2 keepalive interval, kept below the CGNAT idle timeout.
     pub keepalive: Duration,
+    /// HTTP/2 keepalive PING-ack timeout. Bounds how long a silently-dead outbound
+    /// path (WAN/NAT rebind) can look "connected" before the transport tears it down
+    /// so the reconnect loop can re-dial — instead of blocking forever on a zombie
+    /// half-open stream (site-.22 root cause). See [`transport::connect`].
+    pub keepalive_timeout: Duration,
     /// Cap on the reconnect backoff.
     pub reconnect_max: Duration,
+    /// Inbound-idle watchdog: reconnect if NO frame arrives from the control plane
+    /// within this window (belt-and-suspenders for a zombie stream the transport
+    /// keepalive doesn't catch — e.g. h2 alive but the CP dropped the Attach stream).
+    /// `Duration::ZERO` disables it — the safe default until the CP sends periodic
+    /// Attach pings, since otherwise a healthy-but-quiet link would reconnect each
+    /// idle window. Set to ~3× the CP ping interval once that ships.
+    pub inbound_idle: Duration,
     /// CP-managed wireless subsystem (P-W1). `set_wireless_config` /
     /// `confirm_wireless` / `get_wireless_config` frames are dispatched here; its
     /// upward `WirelessStatus` stream (see [`run`]'s `wireless_status`) is fanned
@@ -184,7 +196,8 @@ async fn connect_once<F>(
 where
     F: Fn(bool) + Send + Sync,
 {
-    let channel = transport::connect(&cfg.endpoint, cfg.tls.clone(), cfg.keepalive).await?;
+    let channel =
+        transport::connect(&cfg.endpoint, cfg.tls.clone(), cfg.keepalive, cfg.keepalive_timeout).await?;
     let mut client = EnforcementClient::new(channel);
 
     let (mut out_tx, out_rx) = futures::channel::mpsc::channel::<pb::EngineFrame>(OUTBOUND_BUFFER);
@@ -207,18 +220,41 @@ where
     cp_state(true);
     tracing::info!(store = %cfg.store_id, "control channel established");
 
+    // Inbound-idle watchdog (belt-and-suspenders): if the CP goes silent past
+    // `inbound_idle` we treat the stream as dead and reconnect, even when the
+    // transport never surfaced an error (a zombie half-open stream). Reset on every
+    // inbound frame. ZERO disables it (until the CP sends periodic Attach pings).
+    let idle = cfg.inbound_idle;
+    let idle_on = !idle.is_zero();
+    let idle_sleep = tokio::time::sleep(if idle_on { idle } else { Duration::from_secs(86_400) });
+    tokio::pin!(idle_sleep);
+
     loop {
         tokio::select! {
-            msg = inbound.message() => match msg {
-                Ok(Some(ctrl)) => {
-                    for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner, &cfg.engine_control, &cfg.deauth).await {
-                        if out_tx.send(out).await.is_err() {
-                            return Ok(()); // outbound half gone; reconnect
+            msg = inbound.message() => {
+                // Any inbound frame proves the CP->engine path is live: reset the watchdog.
+                if idle_on {
+                    idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle);
+                }
+                match msg {
+                    Ok(Some(ctrl)) => {
+                        for out in handle_control_frame(ctrl, enforcer, &cfg.provisioner, &cfg.engine_control, &cfg.deauth).await {
+                            if out_tx.send(out).await.is_err() {
+                                return Ok(()); // outbound half gone; reconnect
+                            }
                         }
                     }
+                    Ok(None) => return Ok(()), // peer closed the stream cleanly
+                    Err(status) => return Err(conn_err(format!("inbound stream: {status}"))),
                 }
-                Ok(None) => return Ok(()), // peer closed the stream cleanly
-                Err(status) => return Err(conn_err(format!("inbound stream: {status}"))),
+            },
+            // Watchdog: no inbound frame within `inbound_idle` => reconnect. Disabled
+            // (guard false) when `inbound_idle` is ZERO.
+            _ = &mut idle_sleep, if idle_on => {
+                return Err(conn_err(format!(
+                    "inbound idle: no control frame from CP in {}s (suspected zombie half-open stream); reconnecting",
+                    idle.as_secs()
+                )));
             },
             ev = rx.recv() => match ev {
                 Ok(e) => {
