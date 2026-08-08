@@ -58,6 +58,22 @@ pub struct Config {
     #[serde(default = "default_keepalive_secs")]
     pub control_keepalive_secs: u64,
 
+    /// HTTP/2 keepalive PING-ack timeout (seconds). If a keepalive PING is not
+    /// acked within this window the connection is torn down and reconnected — this
+    /// turns a silently-dead outbound path (WAN/NAT rebind) into a fast reconnect
+    /// instead of a zombie half-open stream that never recovers (site-.22 root
+    /// cause). Keep < the CGNAT idle timeout. Default on.
+    #[serde(default = "default_keepalive_timeout_secs")]
+    pub control_keepalive_timeout_secs: u64,
+
+    /// Inbound-idle watchdog (seconds): reconnect the control channel if NO frame
+    /// arrives from the control plane within this window. 0 = disabled (default).
+    /// SAFE ONLY once the control plane sends periodic keepalive pings on the Attach
+    /// stream — otherwise a healthy-but-quiet link reconnects every idle window. Set
+    /// to ~3× the CP ping interval after that ships.
+    #[serde(default = "default_inbound_idle_secs")]
+    pub control_inbound_idle_secs: u64,
+
     /// Radios the CP-managed wireless subsystem must NOT place owned SSIDs on
     /// (typically the admin/management radio). A push naming any of these is
     /// rejected up front, so `wifi reload <radio>` — which rebuilds the WHOLE radio
@@ -195,6 +211,14 @@ fn default_keepalive_secs() -> u64 {
     20
 }
 
+fn default_keepalive_timeout_secs() -> u64 {
+    20
+}
+
+fn default_inbound_idle_secs() -> u64 {
+    0
+}
+
 fn default_liveness_poll_secs() -> u64 {
     300
 }
@@ -209,6 +233,8 @@ impl Default for Config {
             cp_server_name: String::new(),
             control_reconnect_max_secs: default_reconnect_max_secs(),
             control_keepalive_secs: default_keepalive_secs(),
+            control_keepalive_timeout_secs: default_keepalive_timeout_secs(),
+            control_inbound_idle_secs: default_inbound_idle_secs(),
             wireless_protected_radios: Vec::new(),
             liveness_poll_secs: default_liveness_poll_secs(),
             hmac_key_file: "/etc/portcullis/hmac.key".to_string(),
@@ -437,6 +463,8 @@ fn apply_option(cfg: &mut Config, key: &str, val: &str, lineno: usize) -> Result
         "cp_server_name" => cfg.cp_server_name = val.to_string(),
         "control_reconnect_max_secs" => cfg.control_reconnect_max_secs = parse_u64(val)?,
         "control_keepalive_secs" => cfg.control_keepalive_secs = parse_u64(val)?,
+        "control_keepalive_timeout_secs" => cfg.control_keepalive_timeout_secs = parse_u64(val)?,
+        "control_inbound_idle_secs" => cfg.control_inbound_idle_secs = parse_u64(val)?,
         "liveness_poll_secs" => cfg.liveness_poll_secs = parse_u64(val)?,
         "hmac_key_file" => cfg.hmac_key_file = val.to_string(),
         "responder_port" => cfg.responder_port = parse_u16(val)?,
@@ -658,12 +686,26 @@ config portcullis 'main'
             option cp_server_ca_file '/etc/portcullis/tls/cp-ca.crt'\n\
             option cp_server_name 'cp.wifihub.internal'\n\
             option control_reconnect_max_secs '30'\n\
-            option control_keepalive_secs '10'\n";
+            option control_keepalive_secs '10'\n\
+            option control_keepalive_timeout_secs '15'\n\
+            option control_inbound_idle_secs '90'\n";
         let cfg = Config::from_uci_str(uci).unwrap();
         assert_eq!(cfg.cp_server_ca_file, "/etc/portcullis/tls/cp-ca.crt");
         assert_eq!(cfg.cp_server_name, "cp.wifihub.internal");
         assert_eq!(cfg.control_reconnect_max_secs, 30);
         assert_eq!(cfg.control_keepalive_secs, 10);
+        assert_eq!(cfg.control_keepalive_timeout_secs, 15);
+        assert_eq!(cfg.control_inbound_idle_secs, 90);
+    }
+
+    #[test]
+    fn control_keepalive_timeout_defaults_on_inbound_idle_defaults_off() {
+        // Absent from UCI => keepalive-timeout defaults ON (fixes dead-TCP zombie
+        // fleet-wide), while the inbound-idle watchdog defaults OFF (0) until the CP
+        // sends periodic Attach pings.
+        let cfg = Config::from_uci_str("config portcullis 'main'\n").unwrap();
+        assert_eq!(cfg.control_keepalive_timeout_secs, 20);
+        assert_eq!(cfg.control_inbound_idle_secs, 0);
     }
 
     #[test]
@@ -683,6 +725,8 @@ config portcullis 'main'
             cp_server_name: String::new(),
             control_reconnect_max_secs: 60,
             control_keepalive_secs: 20,
+            control_keepalive_timeout_secs: 20,
+            control_inbound_idle_secs: 0,
             // non-default so the roundtrip actually exercises the field.
             wireless_protected_radios: vec!["radio0".to_string()],
             // non-default so the roundtrip actually exercises the field.
