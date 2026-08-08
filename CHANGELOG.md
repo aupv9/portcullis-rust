@@ -4,6 +4,33 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.25.0] — 2026-08-08
+
+> Cut from **0.24.2** (the deployed fleet baseline) to canary the control-channel
+> fix in isolation — this release does **NOT** include 0.24.3 (redirect
+> `Connection: close`) or 0.24.4 (reap client conntrack on grant). Rebase/fold
+> those in before any production rollout.
+
+### Fixed
+- **Detect a dead control channel and reconnect instead of sitting on a zombie
+  half-open stream.** After a WAN/NAT rebind the outbound gRPC control stream can go
+  silently dead — the HTTP/2 keepalive PING was being sent (`keep_alive_while_idle`)
+  but no ack timeout was configured, so a black-holed connection was never torn down
+  and the engine blocked in `inbound.message()` forever without reconnecting (a site
+  ran ~57 min with the control plane unable to reach it, so new clients on the gated
+  SSID could not be granted). `transport::connect` now sets `keep_alive_timeout`
+  (plus OS-level `tcp_keepalive`): an unacked keepalive PING tears the connection
+  down and the reconnect loop re-dials within seconds.
+
+### Added
+- **Inbound-idle watchdog on the control channel** (`control_inbound_idle_secs`,
+  default `0` = disabled): reconnect if NO frame arrives from the control plane
+  within the window. Belt-and-suspenders for a zombie the transport keepalive can't
+  catch. Safe only once the control plane sends periodic Attach pings — enable it
+  (≈3× the ping interval) after that ships.
+- Config knobs `control_keepalive_timeout_secs` (default `20`, on) and
+  `control_inbound_idle_secs` (default `0`, off).
+
 ## [0.24.2] — 2026-07-29
 
 ### Changed
