@@ -311,7 +311,10 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
                 tls,
                 store_id: cfg.store_id.clone(),
                 keepalive: Duration::from_secs(cfg.control_keepalive_secs.max(1)),
+                keepalive_timeout: Duration::from_secs(cfg.control_keepalive_timeout_secs.max(1)),
                 reconnect_max: Duration::from_secs(cfg.control_reconnect_max_secs.max(1)),
+                // 0 => Duration::ZERO => watchdog disabled (safe until the CP pings).
+                inbound_idle: Duration::from_secs(cfg.control_inbound_idle_secs),
                 provisioner: provisioner.clone(),
                 // P-W1: lets the channel re-scope enforcement to the committed
                 // wireless config's gated-SSID ifaces (never flushes the auth set).
