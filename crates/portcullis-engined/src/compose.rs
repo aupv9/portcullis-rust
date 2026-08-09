@@ -276,11 +276,9 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
         tokio::sync::mpsc::channel(portcullis_provision::SITE_TELEMETRY_BUFFER);
     {
         let runner = Arc::new(portcullis_provision::ProcessRunner);
-        let prov = provisioner.clone();
         tasks.push(tokio::spawn(async move {
             portcullis_provision::run_site_telemetry_poller(
                 runner,
-                prov,
                 site_telemetry_tx,
                 portcullis_provision::DEFAULT_SITE_TELEMETRY_INTERVAL,
             )

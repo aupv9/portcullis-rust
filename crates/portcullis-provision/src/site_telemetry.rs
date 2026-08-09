@@ -22,11 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portcullis_types::{
-    Provisioner, SiteClient, SiteSsid, SiteTelemetryReport, SiteUplink, SiteUplinkSim,
+    SiteClient, SiteSsid, SiteTelemetryReport, SiteUplink, SiteUplinkSim,
 };
 use tokio::sync::mpsc;
 
-use crate::liveness::slug_vifs;
 use crate::runner::CommandRunner;
 
 /// Default site-telemetry cadence (~60 s). A slow site gauge; the shell-outs are
@@ -45,7 +44,6 @@ const PING_TARGET: &str = "8.8.8.8";
 /// [`SiteTelemetryReport`] and pushing it up `tx` (dropped if the consumer is behind).
 pub async fn run_site_telemetry_poller<R: CommandRunner>(
     runner: Arc<R>,
-    provisioner: Arc<dyn Provisioner>,
     tx: mpsc::Sender<SiteTelemetryReport>,
     interval: Duration,
 ) {
@@ -53,7 +51,7 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        let report = poll_once(runner.as_ref(), provisioner.as_ref()).await;
+        let report = poll_once(runner.as_ref()).await;
         match tx.try_send(report) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -67,42 +65,36 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     }
 }
 
-/// One site-telemetry sweep. Enumerates owned SSIDs from the committed
-/// desired-state, probes each (on-air / clients / egress / gate), and gathers
-/// uplink state. Never fails — an error anywhere yields a thinner snapshot.
-pub async fn poll_once<R: CommandRunner>(
-    runner: &R,
-    provisioner: &dyn Provisioner,
-) -> SiteTelemetryReport {
+/// One site-telemetry sweep. Enumerates SSIDs from LIVE UCI (every wifi-iface
+/// bound to a `br-ss*` bridge), probes each (on-air / clients / egress / gate),
+/// and gathers uplink state. Never fails — an error anywhere yields a thinner
+/// snapshot.
+///
+/// Enumeration is LIVE (not the engine's committed desired-state): after a
+/// restart the committed state is rehydrated version-only with EMPTY ssids
+/// (`handle.rs`) until the CP re-pushes, so `get_wireless()` would report 0 SSIDs
+/// even while they are broadcasting. Reading live UCI mirrors `net-report.sh` and
+/// reflects what is actually on-air.
+pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
     let ts_unix = unix_now();
     let router_uptime_secs = parse_uptime(&run_text(runner, "cat", &["/proc/uptime"]).await);
 
-    let desired = provisioner.get_wireless().await.ok();
-    let specs = desired.as_ref().map(|d| d.ssids.as_slice()).unwrap_or(&[]);
+    // LIVE SSID set: wifi-iface sections whose network binds to a br-ss* bridge.
+    let wireless = run_text(runner, "uci", &["-q", "show", "wireless"]).await;
+    let network = run_text(runner, "uci", &["-q", "show", "network"]).await;
+    let bridges = parse_wireless_bridges(&wireless, &network);
 
-    // slug -> VIF(s) (one `ubus network.wireless status`), FORWARD counters + gated
-    // set (one `iptables -nvxL FORWARD`), DHCP leases (one read), gate liveness.
-    let status_json = run_text(runner, "ubus", &["call", "network.wireless", "status"]).await;
-    let vif_of = slug_vifs(&status_json);
-    let (fwd, gated_ifaces) = parse_forward_counters(
-        &run_text(runner, "iptables", &["-nvxL", "FORWARD"]).await,
-    );
+    // FORWARD counters + gated set (one `iptables -nvxL FORWARD`), DHCP leases, gate.
+    let (fwd, gated_ifaces) =
+        parse_forward_counters(&run_text(runner, "iptables", &["-nvxL", "FORWARD"]).await);
     let auth_present = runner.run("ipset", &["list", "wifihub_auth"]).await.is_ok();
     let leases = parse_leases(&run_text(runner, "cat", &["/tmp/dhcp.leases"]).await);
 
     let mut ssids: Vec<SiteSsid> = Vec::new();
     let mut clients: Vec<SiteClient> = Vec::new();
 
-    for spec in specs {
-        let ifname = spec.bridge_name.trim().to_string();
-        if ifname.is_empty() {
-            continue;
-        }
-        let vifs: Vec<&str> = vif_of
-            .iter()
-            .filter(|(slug, _)| slug == &spec.slug)
-            .map(|(_, vif)| vif.as_str())
-            .collect();
+    for (ifname, name) in bridges {
+        let vifs = list_bridge_vifs(runner, &ifname).await;
 
         // on_air = at least one VIF operationally up. channel from the first VIF.
         let mut on_air = false;
@@ -138,13 +130,13 @@ pub async fn poll_once<R: CommandRunner>(
         }
 
         let (fwd_pkts, fwd_bytes) = fwd.get(&ifname).copied().unwrap_or((0, 0));
-        let gate_enforced = gated_ifaces.contains(&ifname) && auth_present;
+        let gated = gated_ifaces.contains(&ifname); // has a FORWARD -> wifihub_fwd jump
         ssids.push(SiteSsid {
             ifname,
-            name: spec.ssid.clone(),
+            name,
             on_air,
-            gated: spec.gated,
-            gate_enforced,
+            gated,
+            gate_enforced: gated && auth_present,
             client_count,
             channel,
             fwd_pkts,
@@ -155,6 +147,17 @@ pub async fn poll_once<R: CommandRunner>(
     let uplink = gather_uplink(runner).await;
 
     SiteTelemetryReport { ts_unix, router_uptime_secs, ssids, clients, uplink }
+}
+
+/// List a bridge's wireless VIF members from `/sys/class/net/<bridge>/brif`.
+async fn list_bridge_vifs<R: CommandRunner>(runner: &R, bridge: &str) -> Vec<String> {
+    let path = format!("/sys/class/net/{bridge}/brif");
+    run_text(runner, "ls", &["-1", &path])
+        .await
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| l.starts_with("wlan"))
+        .collect()
 }
 
 /// Gather site uplink state: active WAN vs SIM, Internet reachability (+latency/
@@ -380,6 +383,49 @@ pub fn parse_uptime(text: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Parse `uci show wireless` + `uci show network` into (bridge, ssid) for every
+/// wifi-iface bound to a `br-ss*` bridge, deduped by bridge (first ssid wins),
+/// sorted by bridge. LIVE enumeration — mirrors net-report.sh; independent of the
+/// engine's committed desired-state (empty after a restart).
+pub fn parse_wireless_bridges(wireless: &str, network: &str) -> Vec<(String, String)> {
+    // network.<net>.device='br-ssX'
+    let mut dev_of: BTreeMap<String, String> = BTreeMap::new();
+    for line in network.lines() {
+        if let Some(rest) = line.strip_prefix("network.") {
+            if let Some((sect, val)) = rest.split_once(".device=") {
+                dev_of.insert(sect.to_string(), unquote(val));
+            }
+        }
+    }
+    // wifi-iface: ssid + network per section.
+    let mut ssid_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut net_of: BTreeMap<String, String> = BTreeMap::new();
+    for line in wireless.lines() {
+        let Some(rest) = line.strip_prefix("wireless.") else { continue };
+        if let Some((sect, val)) = rest.split_once(".ssid=") {
+            ssid_of.insert(sect.to_string(), unquote(val));
+        } else if let Some((sect, val)) = rest.split_once(".network=") {
+            net_of.insert(sect.to_string(), unquote(val));
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for (sect, ssid) in &ssid_of {
+        let Some(net) = net_of.get(sect) else { continue };
+        let Some(dev) = dev_of.get(net) else { continue };
+        if dev.starts_with("br-ss") && seen.insert(dev.clone()) {
+            out.push((dev.clone(), ssid.clone()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Strip surrounding single/double quotes from a `uci show` value.
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches('\'').trim_matches('"').to_string()
+}
+
 /// Parse `ubus call gsm.modem0 info` JSON -> SIM signal, or None (no modem / empty).
 pub fn parse_gsm(json: &str) -> Option<SiteUplinkSim> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -479,5 +525,38 @@ Chain FORWARD (policy DROP 0 packets, 0 bytes)
         assert_eq!(l.len(), 2);
         assert_eq!(parse_uptime("42938.37 166407.14"), 42938);
         assert_eq!(parse_channel("\tssid Foo\n\tchannel 36 (5180 MHz)"), 36);
+    }
+
+    #[test]
+    fn wireless_bridges_enumerates_br_ss_deduped_sorted() {
+        let wireless = "\
+wireless.default_radio0=wifi-iface
+wireless.default_radio0.ssid='RUT_325A_2G'
+wireless.default_radio0.network='lan'
+wireless.pc_win_free_ap0=wifi-iface
+wireless.pc_win_free_ap0.ssid='pilot-devWIN+FREE'
+wireless.pc_win_free_ap0.network='pc_win_free_if'
+wireless.pc_win_ap0=wifi-iface
+wireless.pc_win_ap0.ssid='pilot-dev Thiet Bi'
+wireless.pc_win_ap0.network='pc_win_if'
+wireless.pc_win_ap1=wifi-iface
+wireless.pc_win_ap1.ssid='pilot-dev Thiet Bi'
+wireless.pc_win_ap1.network='pc_win_if'";
+        let network = "\
+network.lan=interface
+network.lan.device='br-lan'
+network.pc_win_free_if=interface
+network.pc_win_free_if.device='br-ss1'
+network.pc_win_if=interface
+network.pc_win_if.device='br-ss2'";
+        let b = parse_wireless_bridges(wireless, network);
+        // br-lan excluded; br-ss2 deduped (dual-band ap0/ap1); sorted by bridge.
+        assert_eq!(
+            b,
+            vec![
+                ("br-ss1".to_string(), "pilot-devWIN+FREE".to_string()),
+                ("br-ss2".to_string(), "pilot-dev Thiet Bi".to_string()),
+            ]
+        );
     }
 }

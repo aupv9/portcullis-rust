@@ -4,6 +4,20 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.27.0] — 2026-08-09
+
+### Fixed
+- **Site-telemetry poller enumerates LIVE SSIDs, not committed desired-state.**
+  v0.26.0 enumerated SSIDs from `provisioner.get_wireless()`, but after any engine
+  restart the committed wireless state is rehydrated version-only with EMPTY `ssids`
+  (until the CP re-pushes) — so the poller reported 0 SSIDs even while they were
+  broadcasting ("SSID phát nhưng dashboard = 0"). The poller now reads live UCI
+  (`uci show wireless`/`network` → every wifi-iface bound to a `br-ss*` bridge,
+  VIFs from `/sys/class/net/<bridge>/brif`), mirroring `net-report.sh` — it reflects
+  what is actually on-air. Drops the provisioner dependency; adds the
+  `parse_wireless_bridges` pure parser (host-tested). `gated` now derives from the
+  live FORWARD → `wifihub_fwd` jump rather than the committed spec.
+
 ## [0.26.0] — 2026-08-09
 
 ### Added
