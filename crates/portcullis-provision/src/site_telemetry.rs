@@ -50,9 +50,12 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
 ) {
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Byte accounting is cumulative across ticks (conntrack is per-live-flow, not a
+    // monotonic counter), so the accumulator lives with the poller, not per-sweep.
+    let mut acc = FlowByteAccumulator::new();
     loop {
         tick.tick().await;
-        let mut report = poll_once(runner.as_ref()).await;
+        let mut report = poll_once(runner.as_ref(), &mut acc).await;
         report.control = health.snapshot();
         match tx.try_send(report) {
             Ok(()) => {}
@@ -77,7 +80,10 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
 /// (`handle.rs`) until the CP re-pushes, so `get_wireless()` would report 0 SSIDs
 /// even while they are broadcasting. Reading live UCI mirrors `net-report.sh` and
 /// reflects what is actually on-air.
-pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
+pub async fn poll_once<R: CommandRunner>(
+    runner: &R,
+    acc: &mut FlowByteAccumulator,
+) -> SiteTelemetryReport {
     let ts_unix = unix_now();
     let router_uptime_secs = parse_uptime(&run_text(runner, "cat", &["/proc/uptime"]).await);
 
@@ -91,6 +97,15 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
         parse_forward_counters(&run_text(runner, "iptables", &["-nvxL", "FORWARD"]).await);
     let auth_present = runner.run("ipset", &["list", "wifihub_auth"]).await.is_ok();
     let leases = parse_leases(&run_text(runner, "cat", &["/tmp/dhcp.leases"]).await);
+
+    // Byte accounting from conntrack. The bridge `/sys` and `iw station dump` byte
+    // counters MISS hardware-offloaded traffic on MT7621 (flow_offloading_hw) — the
+    // offloaded bulk (mostly download) is switched in the PPE and never touches those
+    // netdev/xtables counters, so they read backwards (upload > download). conntrack
+    // reflects offloaded bytes; `acc` folds each flow's increment into a monotonic
+    // per-client-IP cumulative, and `subnets` attributes IPs to their SSID bridge.
+    acc.ingest(&parse_conntrack(&run_text(runner, "cat", &["/proc/net/nf_conntrack"]).await));
+    let subnets = parse_bridge_subnets(&network);
 
     let mut ssids: Vec<SiteSsid> = Vec::new();
     let mut clients: Vec<SiteClient> = Vec::new();
@@ -117,6 +132,10 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
             for st in parse_station_dump(&run_text(runner, "iw", &["dev", vif, "station", "dump"]).await) {
                 client_count += 1;
                 let (ip, hostname) = leases.get(&st.mac).cloned().unwrap_or_default();
+                // Bytes from conntrack (offload-aware), keyed by the leased IP —
+                // station-dump byte counters miss HW-offloaded traffic. Preserve the
+                // field meaning: rx_bytes = upload (client→net), tx_bytes = download.
+                let (upload, download) = acc.client(&ip);
                 clients.push(SiteClient {
                     mac: st.mac,
                     ssid_ifname: ifname.clone(),
@@ -124,8 +143,8 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
                     signal_dbm: st.signal_dbm,
                     tx_rate_mbps: st.tx_rate_mbps,
                     rx_rate_mbps: st.rx_rate_mbps,
-                    rx_bytes: st.rx_bytes,
-                    tx_bytes: st.tx_bytes,
+                    rx_bytes: upload,
+                    tx_bytes: download,
                     connected_secs: st.connected_secs,
                     hostname,
                 });
@@ -133,10 +152,12 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
         }
 
         let (fwd_pkts, fwd_bytes) = fwd.get(&ifname).copied().unwrap_or((0, 0));
-        // Per-SSID directional bytes from the bridge's own counters (like net-report):
-        // rx = client->internet (upload), tx = internet->client (download).
-        let ul_bytes = read_u64(runner, &format!("/sys/class/net/{ifname}/statistics/rx_bytes")).await;
-        let dl_bytes = read_u64(runner, &format!("/sys/class/net/{ifname}/statistics/tx_bytes")).await;
+        // Per-SSID directional bytes = conntrack cumulative summed over this bridge's
+        // /24 (offload-aware). ul = client→internet (upload), dl = internet→client.
+        let (ul_bytes, dl_bytes) = match subnets.get(&ifname) {
+            Some(prefix) => acc.subnet_bytes(prefix),
+            None => (0, 0),
+        };
         let gated = gated_ifaces.contains(&ifname); // has a FORWARD -> wifihub_fwd jump
         ssids.push(SiteSsid {
             ifname,
@@ -313,11 +334,6 @@ pub fn parse_leases(text: &str) -> BTreeMap<String, (String, String)> {
     out
 }
 
-/// Read a single u64 from a `/sys` file (e.g. bridge byte counter). 0 on any error.
-async fn read_u64<R: CommandRunner>(runner: &R, path: &str) -> u64 {
-    run_text(runner, "cat", &[path]).await.trim().parse().unwrap_or(0)
-}
-
 /// Parse `mwan3 status` -> (wan_up, sim_up). Lines: "interface <name> is <state>".
 pub fn parse_mwan3(text: &str) -> (bool, bool) {
     let (mut wan_up, mut sim_up) = (false, false);
@@ -441,6 +457,194 @@ pub fn parse_wireless_bridges(wireless: &str, network: &str) -> Vec<(String, Str
 /// Strip surrounding single/double quotes from a `uci show` value.
 fn unquote(s: &str) -> String {
     s.trim().trim_matches('\'').trim_matches('"').to_string()
+}
+
+/// Parse `uci show network` -> (br-ss* device -> its /24 prefix, e.g. "10.21.0"),
+/// from each interface section's `device` + `ipaddr`. Used to attribute a conntrack
+/// client IP to the SSID bridge that owns its subnet.
+pub fn parse_bridge_subnets(network: &str) -> BTreeMap<String, String> {
+    let mut dev_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut ip_of: BTreeMap<String, String> = BTreeMap::new();
+    for line in network.lines() {
+        let Some(rest) = line.strip_prefix("network.") else { continue };
+        if let Some((sect, val)) = rest.split_once(".device=") {
+            dev_of.insert(sect.to_string(), unquote(val));
+        } else if let Some((sect, val)) = rest.split_once(".ipaddr=") {
+            ip_of.insert(sect.to_string(), unquote(val));
+        }
+    }
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (sect, dev) in &dev_of {
+        if !dev.starts_with("br-ss") {
+            continue;
+        }
+        if let Some(prefix) = ip_of.get(sect).and_then(|ip| ipv4_24_prefix(ip)) {
+            out.insert(dev.clone(), prefix);
+        }
+    }
+    out
+}
+
+/// "10.21.0.1" -> Some("10.21.0"); None if not a dotted IPv4 quad.
+fn ipv4_24_prefix(ip: &str) -> Option<String> {
+    let o: Vec<&str> = ip.split('.').collect();
+    if o.len() == 4 && o.iter().all(|p| p.parse::<u8>().is_ok()) {
+        Some(format!("{}.{}.{}", o[0], o[1], o[2]))
+    } else {
+        None
+    }
+}
+
+/// True if `ip` is inside the /24 `prefix` ("10.21.0" matches "10.21.0.\d+"),
+/// boundary-safe (won't match "10.21.05.x").
+fn ip_in_prefix(ip: &str, prefix: &str) -> bool {
+    ip.strip_prefix(prefix).map(|r| r.starts_with('.')).unwrap_or(false)
+}
+
+/// One parsed `/proc/net/nf_conntrack` IPv4 tcp/udp flow. Each line carries two
+/// `src=/dst=/sport=/dport=/bytes=` groups: original direction then reply. For a
+/// client-initiated flow the original src is the client's LAN IP, so orig_bytes =
+/// upload (client→net) and reply_bytes = download (net→client).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ConntrackFlow {
+    pub proto: String,
+    pub src_ip: String,
+    pub src_port: u32,
+    pub dst_ip: String,
+    pub dst_port: u32,
+    pub orig_bytes: u64,
+    pub reply_bytes: u64,
+}
+
+impl ConntrackFlow {
+    /// Stable per-flow identity (proto + original 5-tuple) for delta accounting.
+    fn key(&self) -> String {
+        format!("{}|{}:{}|{}:{}", self.proto, self.src_ip, self.src_port, self.dst_ip, self.dst_port)
+    }
+}
+
+/// Parse `/proc/net/nf_conntrack` into IPv4 tcp/udp flows with per-direction byte
+/// counters. Fail-soft: ipv6 / non-tcp-udp / unparseable lines are skipped. Crucially
+/// this source DOES count `[HW_OFFLOAD]` flows, unlike the bridge/iptables/station
+/// counters. Field layout: `ipv4 2 <proto> <num> ... src= dst= sport= dport= ...
+/// packets= bytes= [reply:] src= dst= sport= dport= packets= bytes= ...`.
+pub fn parse_conntrack(text: &str) -> Vec<ConntrackFlow> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.first() != Some(&"ipv4") {
+            continue; // skip ipv6 / unknown l3
+        }
+        let proto = match toks.get(2) {
+            Some(&"tcp") => "tcp",
+            Some(&"udp") => "udp",
+            _ => continue, // icmp/other: no client byte interest
+        };
+        let mut f = ConntrackFlow { proto: proto.to_string(), ..Default::default() };
+        let (mut got_src, mut got_dst, mut got_sport, mut got_dport) = (false, false, false, false);
+        let mut bytes_seen = 0u8;
+        for t in &toks {
+            if let Some(v) = t.strip_prefix("src=") {
+                if !got_src {
+                    f.src_ip = v.to_string();
+                    got_src = true;
+                }
+            } else if let Some(v) = t.strip_prefix("dst=") {
+                if !got_dst {
+                    f.dst_ip = v.to_string();
+                    got_dst = true;
+                }
+            } else if let Some(v) = t.strip_prefix("sport=") {
+                if !got_sport {
+                    f.src_port = v.parse().unwrap_or(0);
+                    got_sport = true;
+                }
+            } else if let Some(v) = t.strip_prefix("dport=") {
+                if !got_dport {
+                    f.dst_port = v.parse().unwrap_or(0);
+                    got_dport = true;
+                }
+            } else if let Some(v) = t.strip_prefix("bytes=") {
+                let b = v.parse().unwrap_or(0);
+                match bytes_seen {
+                    0 => f.orig_bytes = b,
+                    1 => f.reply_bytes = b,
+                    _ => {}
+                }
+                bytes_seen = bytes_seen.saturating_add(1);
+            }
+        }
+        if f.src_ip.is_empty() {
+            continue;
+        }
+        out.push(f);
+    }
+    out
+}
+
+/// Monotonic per-client-IP byte accounting fed from successive conntrack snapshots.
+///
+/// conntrack counters are per-LIVE-flow: a flow that times out drops out of the table,
+/// so a plain sum falls over time — which the control plane's cumulative-delta rate
+/// math would misread as a counter reset. Instead we remember each flow's last-seen
+/// (orig, reply) bytes and fold only the INCREMENT into a per-client-IP running total
+/// that only grows. The first snapshot just establishes the baseline (pre-existing
+/// flows' historical bytes are not counted as a startup spike). Resets to zero on
+/// engine restart (in-RAM) — the CP clamps that like any counter reset.
+#[derive(Default)]
+pub struct FlowByteAccumulator {
+    primed: bool,
+    seen: BTreeMap<String, (u64, u64)>, // flow key -> last (orig_bytes, reply_bytes)
+    cum: BTreeMap<String, (u64, u64)>,  // client IP -> (upload, download) cumulative
+}
+
+impl FlowByteAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one conntrack snapshot into the cumulative totals.
+    pub fn ingest(&mut self, flows: &[ConntrackFlow]) {
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        for fl in flows {
+            let key = fl.key();
+            let (last_o, last_r) = self.seen.get(&key).copied().unwrap_or((0, 0));
+            if self.primed {
+                let d_o = fl.orig_bytes.saturating_sub(last_o);
+                let d_r = fl.reply_bytes.saturating_sub(last_r);
+                if d_o != 0 || d_r != 0 {
+                    let e = self.cum.entry(fl.src_ip.clone()).or_insert((0, 0));
+                    e.0 = e.0.saturating_add(d_o);
+                    e.1 = e.1.saturating_add(d_r);
+                }
+            }
+            self.seen.insert(key.clone(), (fl.orig_bytes, fl.reply_bytes));
+            present.insert(key);
+        }
+        // Drop flows gone this tick — their final bytes are already folded in.
+        self.seen.retain(|k, _| present.contains(k));
+        self.primed = true;
+    }
+
+    /// (upload, download) cumulative for one client IP.
+    pub fn client(&self, ip: &str) -> (u64, u64) {
+        self.cum.get(ip).copied().unwrap_or((0, 0))
+    }
+
+    /// (upload, download) summed over every client IP inside a /24 `prefix`.
+    pub fn subnet_bytes(&self, prefix: &str) -> (u64, u64) {
+        if prefix.is_empty() {
+            return (0, 0);
+        }
+        let (mut up, mut down) = (0u64, 0u64);
+        for (ip, (u, d)) in &self.cum {
+            if ip_in_prefix(ip, prefix) {
+                up = up.saturating_add(*u);
+                down = down.saturating_add(*d);
+            }
+        }
+        (up, down)
+    }
 }
 
 /// Parse `ubus call gsm.modem0 info` JSON -> SIM signal, or None (no modem / empty).
@@ -576,5 +780,74 @@ network.pc_win_if.device='br-ss2'";
                 ("br-ss2".to_string(), "pilot-dev Thiet Bi".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn conntrack_parses_directional_bytes() {
+        // Real .25 line: YouTube QUIC flow, orig=upload, reply=download, offloaded.
+        let line = "ipv4     2 udp      17 30 src=10.21.0.41 dst=113.171.68.17 sport=50346 dport=443 packets=269 bytes=61884 src=113.171.68.17 dst=192.168.1.236 sport=443 dport=50346 packets=2572 bytes=3164892 [HW_OFFLOAD] mark=256 zone=0 use=3";
+        let f = parse_conntrack(line);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].proto, "udp");
+        assert_eq!(f[0].src_ip, "10.21.0.41");
+        assert_eq!(f[0].src_port, 50346);
+        assert_eq!(f[0].dst_port, 443);
+        assert_eq!(f[0].orig_bytes, 61884); // upload (client -> net)
+        assert_eq!(f[0].reply_bytes, 3164892); // download (net -> client)
+    }
+
+    #[test]
+    fn conntrack_skips_ipv6_and_non_tcp_udp() {
+        let text = "\
+ipv6     10 tcp      6 src=fe80::1 dst=fe80::2 sport=1 dport=2 bytes=5 src=a dst=b bytes=6
+ipv4     2 icmp     1 30 src=10.21.0.5 dst=8.8.8.8 type=8 code=0 id=1 packets=1 bytes=84";
+        assert!(parse_conntrack(text).is_empty());
+    }
+
+    #[test]
+    fn accumulator_baselines_then_folds_increments_across_expiry() {
+        let mut acc = FlowByteAccumulator::new();
+        let flow = |o, r| ConntrackFlow {
+            proto: "tcp".into(), src_ip: "10.21.0.41".into(), src_port: 1,
+            dst_ip: "1.1.1.1".into(), dst_port: 443, orig_bytes: o, reply_bytes: r,
+        };
+        // First snapshot = baseline only (no startup spike from pre-existing bytes).
+        acc.ingest(&[flow(100, 1000)]);
+        assert_eq!(acc.client("10.21.0.41"), (0, 0));
+        // Same flow grows -> fold only the increment.
+        acc.ingest(&[flow(150, 1500)]);
+        assert_eq!(acc.client("10.21.0.41"), (50, 500));
+        // Flow expires, a NEW flow (same client) appears: prior total retained, the
+        // new flow counted from zero -> monotonic across expiry.
+        acc.ingest(&[ConntrackFlow {
+            proto: "tcp".into(), src_ip: "10.21.0.41".into(), src_port: 2,
+            dst_ip: "2.2.2.2".into(), dst_port: 443, orig_bytes: 10, reply_bytes: 20,
+        }]);
+        assert_eq!(acc.client("10.21.0.41"), (60, 520));
+    }
+
+    #[test]
+    fn bridge_subnets_and_subnet_bytes() {
+        let network = "\
+network.lan=interface
+network.lan.device='br-lan'
+network.lan.ipaddr='192.168.9.1'
+network.pc_win_if=interface
+network.pc_win_if.device='br-ss2'
+network.pc_win_if.ipaddr='10.21.0.1'";
+        let subs = parse_bridge_subnets(network);
+        assert_eq!(subs.get("br-ss2"), Some(&"10.21.0".to_string()));
+        assert!(!subs.contains_key("br-lan")); // only br-ss* bridges
+
+        let mut acc = FlowByteAccumulator::new();
+        let mk = |ip: &str, o, r| ConntrackFlow {
+            proto: "tcp".into(), src_ip: ip.into(), src_port: 1,
+            dst_ip: "1.1.1.1".into(), dst_port: 443, orig_bytes: o, reply_bytes: r,
+        };
+        acc.ingest(&[mk("10.21.0.41", 0, 0), mk("10.21.0.42", 0, 0), mk("10.99.0.1", 0, 0)]);
+        acc.ingest(&[mk("10.21.0.41", 100, 900), mk("10.21.0.42", 50, 400), mk("10.99.0.1", 999, 999)]);
+        // Subnet sum includes only 10.21.0.x (upload 150, download 1300); 10.99.* excluded.
+        assert_eq!(acc.subnet_bytes("10.21.0"), (150, 1300));
+        assert_eq!(acc.client("10.21.0.41"), (100, 900));
     }
 }
