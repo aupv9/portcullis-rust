@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portcullis_types::{
-    SiteClient, SiteSsid, SiteTelemetryReport, SiteUplink, SiteUplinkSim,
+    ControlChannelHealth, SiteClient, SiteSsid, SiteTelemetryReport, SiteUplink, SiteUplinkSim,
 };
 use tokio::sync::mpsc;
 
@@ -44,6 +44,7 @@ const PING_TARGET: &str = "8.8.8.8";
 /// [`SiteTelemetryReport`] and pushing it up `tx` (dropped if the consumer is behind).
 pub async fn run_site_telemetry_poller<R: CommandRunner>(
     runner: Arc<R>,
+    health: Arc<ControlChannelHealth>,
     tx: mpsc::Sender<SiteTelemetryReport>,
     interval: Duration,
 ) {
@@ -51,7 +52,8 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        let report = poll_once(runner.as_ref()).await;
+        let mut report = poll_once(runner.as_ref()).await;
+        report.control = health.snapshot();
         match tx.try_send(report) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -153,7 +155,8 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
 
     let uplink = gather_uplink(runner).await;
 
-    SiteTelemetryReport { ts_unix, router_uptime_secs, ssids, clients, uplink }
+    // control is filled by the poller from the shared ControlChannelHealth.
+    SiteTelemetryReport { ts_unix, router_uptime_secs, ssids, clients, uplink, control: Default::default() }
 }
 
 /// List a bridge's wireless VIF members from `/sys/class/net/<bridge>/brif`.

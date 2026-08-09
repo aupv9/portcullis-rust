@@ -219,6 +219,22 @@ pub struct SiteUplink {
     #[prost(message, optional, tag="8")]
     pub sim: ::core::option::Option<SiteUplinkSim>,
 }
+/// Engine's own view of its outbound control channel to the CP (the .22 zombie
+/// signals): is it dialed in, how long the current connection has held, and how
+/// many times it has reconnected since boot.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SiteControlChannel {
+    /// stream currently established
+    #[prost(bool, tag="1")]
+    pub cp_connected: bool,
+    /// # re-establishes after the first dial
+    #[prost(uint32, tag="2")]
+    pub reconnects_since_boot: u32,
+    /// uptime of the CURRENT connection (0 if down)
+    #[prost(uint32, tag="3")]
+    pub connected_secs: u32,
+}
 /// One whole-site snapshot for a router, pushed unsolicited as
 /// EngineFrame.site_telemetry.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -235,6 +251,9 @@ pub struct SiteTelemetryReport {
     pub clients: ::prost::alloc::vec::Vec<SiteClient>,
     #[prost(message, optional, tag="5")]
     pub uplink: ::core::option::Option<SiteUplink>,
+    /// engine<->CP dial health
+    #[prost(message, optional, tag="6")]
+    pub control: ::core::option::Option<SiteControlChannel>,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.

@@ -421,6 +421,11 @@ pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetry
         ssids: r.ssids.iter().map(site_ssid_to_pb).collect(),
         clients: r.clients.iter().map(site_client_to_pb).collect(),
         uplink: Some(site_uplink_to_pb(&r.uplink)),
+        control: Some(pb::SiteControlChannel {
+            cp_connected: r.control.cp_connected,
+            reconnects_since_boot: r.control.reconnects_since_boot,
+            connected_secs: r.control.connected_secs,
+        }),
     }
 }
 

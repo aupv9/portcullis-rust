@@ -149,6 +149,15 @@ message SiteUplink {
   SiteUplinkSim sim         = 8; // absent = no modem
 }
 
+// Engine's own view of its outbound control channel to the CP (the .22 zombie
+// signals): is it dialed in, how long the current connection has held, and how
+// many times it has reconnected since boot.
+message SiteControlChannel {
+  bool   cp_connected          = 1; // stream currently established
+  uint32 reconnects_since_boot = 2; // # re-establishes after the first dial
+  uint32 connected_secs        = 3; // uptime of the CURRENT connection (0 if down)
+}
+
 // One whole-site snapshot for a router, pushed unsolicited as
 // EngineFrame.site_telemetry.
 message SiteTelemetryReport {
@@ -157,6 +166,7 @@ message SiteTelemetryReport {
   repeated SiteSsid   ssids   = 3;
   repeated SiteClient clients = 4;
   SiteUplink          uplink  = 5;
+  SiteControlChannel  control = 6; // engine<->CP dial health
 }
 
 // control plane -> engine. `correlation_id` is echoed back in the answering
