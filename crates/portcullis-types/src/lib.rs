@@ -1117,6 +1117,12 @@ pub struct SiteSsid {
     pub rx_dropped: u64,
     pub tx_errors: u64,
     pub tx_dropped: u64,
+    // Radio airtime + noise (per-radio survey; explains why retries are high) and
+    // DHCP pool fill for this SSID's subnet.
+    pub airtime_busy_pct: u32, // 0..100, delta busy/active since last poll
+    pub noise_dbm: i32,        // channel noise floor (0 = n/a)
+    pub dhcp_leased: u32,      // active leases in the subnet
+    pub dhcp_capacity: u32,    // DHCP pool size (0 = unknown)
 }
 
 /// One associated client on any SSID VIF. f64 rates ⇒ no `Eq`.
@@ -1167,6 +1173,20 @@ pub struct SiteControlChannel {
     pub connected_secs: u32,
 }
 
+/// Router system health (SNMP-equivalent, read locally via ubus/df/gsmctl). Gauges,
+/// not counters — unaffected by hardware flow offload.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SiteHealth {
+    pub cpu_load1: f64,     // 1-minute load average
+    pub cpu_load5: f64,
+    pub cpu_load15: f64,
+    pub mem_total: u64,     // bytes
+    pub mem_available: u64, // bytes
+    pub flash_total: u64,   // bytes (persistent /overlay)
+    pub flash_free: u64,    // bytes
+    pub modem_temp_dc: i32, // deci-°C (390 = 39.0°C); 0 = n/a. No CPU sensor on MT7621.
+}
+
 /// One whole-site telemetry snapshot for a router (Transport A).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SiteTelemetryReport {
@@ -1176,6 +1196,7 @@ pub struct SiteTelemetryReport {
     pub clients: Vec<SiteClient>,
     pub uplink: SiteUplink,
     pub control: SiteControlChannel,
+    pub health: SiteHealth,
 }
 
 /// Shared, interior-mutable control-channel health tracked by the control task
