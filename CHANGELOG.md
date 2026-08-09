@@ -4,6 +4,27 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.30.0] — 2026-08-09
+
+### Fixed
+- **Site-telemetry byte counters were wrong under hardware flow offload.** On the
+  MT7621 (`flow_offloading_hw=1`) the bulk of forwarded traffic — mostly download —
+  is switched in the PPE and never touches the Linux bridge `/sys` counters,
+  `iptables` FORWARD counters, or `iw station dump` byte counters. The old
+  per-SSID `ul/dl_bytes` (bridge `rx/tx`) and per-client `rx/tx_bytes` (station
+  dump) therefore undercounted download and read backwards (upload > download) —
+  e.g. a client that pulled 4.1 MB of video showed 0.48 MB "download" / 1.30 MB
+  "upload". Byte accounting now comes from `/proc/net/nf_conntrack`, which DOES
+  reflect offloaded flows. A new `FlowByteAccumulator` folds each flow's byte
+  increment into a monotonic per-client-IP cumulative (conntrack is per-live-flow,
+  not a cumulative counter, so a plain sum falls when flows expire); per-SSID
+  totals sum the cumulative over the bridge's `/24`. The wire contract is
+  unchanged (`ul/dl_bytes`, client `rx/tx_bytes`) — only the source — so the CP
+  egress/today derivations and the FE become correct with no downstream change.
+  Note: the cumulative is in-RAM, so an engine restart resets it (the CP clamps
+  that like any counter reset). `fwd_bytes/fwd_pkts` remain but are unreliable
+  under offload and unused by the dashboard.
+
 ## [0.29.0] — 2026-08-09
 
 ### Added
