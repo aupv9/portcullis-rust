@@ -146,6 +146,12 @@ pub struct SiteSsid {
     /// cumulative forwarded bytes toward the uplink (egress)
     #[prost(uint64, tag="9")]
     pub fwd_bytes: u64,
+    /// cumulative bytes client->internet (bridge rx_bytes)
+    #[prost(uint64, tag="10")]
+    pub ul_bytes: u64,
+    /// cumulative bytes internet->client (bridge tx_bytes)
+    #[prost(uint64, tag="11")]
+    pub dl_bytes: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -176,6 +182,9 @@ pub struct SiteClient {
     /// association age
     #[prost(uint32, tag="9")]
     pub connected_secs: u32,
+    /// DHCP-lease hostname ("" if none)
+    #[prost(string, tag="10")]
+    pub hostname: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

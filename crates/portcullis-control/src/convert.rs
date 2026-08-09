@@ -435,6 +435,8 @@ fn site_ssid_to_pb(s: &SiteSsid) -> pb::SiteSsid {
         channel: s.channel,
         fwd_pkts: s.fwd_pkts,
         fwd_bytes: s.fwd_bytes,
+        ul_bytes: s.ul_bytes,
+        dl_bytes: s.dl_bytes,
     }
 }
 
@@ -449,6 +451,7 @@ fn site_client_to_pb(c: &SiteClient) -> pb::SiteClient {
         rx_bytes: c.rx_bytes,
         tx_bytes: c.tx_bytes,
         connected_secs: c.connected_secs,
+        hostname: c.hostname.clone(),
     }
 }
 
