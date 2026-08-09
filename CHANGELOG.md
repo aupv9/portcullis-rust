@@ -4,6 +4,19 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.34.0] — 2026-08-09
+
+### Changed
+- **SSID `on_air` now uses netifd's authoritative wireless state, not just netdev
+  operstate.** A VIF counts as on-air only when its `operstate == up` AND netifd's
+  `network.wireless status` reports its radio `up && !disabled && !retry_setup_failed`
+  (`parse_wireless_status`) — i.e. hostapd actually launched the BSS. A bare
+  `operstate=up` can lie when hostapd setup failed; this catches that and makes the
+  24h liveness heatmap more truthful. Fail-soft: if netifd status is unavailable for
+  a VIF, falls back to operstate only (no regression). Engine-only; contract
+  unchanged. (Tier 2 of the wireless-accuracy work; the CP-side "chập chờn"/deg
+  per-bucket state is Tier 1.)
+
 ## [0.33.0] — 2026-08-09
 
 ### Fixed

@@ -131,6 +131,10 @@ pub async fn poll_once<R: CommandRunner>(
     let leased_by_prefix = count_leases_by_prefix(&leases);
 
     let health = gather_health(runner).await;
+    // netifd's authoritative wireless state per VIF — "BSS actually came up" (hostapd
+    // launched, radio not disabled, setup didn't fail). A bare operstate=up can lie
+    // when hostapd setup failed; this catches that.
+    let wstatus = parse_wireless_status(&run_text(runner, "ubus", &["call", "network.wireless", "status"]).await);
 
     let mut ssids: Vec<SiteSsid> = Vec::new();
     let mut clients: Vec<SiteClient> = Vec::new();
@@ -139,12 +143,15 @@ pub async fn poll_once<R: CommandRunner>(
         let vifs = list_bridge_vifs(runner, &ifname).await;
         let first_vif = vifs.first().cloned();
 
-        // on_air = at least one VIF operationally up. channel from the first VIF.
+        // on_air = at least one VIF operationally up AND netifd confirms its BSS is
+        // up (not disabled / setup-failed). channel from the first VIF. netifd status
+        // unknown for a VIF ⇒ fall back to operstate only (fail-soft, no regression).
         let mut on_air = false;
         let mut channel = 0u32;
         for (i, vif) in vifs.iter().enumerate() {
             let path = format!("/sys/class/net/{vif}/operstate");
-            if run_text(runner, "cat", &[&path]).await.trim() == "up" {
+            let operup = run_text(runner, "cat", &[&path]).await.trim() == "up";
+            if operup && wstatus.get(vif).copied().unwrap_or(true) {
                 on_air = true;
             }
             if i == 0 {
@@ -464,6 +471,30 @@ pub fn parse_neigh(text: &str) -> BTreeMap<String, String> {
             out.insert(mac, ip.to_string()); // freshest binding wins
         } else {
             out.entry(mac).or_insert_with(|| ip.to_string());
+        }
+    }
+    out
+}
+
+/// Parse `ubus call network.wireless status` -> (VIF ifname -> BSS genuinely up).
+/// netifd's authoritative view: a VIF is up when its radio is `up && !disabled &&
+/// !retry_setup_failed` (i.e. hostapd actually launched the BSS). More accurate than
+/// a bare `operstate=up`. Unparseable/empty ⇒ empty map (caller falls back to operstate).
+pub fn parse_wireless_status(json: &str) -> BTreeMap<String, bool> {
+    let mut out = BTreeMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return out };
+    let Some(radios) = v.as_object() else { return out };
+    for radio in radios.values() {
+        let b = |k: &str| radio.get(k).and_then(|x| x.as_bool());
+        let ok = b("up").unwrap_or(false)
+            && !b("disabled").unwrap_or(false)
+            && !b("retry_setup_failed").unwrap_or(false);
+        if let Some(ifs) = radio.get("interfaces").and_then(|x| x.as_array()) {
+            for i in ifs {
+                if let Some(name) = i.get("ifname").and_then(|x| x.as_str()) {
+                    out.insert(name.to_string(), ok);
+                }
+            }
         }
     }
     out
@@ -1185,5 +1216,20 @@ fe80::1 dev br-ss2 lladdr aa:bb:cc:dd:ee:ff STALE
         assert_eq!(n.get("96:22:95:06:f8:d7"), Some(&"10.21.0.171".to_string()));
         assert_eq!(n.get("f6:83:90:06:19:cb"), Some(&"10.22.0.87".to_string())); // MAC lowercased
         assert_eq!(n.len(), 2); // ipv6 + no-lladdr(FAILED) skipped
+    }
+
+    #[test]
+    fn wireless_status_marks_failed_or_disabled_radio_down() {
+        let json = r#"{
+          "radio0": {"up": true, "disabled": false, "retry_setup_failed": false,
+                     "interfaces":[{"ifname":"wlan0-D-1"},{"ifname":"wlan0-D-2"}]},
+          "radio1": {"up": true, "disabled": false, "retry_setup_failed": true,
+                     "interfaces":[{"ifname":"wlan1-D-1"}]}
+        }"#;
+        let s = parse_wireless_status(json);
+        assert_eq!(s.get("wlan0-D-1"), Some(&true));
+        assert_eq!(s.get("wlan0-D-2"), Some(&true));
+        assert_eq!(s.get("wlan1-D-1"), Some(&false)); // retry_setup_failed → down
+        assert!(parse_wireless_status("not json").is_empty());
     }
 }
