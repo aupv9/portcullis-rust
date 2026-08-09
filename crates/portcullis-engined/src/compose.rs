@@ -265,6 +265,30 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     }
     let mut device_reports_rx = Some(device_reports_rx);
 
+    // 4f. Whole-site telemetry poller (Transport A) — a fourth ISOLATED, read-only
+    //     task. Every ~60 s it builds one SiteTelemetryReport (per-SSID on-air/gate/
+    //     egress + per-client + uplink) and fans it up the control channel. Purely
+    //     observational: reads the committed desired-state + shells out to
+    //     iw/iptables/ubus/mwan3/ping via the CommandRunner seam; never writes
+    //     wireless config or touches enforcement. Feeds the admin "Giám sát trực
+    //     tiếp" tab via the CP (site_telemetry table + read API).
+    let (site_telemetry_tx, site_telemetry_rx) =
+        tokio::sync::mpsc::channel(portcullis_provision::SITE_TELEMETRY_BUFFER);
+    {
+        let runner = Arc::new(portcullis_provision::ProcessRunner);
+        let prov = provisioner.clone();
+        tasks.push(tokio::spawn(async move {
+            portcullis_provision::run_site_telemetry_poller(
+                runner,
+                prov,
+                site_telemetry_tx,
+                portcullis_provision::DEFAULT_SITE_TELEMETRY_INTERVAL,
+            )
+            .await;
+        }));
+    }
+    let mut site_telemetry_rx = Some(site_telemetry_rx);
+
     // 4e. Runtime control state (F0): the CP-pushed config store + EngineControl
     //     controller. Built UNCONDITIONALLY (independent of CP connectivity) — it
     //     holds local runtime state and drives the effect loops (garden/enforcement
@@ -339,9 +363,12 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
             // Move the P3 device-telemetry stream in too (unsolicited periodic).
             let device_reports_rx =
                 device_reports_rx.take().expect("device-report receiver taken once");
+            // Move the Transport-A site-telemetry stream in too (unsolicited periodic).
+            let site_telemetry_rx =
+                site_telemetry_rx.take().expect("site-telemetry receiver taken once");
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
-                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, liveness_rx, device_reports_rx, move |up| {
+                portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, liveness_rx, device_reports_rx, site_telemetry_rx, move |up| {
                     mgr.set_cp_connected(up);
                     if !up {
                         m.incr(Metric::CpDisconnect);

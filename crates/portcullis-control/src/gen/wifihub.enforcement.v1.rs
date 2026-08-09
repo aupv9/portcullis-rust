@@ -14,7 +14,7 @@ pub struct EngineFrame {
     /// echoed back on the answering ack/reply so the CP can confirm continuity.
     #[prost(string, tag="15")]
     pub trace_ctx: ::prost::alloc::string::String,
-    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
+    #[prost(oneof="engine_frame::Msg", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16")]
     pub msg: ::core::option::Option<engine_frame::Msg>,
 }
 /// Nested message and enum types in `EngineFrame`.
@@ -61,6 +61,9 @@ pub mod engine_frame {
         /// per-device telemetry (P3 device monitoring); unsolicited, ~30s poll of device VIFs
         #[prost(message, tag="14")]
         WirelessDevices(super::WirelessDeviceReport),
+        /// whole-site telemetry (SSID/client/uplink); unsolicited, ~30-60s poll (Transport A)
+        #[prost(message, tag="16")]
+        SiteTelemetry(super::SiteTelemetryReport),
     }
 }
 /// One observed device (station) on an owned SSID (P3 device monitoring). The
@@ -105,6 +108,124 @@ pub struct WirelessDeviceReport {
     /// engine wall-clock (unix seconds) at sample
     #[prost(int64, tag="2")]
     pub ts_unix: i64,
+}
+/// ---------------------------------------------------------------------------
+/// Whole-site telemetry (Transport A — engine-native "Giám sát trực tiếp"). The
+/// engine polls SSID on-air/gate/egress + per-client + uplink (~30-60s) and pushes
+/// one snapshot up unsolicited as EngineFrame.site_telemetry. Purely observational.
+/// The CP stores the latest snapshot + a 24h history and derives per-SSID
+/// uptime%/liveness for the admin monitoring tab.
+/// ---------------------------------------------------------------------------
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteSsid {
+    /// bridge iface, e.g. "br-ss1"
+    #[prost(string, tag="1")]
+    pub ifname: ::prost::alloc::string::String,
+    /// advertised SSID name
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
+    /// at least one VIF up (hostapd broadcasting)
+    #[prost(bool, tag="3")]
+    pub on_air: bool,
+    /// captive-gated SSID
+    #[prost(bool, tag="4")]
+    pub gated: bool,
+    /// gate actually scoped to this bridge (live)
+    #[prost(bool, tag="5")]
+    pub gate_enforced: bool,
+    /// associated stations across the bridge's VIFs
+    #[prost(uint32, tag="6")]
+    pub client_count: u32,
+    /// primary channel (0 = unknown)
+    #[prost(uint32, tag="7")]
+    pub channel: u32,
+    /// cumulative forwarded packets (FORWARD -i ifname)
+    #[prost(uint64, tag="8")]
+    pub fwd_pkts: u64,
+    /// cumulative forwarded bytes toward the uplink (egress)
+    #[prost(uint64, tag="9")]
+    pub fwd_bytes: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteClient {
+    /// station MAC (lowercase)
+    #[prost(string, tag="1")]
+    pub mac: ::prost::alloc::string::String,
+    /// bridge it is associated on
+    #[prost(string, tag="2")]
+    pub ssid_ifname: ::prost::alloc::string::String,
+    /// DHCP-leased IP, "" = associated but no lease
+    #[prost(string, tag="3")]
+    pub ip: ::prost::alloc::string::String,
+    #[prost(int32, tag="4")]
+    pub signal_dbm: i32,
+    /// AP->client PHY rate
+    #[prost(double, tag="5")]
+    pub tx_rate_mbps: f64,
+    /// client->AP PHY rate
+    #[prost(double, tag="6")]
+    pub rx_rate_mbps: f64,
+    /// cumulative bytes from the client
+    #[prost(uint64, tag="7")]
+    pub rx_bytes: u64,
+    /// cumulative bytes to the client
+    #[prost(uint64, tag="8")]
+    pub tx_bytes: u64,
+    /// association age
+    #[prost(uint32, tag="9")]
+    pub connected_secs: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteUplinkSim {
+    #[prost(string, tag="1")]
+    pub operator: ::prost::alloc::string::String,
+    #[prost(int32, tag="2")]
+    pub rsrp: i32,
+    #[prost(int32, tag="3")]
+    pub sinr: i32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteUplink {
+    /// "wan" (cable) | "sim" | other iface label
+    #[prost(string, tag="1")]
+    pub active_wan: ::prost::alloc::string::String,
+    #[prost(bool, tag="2")]
+    pub wan_up: bool,
+    #[prost(bool, tag="3")]
+    pub sim_up: bool,
+    /// ping succeeded
+    #[prost(bool, tag="4")]
+    pub internet_reachable: bool,
+    #[prost(double, tag="5")]
+    pub latency_ms: f64,
+    #[prost(double, tag="6")]
+    pub loss_pct: f64,
+    #[prost(string, tag="7")]
+    pub public_ip: ::prost::alloc::string::String,
+    /// absent = no modem
+    #[prost(message, optional, tag="8")]
+    pub sim: ::core::option::Option<SiteUplinkSim>,
+}
+/// One whole-site snapshot for a router, pushed unsolicited as
+/// EngineFrame.site_telemetry.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteTelemetryReport {
+    /// engine wall-clock (unix seconds) at sample
+    #[prost(int64, tag="1")]
+    pub ts_unix: i64,
+    #[prost(uint32, tag="2")]
+    pub router_uptime_secs: u32,
+    #[prost(message, repeated, tag="3")]
+    pub ssids: ::prost::alloc::vec::Vec<SiteSsid>,
+    #[prost(message, repeated, tag="4")]
+    pub clients: ::prost::alloc::vec::Vec<SiteClient>,
+    #[prost(message, optional, tag="5")]
+    pub uplink: ::core::option::Option<SiteUplink>,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.

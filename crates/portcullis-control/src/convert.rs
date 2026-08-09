@@ -12,8 +12,8 @@ use std::time::Duration;
 use portcullis_types::{
     DeviceObservation, EngineInfoSnapshot, EngineParameters, Error, GrantParams, HealthStatus,
     MacAddr, MetricsSnapshot, PeerAllow, ProvisionState, Result, RevokeReason, SessionEvent,
-    SessionId, SessionInfo, SsidSpec, Tier, TierPolicy, WirelessDesiredState, WirelessDeviceReport,
-    WirelessLiveness, WirelessStatus,
+    SessionId, SessionInfo, SiteClient, SiteSsid, SiteTelemetryReport, SiteUplink, SsidSpec, Tier,
+    TierPolicy, WirelessDesiredState, WirelessDeviceReport, WirelessLiveness, WirelessStatus,
 };
 
 use crate::pb;
@@ -410,6 +410,62 @@ fn device_observation_to_pb(d: &DeviceObservation) -> pb::DeviceObservation {
         rx_bytes: d.rx_bytes,
         tx_bytes: d.tx_bytes,
         uptime_secs: d.uptime_secs,
+    }
+}
+
+/// Map a whole-site telemetry snapshot (Transport A) to its pb form.
+pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetryReport {
+    pb::SiteTelemetryReport {
+        ts_unix: r.ts_unix,
+        router_uptime_secs: r.router_uptime_secs,
+        ssids: r.ssids.iter().map(site_ssid_to_pb).collect(),
+        clients: r.clients.iter().map(site_client_to_pb).collect(),
+        uplink: Some(site_uplink_to_pb(&r.uplink)),
+    }
+}
+
+fn site_ssid_to_pb(s: &SiteSsid) -> pb::SiteSsid {
+    pb::SiteSsid {
+        ifname: s.ifname.clone(),
+        name: s.name.clone(),
+        on_air: s.on_air,
+        gated: s.gated,
+        gate_enforced: s.gate_enforced,
+        client_count: s.client_count,
+        channel: s.channel,
+        fwd_pkts: s.fwd_pkts,
+        fwd_bytes: s.fwd_bytes,
+    }
+}
+
+fn site_client_to_pb(c: &SiteClient) -> pb::SiteClient {
+    pb::SiteClient {
+        mac: c.mac.clone(),
+        ssid_ifname: c.ssid_ifname.clone(),
+        ip: c.ip.clone(),
+        signal_dbm: c.signal_dbm,
+        tx_rate_mbps: c.tx_rate_mbps,
+        rx_rate_mbps: c.rx_rate_mbps,
+        rx_bytes: c.rx_bytes,
+        tx_bytes: c.tx_bytes,
+        connected_secs: c.connected_secs,
+    }
+}
+
+fn site_uplink_to_pb(u: &SiteUplink) -> pb::SiteUplink {
+    pb::SiteUplink {
+        active_wan: u.active_wan.clone(),
+        wan_up: u.wan_up,
+        sim_up: u.sim_up,
+        internet_reachable: u.internet_reachable,
+        latency_ms: u.latency_ms,
+        loss_pct: u.loss_pct,
+        public_ip: u.public_ip.clone(),
+        sim: u.sim.as_ref().map(|s| pb::SiteUplinkSim {
+            operator: s.operator.clone(),
+            rsrp: s.rsrp,
+            sinr: s.sinr,
+        }),
     }
 }
 
