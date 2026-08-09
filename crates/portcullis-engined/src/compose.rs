@@ -272,13 +272,18 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     //     iw/iptables/ubus/mwan3/ping via the CommandRunner seam; never writes
     //     wireless config or touches enforcement. Feeds the admin "Giám sát trực
     //     tiếp" tab via the CP (site_telemetry table + read API).
+    // Shared engine<->CP control-channel health: updated by the control task's
+    // cp_state callback, read by the site-telemetry poller (the .22 zombie signals).
+    let ctrl_health = Arc::new(portcullis_types::ControlChannelHealth::new());
     let (site_telemetry_tx, site_telemetry_rx) =
         tokio::sync::mpsc::channel(portcullis_provision::SITE_TELEMETRY_BUFFER);
     {
         let runner = Arc::new(portcullis_provision::ProcessRunner);
+        let health = ctrl_health.clone();
         tasks.push(tokio::spawn(async move {
             portcullis_provision::run_site_telemetry_poller(
                 runner,
+                health,
                 site_telemetry_tx,
                 portcullis_provision::DEFAULT_SITE_TELEMETRY_INTERVAL,
             )
@@ -364,11 +369,15 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
             // Move the Transport-A site-telemetry stream in too (unsolicited periodic).
             let site_telemetry_rx =
                 site_telemetry_rx.take().expect("site-telemetry receiver taken once");
+            let cp_health = ctrl_health.clone();
             tasks.push(tokio::spawn(async move {
                 tracing::info!(endpoint = %chan_cfg.endpoint, "dialing control plane (mTLS bidi stream)");
                 portcullis_control::run_control_channel(chan_cfg, enforcer, events, wireless_rx, liveness_rx, device_reports_rx, site_telemetry_rx, move |up| {
                     mgr.set_cp_connected(up);
-                    if !up {
+                    if up {
+                        cp_health.on_established();
+                    } else {
+                        cp_health.on_disconnect();
                         m.incr(Metric::CpDisconnect);
                     }
                 })

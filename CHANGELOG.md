@@ -4,6 +4,16 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.29.0] — 2026-08-09
+
+### Added
+- **Engine↔CP control-channel health in site telemetry.** `SiteTelemetryReport`
+  gains a `control` block — `cp_connected`, `reconnects_since_boot`,
+  `connected_secs` (uptime of the current dial) — sourced from a shared
+  `ControlChannelHealth` the control task updates from its `cp_state` callback and
+  the poller reads. Surfaces the `.22` zombie signals (is the engine dialed in, is
+  the channel flapping, how long has it held) directly in the dashboard.
+
 ## [0.28.0] — 2026-08-09
 
 ### Added

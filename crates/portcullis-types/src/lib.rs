@@ -1149,6 +1149,14 @@ pub struct SiteUplink {
     pub sim: Option<SiteUplinkSim>,
 }
 
+/// Engine's own control-channel (dial to CP) health snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteControlChannel {
+    pub cp_connected: bool,
+    pub reconnects_since_boot: u32,
+    pub connected_secs: u32,
+}
+
 /// One whole-site telemetry snapshot for a router (Transport A).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SiteTelemetryReport {
@@ -1157,6 +1165,58 @@ pub struct SiteTelemetryReport {
     pub ssids: Vec<SiteSsid>,
     pub clients: Vec<SiteClient>,
     pub uplink: SiteUplink,
+    pub control: SiteControlChannel,
+}
+
+/// Shared, interior-mutable control-channel health tracked by the control task
+/// and read by the site-telemetry poller. Lock-free (atomics). `on_established` /
+/// `on_disconnect` are called from the channel's `cp_state` callback.
+#[derive(Debug, Default)]
+pub struct ControlChannelHealth {
+    connected: std::sync::atomic::AtomicBool,
+    establishes: std::sync::atomic::AtomicU64, // total (re)establishes since boot
+    connected_at_unix: std::sync::atomic::AtomicI64,
+}
+
+impl ControlChannelHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+    /// Stream just came up.
+    pub fn on_established(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.connected.store(true, Relaxed);
+        self.establishes.fetch_add(1, Relaxed);
+        self.connected_at_unix.store(Self::now(), Relaxed);
+    }
+    /// Stream dropped.
+    pub fn on_disconnect(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.connected.store(false, Relaxed);
+        self.connected_at_unix.store(0, Relaxed);
+    }
+    /// Current snapshot for reporting.
+    pub fn snapshot(&self) -> SiteControlChannel {
+        use std::sync::atomic::Ordering::Relaxed;
+        let connected = self.connected.load(Relaxed);
+        let at = self.connected_at_unix.load(Relaxed);
+        let connected_secs = if connected && at > 0 {
+            (Self::now() - at).max(0) as u32
+        } else {
+            0
+        };
+        SiteControlChannel {
+            cp_connected: connected,
+            reconnects_since_boot: self.establishes.load(Relaxed).saturating_sub(1) as u32,
+            connected_secs,
+        }
+    }
 }
 
 /// Provision-subsystem errors (fail-OPEN: an error rolls back / leaves prior
