@@ -1109,6 +1109,8 @@ pub struct SiteSsid {
     pub channel: u32,
     pub fwd_pkts: u64,         // cumulative FORWARD packets from the bridge
     pub fwd_bytes: u64,        // cumulative FORWARD bytes (egress toward uplink)
+    pub ul_bytes: u64,         // cumulative bytes client->internet (bridge rx_bytes)
+    pub dl_bytes: u64,         // cumulative bytes internet->client (bridge tx_bytes)
 }
 
 /// One associated client on any SSID VIF. f64 rates ⇒ no `Eq`.
@@ -1123,6 +1125,7 @@ pub struct SiteClient {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub connected_secs: u32,
+    pub hostname: String,      // DHCP-lease hostname ("" if none)
 }
 
 /// Backup-SIM signal (`None` on the report = no modem present).

@@ -4,6 +4,16 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.28.0] — 2026-08-09
+
+### Added
+- **Per-SSID directional byte counters + client DHCP hostname** (site-telemetry
+  mockup parity). `SiteSsid` gains `ul_bytes`/`dl_bytes` (client→internet /
+  internet→client, read from the bridge's own `rx_bytes`/`tx_bytes` counters like
+  `net-report.sh`) so the dashboard can show ↓/↑ throughput per SSID and a
+  down/up chart toggle. `SiteClient` gains `hostname` (from the DHCP lease name)
+  so the clients table can show a device name, not just a MAC.
+
 ## [0.27.0] — 2026-08-09
 
 ### Fixed

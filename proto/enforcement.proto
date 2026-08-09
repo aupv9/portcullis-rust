@@ -115,6 +115,8 @@ message SiteSsid {
   uint32 channel       = 7; // primary channel (0 = unknown)
   uint64 fwd_pkts      = 8; // cumulative forwarded packets (FORWARD -i ifname)
   uint64 fwd_bytes     = 9; // cumulative forwarded bytes toward the uplink (egress)
+  uint64 ul_bytes      = 10; // cumulative bytes client->internet (bridge rx_bytes)
+  uint64 dl_bytes      = 11; // cumulative bytes internet->client (bridge tx_bytes)
 }
 
 message SiteClient {
@@ -127,6 +129,7 @@ message SiteClient {
   uint64 rx_bytes       = 7; // cumulative bytes from the client
   uint64 tx_bytes       = 8; // cumulative bytes to the client
   uint32 connected_secs = 9; // association age
+  string hostname       = 10; // DHCP-lease hostname ("" if none)
 }
 
 message SiteUplinkSim {

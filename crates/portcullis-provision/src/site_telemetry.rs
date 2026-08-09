@@ -114,7 +114,7 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
         for vif in &vifs {
             for st in parse_station_dump(&run_text(runner, "iw", &["dev", vif, "station", "dump"]).await) {
                 client_count += 1;
-                let ip = leases.get(&st.mac).cloned().unwrap_or_default();
+                let (ip, hostname) = leases.get(&st.mac).cloned().unwrap_or_default();
                 clients.push(SiteClient {
                     mac: st.mac,
                     ssid_ifname: ifname.clone(),
@@ -125,11 +125,16 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
                     rx_bytes: st.rx_bytes,
                     tx_bytes: st.tx_bytes,
                     connected_secs: st.connected_secs,
+                    hostname,
                 });
             }
         }
 
         let (fwd_pkts, fwd_bytes) = fwd.get(&ifname).copied().unwrap_or((0, 0));
+        // Per-SSID directional bytes from the bridge's own counters (like net-report):
+        // rx = client->internet (upload), tx = internet->client (download).
+        let ul_bytes = read_u64(runner, &format!("/sys/class/net/{ifname}/statistics/rx_bytes")).await;
+        let dl_bytes = read_u64(runner, &format!("/sys/class/net/{ifname}/statistics/tx_bytes")).await;
         let gated = gated_ifaces.contains(&ifname); // has a FORWARD -> wifihub_fwd jump
         ssids.push(SiteSsid {
             ifname,
@@ -141,6 +146,8 @@ pub async fn poll_once<R: CommandRunner>(runner: &R) -> SiteTelemetryReport {
             channel,
             fwd_pkts,
             fwd_bytes,
+            ul_bytes,
+            dl_bytes,
         });
     }
 
@@ -289,16 +296,23 @@ pub fn parse_forward_counters(text: &str) -> (BTreeMap<String, (u64, u64)>, BTre
     (fwd, gated)
 }
 
-/// Parse `/tmp/dhcp.leases` (`<expiry> <mac> <ip> <name> <id>`) into mac->ip.
-pub fn parse_leases(text: &str) -> BTreeMap<String, String> {
+/// Parse `/tmp/dhcp.leases` (`<expiry> <mac> <ip> <name> <id>`) into
+/// mac -> (ip, hostname). A `*`/absent name maps to "".
+pub fn parse_leases(text: &str) -> BTreeMap<String, (String, String)> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() >= 3 {
-            out.insert(f[1].to_ascii_lowercase(), f[2].to_string());
+            let host = f.get(3).copied().filter(|s| *s != "*").unwrap_or("").to_string();
+            out.insert(f[1].to_ascii_lowercase(), (f[2].to_string(), host));
         }
     }
     out
+}
+
+/// Read a single u64 from a `/sys` file (e.g. bridge byte counter). 0 on any error.
+async fn read_u64<R: CommandRunner>(runner: &R, path: &str) -> u64 {
+    run_text(runner, "cat", &[path]).await.trim().parse().unwrap_or(0)
 }
 
 /// Parse `mwan3 status` -> (wan_up, sim_up). Lines: "interface <name> is <state>".
@@ -520,8 +534,9 @@ Chain FORWARD (policy DROP 0 packets, 0 bytes)
 
     #[test]
     fn leases_and_uptime_and_channel() {
-        let l = parse_leases("1786000000 A4:83:E7:1C:22:9F 10.20.0.34 iPhone *\nbad\n1786 dc:0b:34:77:1e:02 10.20.0.51 gala *");
-        assert_eq!(l.get("a4:83:e7:1c:22:9f"), Some(&"10.20.0.34".to_string()));
+        let l = parse_leases("1786000000 A4:83:E7:1C:22:9F 10.20.0.34 iPhone *\nbad\n1786 dc:0b:34:77:1e:02 10.20.0.51 * *");
+        assert_eq!(l.get("a4:83:e7:1c:22:9f"), Some(&("10.20.0.34".to_string(), "iPhone".to_string())));
+        assert_eq!(l.get("dc:0b:34:77:1e:02"), Some(&("10.20.0.51".to_string(), String::new())));
         assert_eq!(l.len(), 2);
         assert_eq!(parse_uptime("42938.37 166407.14"), 42938);
         assert_eq!(parse_channel("\tssid Foo\n\tchannel 36 (5180 MHz)"), 36);
