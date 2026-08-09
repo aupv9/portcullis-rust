@@ -1169,13 +1169,20 @@ pub struct SiteTelemetryReport {
 }
 
 /// Shared, interior-mutable control-channel health tracked by the control task
-/// and read by the site-telemetry poller. Lock-free (atomics). `on_established` /
-/// `on_disconnect` are called from the channel's `cp_state` callback.
+/// and read by the site-telemetry poller. Uses a `Mutex` (NOT 64-bit atomics —
+/// `AtomicU64`/`AtomicI64` are unavailable on the mipsel target). `on_established`
+/// / `on_disconnect` are called from the channel's `cp_state` callback; the
+/// critical sections are tiny + never block.
 #[derive(Debug, Default)]
 pub struct ControlChannelHealth {
-    connected: std::sync::atomic::AtomicBool,
-    establishes: std::sync::atomic::AtomicU64, // total (re)establishes since boot
-    connected_at_unix: std::sync::atomic::AtomicI64,
+    inner: std::sync::Mutex<CtrlHealthInner>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CtrlHealthInner {
+    connected: bool,
+    establishes: u64, // total (re)establishes since boot
+    connected_at_unix: i64,
 }
 
 impl ControlChannelHealth {
@@ -1188,32 +1195,34 @@ impl ControlChannelHealth {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
     }
+    fn lock(&self) -> std::sync::MutexGuard<'_, CtrlHealthInner> {
+        // Recover from a poisoned lock rather than abort the engine (panic=abort).
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
     /// Stream just came up.
     pub fn on_established(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.connected.store(true, Relaxed);
-        self.establishes.fetch_add(1, Relaxed);
-        self.connected_at_unix.store(Self::now(), Relaxed);
+        let mut g = self.lock();
+        g.connected = true;
+        g.establishes += 1;
+        g.connected_at_unix = Self::now();
     }
     /// Stream dropped.
     pub fn on_disconnect(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.connected.store(false, Relaxed);
-        self.connected_at_unix.store(0, Relaxed);
+        let mut g = self.lock();
+        g.connected = false;
+        g.connected_at_unix = 0;
     }
     /// Current snapshot for reporting.
     pub fn snapshot(&self) -> SiteControlChannel {
-        use std::sync::atomic::Ordering::Relaxed;
-        let connected = self.connected.load(Relaxed);
-        let at = self.connected_at_unix.load(Relaxed);
-        let connected_secs = if connected && at > 0 {
-            (Self::now() - at).max(0) as u32
+        let g = self.lock();
+        let connected_secs = if g.connected && g.connected_at_unix > 0 {
+            (Self::now() - g.connected_at_unix).max(0) as u32
         } else {
             0
         };
         SiteControlChannel {
-            cp_connected: connected,
-            reconnects_since_boot: self.establishes.load(Relaxed).saturating_sub(1) as u32,
+            cp_connected: g.connected,
+            reconnects_since_boot: g.establishes.saturating_sub(1) as u32,
             connected_secs,
         }
     }
