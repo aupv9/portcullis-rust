@@ -22,15 +22,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portcullis_types::{
-    ControlChannelHealth, SiteClient, SiteSsid, SiteTelemetryReport, SiteUplink, SiteUplinkSim,
+    ControlChannelHealth, SiteClient, SiteHealth, SiteSsid, SiteTelemetryReport, SiteUplink,
+    SiteUplinkSim,
 };
 use tokio::sync::mpsc;
 
 use crate::runner::CommandRunner;
 
-/// Default site-telemetry cadence (~60 s). A slow site gauge; the shell-outs are
-/// cheap on the MIPS budget and a stale snapshot is worthless, so we do not go faster.
-pub const DEFAULT_SITE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
+/// Default LIGHT site-telemetry cadence (~20 s) — SSID/clients/bytes/airtime/health,
+/// all cheap reads. The expensive uplink probe (ping + curl) runs only every
+/// [`UPLINK_REFRESH_EVERY`] ticks (~60 s) and is cached in between, so the dashboard
+/// feels live without paying ping/curl every tick.
+pub const DEFAULT_SITE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Refresh the uplink probe (ping/curl/gsm) every Nth light tick (~60 s at 20 s).
+pub const UPLINK_REFRESH_EVERY: u32 = 3;
 
 /// Bound on the outward mpsc. Tiny: a full channel drops (a stale snapshot is
 /// worthless), never blocks the poll loop.
@@ -50,12 +56,20 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
 ) {
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Byte accounting is cumulative across ticks (conntrack is per-live-flow, not a
-    // monotonic counter), so the accumulator lives with the poller, not per-sweep.
+    // Byte accounting + airtime% are cumulative across ticks (conntrack is per-live-
+    // flow; survey times are since-boot), so their state lives with the poller.
     let mut acc = FlowByteAccumulator::new();
+    let mut survey = SurveyState::default();
+    // Cached uplink refreshed every UPLINK_REFRESH_EVERY ticks (ping/curl are slow).
+    let mut uplink = gather_uplink(runner.as_ref()).await;
+    let mut tick_n: u32 = 0;
     loop {
         tick.tick().await;
-        let mut report = poll_once(runner.as_ref(), &mut acc).await;
+        if tick_n != 0 && tick_n.is_multiple_of(UPLINK_REFRESH_EVERY) {
+            uplink = gather_uplink(runner.as_ref()).await;
+        }
+        tick_n = tick_n.wrapping_add(1);
+        let mut report = poll_once(runner.as_ref(), &mut acc, &mut survey, &uplink).await;
         report.control = health.snapshot();
         match tx.try_send(report) {
             Ok(()) => {}
@@ -83,6 +97,8 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
 pub async fn poll_once<R: CommandRunner>(
     runner: &R,
     acc: &mut FlowByteAccumulator,
+    survey: &mut SurveyState,
+    uplink: &SiteUplink,
 ) -> SiteTelemetryReport {
     let ts_unix = unix_now();
     let router_uptime_secs = parse_uptime(&run_text(runner, "cat", &["/proc/uptime"]).await);
@@ -106,12 +122,19 @@ pub async fn poll_once<R: CommandRunner>(
     // per-client-IP cumulative, and `subnets` attributes IPs to their SSID bridge.
     acc.ingest(&parse_conntrack(&run_text(runner, "cat", &["/proc/net/nf_conntrack"]).await));
     let subnets = parse_bridge_subnets(&network);
+    // DHCP pool size per bridge (uci dhcp .limit) + lease counts per subnet.
+    let dhcp = run_text(runner, "uci", &["-q", "show", "dhcp"]).await;
+    let dhcp_pools = parse_dhcp_pools(&dhcp, &network);
+    let leased_by_prefix = count_leases_by_prefix(&leases);
+
+    let health = gather_health(runner).await;
 
     let mut ssids: Vec<SiteSsid> = Vec::new();
     let mut clients: Vec<SiteClient> = Vec::new();
 
     for (ifname, name) in bridges {
         let vifs = list_bridge_vifs(runner, &ifname).await;
+        let first_vif = vifs.first().cloned();
 
         // on_air = at least one VIF operationally up. channel from the first VIF.
         let mut on_air = false;
@@ -167,6 +190,24 @@ pub async fn poll_once<R: CommandRunner>(
         let tx_errors = read_sys_u64(runner, &stat("tx_errors")).await;
         let tx_dropped = read_sys_u64(runner, &stat("tx_dropped")).await;
         let gated = gated_ifaces.contains(&ifname); // has a FORWARD -> wifihub_fwd jump
+
+        // Radio airtime busy% (delta since last poll) + noise, from the first VIF's
+        // survey; explains high client retries (congestion vs. router fault).
+        let (mut airtime_busy_pct, mut noise_dbm) = (0u32, 0i32);
+        if let Some(vif) = &first_vif {
+            let (active, busy, noise) =
+                parse_survey(&run_text(runner, "iw", &["dev", vif, "survey", "dump"]).await);
+            airtime_busy_pct = survey.delta_busy_pct(vif, active, busy);
+            noise_dbm = noise;
+        }
+        // DHCP pool fill for this SSID's subnet.
+        let dhcp_capacity = dhcp_pools.get(&ifname).copied().unwrap_or(0);
+        let dhcp_leased = subnets
+            .get(&ifname)
+            .and_then(|p| leased_by_prefix.get(p))
+            .copied()
+            .unwrap_or(0);
+
         ssids.push(SiteSsid {
             ifname,
             name,
@@ -183,13 +224,24 @@ pub async fn poll_once<R: CommandRunner>(
             rx_dropped,
             tx_errors,
             tx_dropped,
+            airtime_busy_pct,
+            noise_dbm,
+            dhcp_leased,
+            dhcp_capacity,
         });
     }
 
-    let uplink = gather_uplink(runner).await;
-
-    // control is filled by the poller from the shared ControlChannelHealth.
-    SiteTelemetryReport { ts_unix, router_uptime_secs, ssids, clients, uplink, control: Default::default() }
+    // control is filled by the poller from the shared ControlChannelHealth; uplink is
+    // the poller's cached probe (refreshed on a slower cadence).
+    SiteTelemetryReport {
+        ts_unix,
+        router_uptime_secs,
+        ssids,
+        clients,
+        uplink: uplink.clone(),
+        control: Default::default(),
+        health,
+    }
 }
 
 /// List a bridge's wireless VIF members from `/sys/class/net/<bridge>/brif`.
@@ -230,6 +282,26 @@ async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
         loss_pct,
         public_ip,
         sim,
+    }
+}
+
+/// Router system health via local sources (SNMP-equivalent, no snmpd): ubus for
+/// load+memory, df for persistent flash (/overlay), gsmctl for modem temp. Fail-soft.
+/// MT7621 exposes no CPU/board thermal sensor, so only the modem temp is available.
+async fn gather_health<R: CommandRunner>(runner: &R) -> SiteHealth {
+    let (cpu_load1, cpu_load5, cpu_load15, mem_total, mem_available) =
+        parse_system_info(&run_text(runner, "ubus", &["call", "system", "info"]).await);
+    let (flash_total, flash_free) = parse_df_overlay(&run_text(runner, "df", &["-k"]).await);
+    let modem_temp_dc = run_text(runner, "gsmctl", &["-c"]).await.trim().parse().unwrap_or(0);
+    SiteHealth {
+        cpu_load1,
+        cpu_load5,
+        cpu_load15,
+        mem_total,
+        mem_available,
+        flash_total,
+        flash_free,
+        modem_temp_dc,
     }
 }
 
@@ -522,6 +594,130 @@ fn ipv4_24_prefix(ip: &str) -> Option<String> {
 /// boundary-safe (won't match "10.21.05.x").
 fn ip_in_prefix(ip: &str, prefix: &str) -> bool {
     ip.strip_prefix(prefix).map(|r| r.starts_with('.')).unwrap_or(false)
+}
+
+/// Parse `ubus call system info` -> (load1, load5, load15, mem_total, mem_available).
+/// ubus load values are fixed-point ×65536 (12608 => 0.19). Bytes for memory.
+pub fn parse_system_info(json: &str) -> (f64, f64, f64, u64, u64) {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return (0.0, 0.0, 0.0, 0, 0),
+    };
+    let ld = |i| v.get("load").and_then(|l| l.get(i)).and_then(|x| x.as_f64()).map(|f| f / 65536.0).unwrap_or(0.0);
+    let mem = |k| v.get("memory").and_then(|m| m.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
+    (ld(0), ld(1), ld(2), mem("total"), mem("available"))
+}
+
+/// Parse `df -k` -> (total_bytes, free_bytes) for the persistent `/overlay` mount.
+/// Columns: Filesystem 1K-blocks Used Available Use% Mounted (read from the end).
+pub fn parse_df_overlay(text: &str) -> (u64, u64) {
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.last() == Some(&"/overlay") && f.len() >= 6 {
+            let total = f[f.len() - 5].parse::<u64>().unwrap_or(0);
+            let avail = f[f.len() - 3].parse::<u64>().unwrap_or(0);
+            return (total * 1024, avail * 1024);
+        }
+    }
+    (0, 0)
+}
+
+/// Parse `iw dev <vif> survey dump` -> (active_ms, busy_ms, noise_dbm) for the
+/// in-use channel (cumulative times since boot; caller deltas them).
+pub fn parse_survey(text: &str) -> (u64, u64, i32) {
+    let (mut active, mut busy, mut noise) = (0u64, 0u64, 0i32);
+    let mut in_use = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("frequency:") {
+            in_use = t.contains("[in use]");
+            continue;
+        }
+        if !in_use {
+            continue;
+        }
+        if let Some(r) = t.strip_prefix("noise:") {
+            noise = r.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        } else if let Some(r) = t.strip_prefix("channel active time:") {
+            active = r.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        } else if let Some(r) = t.strip_prefix("channel busy time:") {
+            busy = r.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+    }
+    (active, busy, noise)
+}
+
+/// Per-VIF last survey sample, so the poller can report the busy% over the interval
+/// (the raw times are cumulative since boot).
+#[derive(Default)]
+pub struct SurveyState {
+    last: BTreeMap<String, (u64, u64)>, // vif -> (active_ms, busy_ms)
+}
+
+impl SurveyState {
+    /// busy% (0..100) over the interval since the last sample of this VIF. Returns 0
+    /// on the first sample (baseline) or if the counters did not advance / reset.
+    pub fn delta_busy_pct(&mut self, vif: &str, active: u64, busy: u64) -> u32 {
+        let prev = self.last.insert(vif.to_string(), (active, busy));
+        let (la, lb) = match prev {
+            Some(p) => p,
+            None => return 0, // first sample = baseline, no spike
+        };
+        if active <= la || busy < lb {
+            return 0; // no advance / counter reset
+        }
+        let da = active - la;
+        let db = busy - lb;
+        if da == 0 {
+            return 0;
+        }
+        ((db.saturating_mul(100)) / da).min(100) as u32
+    }
+}
+
+/// Parse `uci show dhcp` + `uci show network` -> (br-ss* bridge -> DHCP pool size),
+/// via dhcp `.interface`(network name) + `.limit`, joined to network `.device`.
+pub fn parse_dhcp_pools(dhcp: &str, network: &str) -> BTreeMap<String, u32> {
+    let mut iface_of: BTreeMap<String, String> = BTreeMap::new(); // dhcp section -> netname
+    let mut limit_of: BTreeMap<String, u32> = BTreeMap::new(); // dhcp section -> limit
+    for line in dhcp.lines() {
+        let Some(rest) = line.strip_prefix("dhcp.") else { continue };
+        if let Some((s, v)) = rest.split_once(".interface=") {
+            iface_of.insert(s.to_string(), unquote(v));
+        } else if let Some((s, v)) = rest.split_once(".limit=") {
+            if let Ok(n) = unquote(v).parse() {
+                limit_of.insert(s.to_string(), n);
+            }
+        }
+    }
+    let mut dev_of: BTreeMap<String, String> = BTreeMap::new(); // netname -> device
+    for line in network.lines() {
+        if let Some(rest) = line.strip_prefix("network.") {
+            if let Some((s, v)) = rest.split_once(".device=") {
+                dev_of.insert(s.to_string(), unquote(v));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (sect, netname) in &iface_of {
+        if let (Some(limit), Some(dev)) = (limit_of.get(sect), dev_of.get(netname)) {
+            if dev.starts_with("br-ss") {
+                out.insert(dev.clone(), *limit);
+            }
+        }
+    }
+    out
+}
+
+/// Count active DHCP leases per /24 prefix (from parsed leases).
+fn count_leases_by_prefix(leases: &BTreeMap<String, (String, String)>) -> BTreeMap<String, u32> {
+    let mut out: BTreeMap<String, u32> = BTreeMap::new();
+    for (ip, _host) in leases.values() {
+        if let Some(pre) = ipv4_24_prefix(ip) {
+            *out.entry(pre).or_insert(0) += 1;
+        }
+    }
+    out
 }
 
 /// One parsed `/proc/net/nf_conntrack` IPv4 tcp/udp flow. Each line carries two
@@ -876,5 +1072,65 @@ network.pc_win_if.ipaddr='10.21.0.1'";
         // Subnet sum includes only 10.21.0.x (upload 150, download 1300); 10.99.* excluded.
         assert_eq!(acc.subnet_bytes("10.21.0"), (150, 1300));
         assert_eq!(acc.client("10.21.0.41"), (100, 900));
+    }
+
+    #[test]
+    fn system_info_parses_load_and_memory() {
+        let j = r#"{"uptime":74522,"load":[12608,13440,11840],"memory":{"total":253820928,"free":119619584,"available":127864832}}"#;
+        let (l1, l5, l15, total, avail) = parse_system_info(j);
+        assert!((l1 - 0.1924).abs() < 0.001); // 12608/65536
+        assert!((l5 - 0.2051).abs() < 0.001);
+        assert!((l15 - 0.1807).abs() < 0.001);
+        assert_eq!(total, 253820928);
+        assert_eq!(avail, 127864832);
+        assert_eq!(parse_system_info("not json"), (0.0, 0.0, 0.0, 0, 0));
+    }
+
+    #[test]
+    fn df_overlay_parses_persistent_mount_only() {
+        let text = "\
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/root                22016     22016         0 100% /
+tmpfs                   123936      3792    120144   3% /tmp
+/dev/ubi0_2              85096     14172     66540  18% /overlay
+overlay                  85096     14172     66540  18% /etc";
+        assert_eq!(parse_df_overlay(text), (85096 * 1024, 66540 * 1024));
+    }
+
+    #[test]
+    fn survey_parses_in_use_channel_only() {
+        let text = "\
+Survey data from wlan0-D-3
+\tfrequency:\t\t\t2412 MHz
+\tnoise:\t\t\t\t-100 dBm
+\tchannel active time:\t\t999 ms
+Survey data from wlan0-D-3
+\tfrequency:\t\t\t2462 MHz [in use]
+\tnoise:\t\t\t\t-90 dBm
+\tchannel active time:\t\t76172369 ms
+\tchannel busy time:\t\t13149124 ms";
+        assert_eq!(parse_survey(text), (76172369, 13149124, -90));
+    }
+
+    #[test]
+    fn survey_state_deltas_busy_pct() {
+        let mut s = SurveyState::default();
+        assert_eq!(s.delta_busy_pct("w0", 1000, 100), 0); // first = baseline
+        assert_eq!(s.delta_busy_pct("w0", 2000, 600), 50); // +500 busy / +1000 active
+        assert_eq!(s.delta_busy_pct("w0", 1500, 300), 0); // counter reset -> 0
+    }
+
+    #[test]
+    fn dhcp_pools_map_bridge_to_limit() {
+        let dhcp = "\
+dhcp.pc_win=dhcp
+dhcp.pc_win.interface='pc_win_if'
+dhcp.pc_win.start='10'
+dhcp.pc_win.limit='200'";
+        let network = "\
+network.pc_win_if=interface
+network.pc_win_if.device='br-ss2'";
+        let pools = parse_dhcp_pools(dhcp, network);
+        assert_eq!(pools.get("br-ss2"), Some(&200u32));
     }
 }

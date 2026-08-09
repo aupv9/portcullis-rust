@@ -426,6 +426,16 @@ pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetry
             reconnects_since_boot: r.control.reconnects_since_boot,
             connected_secs: r.control.connected_secs,
         }),
+        health: Some(pb::SiteHealth {
+            cpu_load1: r.health.cpu_load1,
+            cpu_load5: r.health.cpu_load5,
+            cpu_load15: r.health.cpu_load15,
+            mem_total: r.health.mem_total,
+            mem_available: r.health.mem_available,
+            flash_total: r.health.flash_total,
+            flash_free: r.health.flash_free,
+            modem_temp_dc: r.health.modem_temp_dc,
+        }),
     }
 }
 
@@ -446,6 +456,10 @@ fn site_ssid_to_pb(s: &SiteSsid) -> pb::SiteSsid {
         rx_dropped: s.rx_dropped,
         tx_errors: s.tx_errors,
         tx_dropped: s.tx_dropped,
+        airtime_busy_pct: s.airtime_busy_pct,
+        noise_dbm: s.noise_dbm,
+        dhcp_leased: s.dhcp_leased,
+        dhcp_capacity: s.dhcp_capacity,
     }
 }
 

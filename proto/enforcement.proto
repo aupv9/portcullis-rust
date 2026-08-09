@@ -121,6 +121,10 @@ message SiteSsid {
   uint64 rx_dropped    = 13; // evidence (~0 when the router is healthy)
   uint64 tx_errors     = 14;
   uint64 tx_dropped    = 15;
+  uint32 airtime_busy_pct = 16; // radio airtime busy % (0..100, delta) — congestion
+  int32  noise_dbm        = 17; // channel noise floor (0 = n/a)
+  uint32 dhcp_leased      = 18; // active leases in the subnet
+  uint32 dhcp_capacity    = 19; // DHCP pool size (0 = unknown)
 }
 
 message SiteClient {
@@ -164,6 +168,19 @@ message SiteControlChannel {
   uint32 connected_secs        = 3; // uptime of the CURRENT connection (0 if down)
 }
 
+// Router system health (read locally via ubus/df/gsmctl — SNMP-equivalent). Gauges,
+// not counters, so unaffected by hardware flow offload.
+message SiteHealth {
+  double cpu_load1      = 1;
+  double cpu_load5      = 2;
+  double cpu_load15     = 3;
+  uint64 mem_total      = 4; // bytes
+  uint64 mem_available  = 5; // bytes
+  uint64 flash_total    = 6; // bytes (persistent /overlay)
+  uint64 flash_free     = 7; // bytes
+  int32  modem_temp_dc  = 8; // deci-°C (390 = 39.0°C); 0 = n/a (no CPU sensor on MT7621)
+}
+
 // One whole-site snapshot for a router, pushed unsolicited as
 // EngineFrame.site_telemetry.
 message SiteTelemetryReport {
@@ -173,6 +190,7 @@ message SiteTelemetryReport {
   repeated SiteClient clients = 4;
   SiteUplink          uplink  = 5;
   SiteControlChannel  control = 6; // engine<->CP dial health
+  SiteHealth          health  = 7; // router CPU/RAM/flash/temp
 }
 
 // control plane -> engine. `correlation_id` is echoed back in the answering

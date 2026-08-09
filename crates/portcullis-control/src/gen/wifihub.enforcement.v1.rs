@@ -162,6 +162,18 @@ pub struct SiteSsid {
     pub tx_errors: u64,
     #[prost(uint64, tag="15")]
     pub tx_dropped: u64,
+    /// radio airtime busy % (0..100, delta) — congestion
+    #[prost(uint32, tag="16")]
+    pub airtime_busy_pct: u32,
+    /// channel noise floor (0 = n/a)
+    #[prost(int32, tag="17")]
+    pub noise_dbm: i32,
+    /// active leases in the subnet
+    #[prost(uint32, tag="18")]
+    pub dhcp_leased: u32,
+    /// DHCP pool size (0 = unknown)
+    #[prost(uint32, tag="19")]
+    pub dhcp_capacity: u32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -251,6 +263,33 @@ pub struct SiteControlChannel {
     #[prost(uint32, tag="3")]
     pub connected_secs: u32,
 }
+/// Router system health (read locally via ubus/df/gsmctl — SNMP-equivalent). Gauges,
+/// not counters, so unaffected by hardware flow offload.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SiteHealth {
+    #[prost(double, tag="1")]
+    pub cpu_load1: f64,
+    #[prost(double, tag="2")]
+    pub cpu_load5: f64,
+    #[prost(double, tag="3")]
+    pub cpu_load15: f64,
+    /// bytes
+    #[prost(uint64, tag="4")]
+    pub mem_total: u64,
+    /// bytes
+    #[prost(uint64, tag="5")]
+    pub mem_available: u64,
+    /// bytes (persistent /overlay)
+    #[prost(uint64, tag="6")]
+    pub flash_total: u64,
+    /// bytes
+    #[prost(uint64, tag="7")]
+    pub flash_free: u64,
+    /// deci-°C (390 = 39.0°C); 0 = n/a (no CPU sensor on MT7621)
+    #[prost(int32, tag="8")]
+    pub modem_temp_dc: i32,
+}
 /// One whole-site snapshot for a router, pushed unsolicited as
 /// EngineFrame.site_telemetry.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -270,6 +309,9 @@ pub struct SiteTelemetryReport {
     /// engine<->CP dial health
     #[prost(message, optional, tag="6")]
     pub control: ::core::option::Option<SiteControlChannel>,
+    /// router CPU/RAM/flash/temp
+    #[prost(message, optional, tag="7")]
+    pub health: ::core::option::Option<SiteHealth>,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.

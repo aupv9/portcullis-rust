@@ -4,6 +4,25 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.32.0] — 2026-08-09
+
+### Added
+- **Router health, radio airtime, and DHCP pool in site telemetry** (SNMP-equivalent
+  metrics, read locally — no snmpd, offload-independent gauges):
+  - `SiteHealth` block: CPU load (1/5/15), RAM total/available, persistent flash
+    (`/overlay`) total/free, modem temperature — from `ubus system info`, `df`,
+    `gsmctl -c`. (MT7621 has no CPU/board thermal sensor, so only modem temp.)
+  - `SiteSsid` += `airtime_busy_pct` (radio busy %, delta-based — explains why client
+    retries are high: congestion vs. router fault) + `noise_dbm`, from
+    `iw dev <vif> survey dump`; plus `dhcp_leased` / `dhcp_capacity` (pool fill).
+
+### Changed
+- **Split poll cadence for a livelier dashboard.** The light snapshot (SSID / clients
+  / bytes / airtime / health) now emits every ~20 s (`DEFAULT_SITE_TELEMETRY_INTERVAL`
+  60 s → 20 s); the expensive uplink probe (ping + curl) runs only every
+  `UPLINK_REFRESH_EVERY` (3) ticks (~60 s) and is cached in between — so throughput/
+  clients feel live without paying ping/curl each tick.
+
 ## [0.31.0] — 2026-08-09
 
 ### Added
