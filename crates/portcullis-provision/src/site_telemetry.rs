@@ -113,6 +113,9 @@ pub async fn poll_once<R: CommandRunner>(
         parse_forward_counters(&run_text(runner, "iptables", &["-nvxL", "FORWARD"]).await);
     let auth_present = runner.run("ipset", &["list", "wifihub_auth"]).await.is_ok();
     let leases = parse_leases(&run_text(runner, "cat", &["/tmp/dhcp.leases"]).await);
+    // ARP/neighbour table — resolves the IP of clients with a STATIC IP (no DHCP
+    // lease), e.g. IoT devices. Without this they falsely show "no IP" on the tab.
+    let neigh = parse_neigh(&run_text(runner, "ip", &["neigh"]).await);
 
     // Byte accounting from conntrack. The bridge `/sys` and `iw station dump` byte
     // counters MISS hardware-offloaded traffic on MT7621 (flow_offloading_hw) — the
@@ -154,7 +157,14 @@ pub async fn poll_once<R: CommandRunner>(
         for vif in &vifs {
             for st in parse_station_dump(&run_text(runner, "iw", &["dev", vif, "station", "dump"]).await) {
                 client_count += 1;
-                let (ip, hostname) = leases.get(&st.mac).cloned().unwrap_or_default();
+                let (mut ip, hostname) = leases.get(&st.mac).cloned().unwrap_or_default();
+                // No DHCP lease? Fall back to the ARP table (static-IP devices have a
+                // neighbour entry but no lease) so they aren't flagged "chưa có IP".
+                if ip.is_empty() {
+                    if let Some(nip) = neigh.get(&st.mac) {
+                        ip = nip.clone();
+                    }
+                }
                 // Bytes from conntrack (offload-aware), keyed by the leased IP —
                 // station-dump byte counters miss HW-offloaded traffic. Preserve the
                 // field meaning: rx_bytes = upload (client→net), tx_bytes = download.
@@ -424,6 +434,36 @@ pub fn parse_leases(text: &str) -> BTreeMap<String, (String, String)> {
         if f.len() >= 3 {
             let host = f.get(3).copied().filter(|s| *s != "*").unwrap_or("").to_string();
             out.insert(f[1].to_ascii_lowercase(), (f[2].to_string(), host));
+        }
+    }
+    out
+}
+
+/// Parse `ip neigh` into mac -> IPv4, for clients that have an IP but no DHCP lease
+/// (static-IP devices). Line: `<ip> dev <if> lladdr <mac> <STATE>`. Only IPv4 entries
+/// in a usable state (REACHABLE/STALE/DELAY/PROBE/PERMANENT) with an lladdr; REACHABLE
+/// wins over a staler duplicate. Skips FAILED/INCOMPLETE/NOARP (no valid binding).
+pub fn parse_neigh(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let ip = f[0];
+        if !ip.contains('.') || ip.contains(':') {
+            continue; // IPv4 only
+        }
+        let Some(li) = f.iter().position(|&t| t == "lladdr") else { continue };
+        let Some(mac) = f.get(li + 1).map(|m| m.to_ascii_lowercase()) else { continue };
+        let state = f.last().copied().unwrap_or("");
+        if !matches!(state, "REACHABLE" | "STALE" | "DELAY" | "PROBE" | "PERMANENT") {
+            continue;
+        }
+        if state == "REACHABLE" {
+            out.insert(mac, ip.to_string()); // freshest binding wins
+        } else {
+            out.entry(mac).or_insert_with(|| ip.to_string());
         }
     }
     out
@@ -1132,5 +1172,18 @@ network.pc_win_if=interface
 network.pc_win_if.device='br-ss2'";
         let pools = parse_dhcp_pools(dhcp, network);
         assert_eq!(pools.get("br-ss2"), Some(&200u32));
+    }
+
+    #[test]
+    fn neigh_resolves_static_ip_lowercased_skips_ipv6_and_no_lladdr() {
+        let text = "\
+10.21.0.171 dev br-ss2 lladdr 96:22:95:06:f8:d7 STALE
+10.22.0.87 dev br-ss3 lladdr F6:83:90:06:19:CB REACHABLE
+fe80::1 dev br-ss2 lladdr aa:bb:cc:dd:ee:ff STALE
+10.21.0.9 dev br-ss2  FAILED";
+        let n = parse_neigh(text);
+        assert_eq!(n.get("96:22:95:06:f8:d7"), Some(&"10.21.0.171".to_string()));
+        assert_eq!(n.get("f6:83:90:06:19:cb"), Some(&"10.22.0.87".to_string())); // MAC lowercased
+        assert_eq!(n.len(), 2); // ipv6 + no-lladdr(FAILED) skipped
     }
 }

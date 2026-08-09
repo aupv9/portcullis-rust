@@ -4,6 +4,20 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.33.0] — 2026-08-09
+
+### Fixed
+- **Static-IP clients no longer show "no IP".** A client's IP was resolved only from
+  `/tmp/dhcp.leases`, so a device with a STATIC IP (no lease — common for IoT, e.g. a
+  fleet-wide device at 10.21.0.171 on the "iot" SSID) was reported with `ip=""` and
+  flagged "chưa có IP" on the dashboard, even though it had a working IP (visible in
+  the ARP table). `poll_once` now falls back to `ip neigh` (`parse_neigh`) when there
+  is no lease: a MAC with a usable neighbour entry (REACHABLE/STALE/DELAY/PROBE/
+  PERMANENT) takes that IP. Engine-only; the wire contract (`SiteClient.ip`) is
+  unchanged, so the "chưa có IP" count now reflects only genuinely IP-less devices
+  (real DHCP failure / mid-handshake). Bonus: their conntrack per-client bytes now
+  resolve too.
+
 ## [0.32.0] — 2026-08-09
 
 ### Added
