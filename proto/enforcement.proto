@@ -115,8 +115,12 @@ message SiteSsid {
   uint32 channel       = 7; // primary channel (0 = unknown)
   uint64 fwd_pkts      = 8; // cumulative forwarded packets (FORWARD -i ifname)
   uint64 fwd_bytes     = 9; // cumulative forwarded bytes toward the uplink (egress)
-  uint64 ul_bytes      = 10; // cumulative bytes client->internet (bridge rx_bytes)
-  uint64 dl_bytes      = 11; // cumulative bytes internet->client (bridge tx_bytes)
+  uint64 ul_bytes      = 10; // cumulative bytes client->internet (conntrack)
+  uint64 dl_bytes      = 11; // cumulative bytes internet->client (conntrack)
+  uint64 rx_errors     = 12; // bridge netdev reliability counters — router-side drop
+  uint64 rx_dropped    = 13; // evidence (~0 when the router is healthy)
+  uint64 tx_errors     = 14;
+  uint64 tx_dropped    = 15;
 }
 
 message SiteClient {
@@ -130,6 +134,8 @@ message SiteClient {
   uint64 tx_bytes       = 8; // cumulative bytes to the client
   uint32 connected_secs = 9; // association age
   string hostname       = 10; // DHCP-lease hostname ("" if none)
+  uint64 tx_retries     = 11; // 802.11 retransmit attempts (RF/congestion evidence)
+  uint64 tx_failed      = 12; // frames given up after retries
 }
 
 message SiteUplinkSim {

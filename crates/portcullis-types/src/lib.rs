@@ -1109,8 +1109,14 @@ pub struct SiteSsid {
     pub channel: u32,
     pub fwd_pkts: u64,         // cumulative FORWARD packets from the bridge
     pub fwd_bytes: u64,        // cumulative FORWARD bytes (egress toward uplink)
-    pub ul_bytes: u64,         // cumulative bytes client->internet (bridge rx_bytes)
-    pub dl_bytes: u64,         // cumulative bytes internet->client (bridge tx_bytes)
+    pub ul_bytes: u64,         // cumulative bytes client->internet (conntrack)
+    pub dl_bytes: u64,         // cumulative bytes internet->client (conntrack)
+    // Per-SSID bridge reliability counters (netdev /sys). Evidence that the router
+    // itself is (not) dropping traffic on this SSID — usually ~0 when healthy.
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
 }
 
 /// One associated client on any SSID VIF. f64 rates ⇒ no `Eq`.
@@ -1126,6 +1132,10 @@ pub struct SiteClient {
     pub tx_bytes: u64,
     pub connected_secs: u32,
     pub hostname: String,      // DHCP-lease hostname ("" if none)
+    // 802.11 delivery quality (from station dump) — the real WiFi evidence: retries
+    // and give-ups are RF/coverage/congestion signals, offload-independent.
+    pub tx_retries: u64,
+    pub tx_failed: u64,
 }
 
 /// Backup-SIM signal (`None` on the report = no modem present).
