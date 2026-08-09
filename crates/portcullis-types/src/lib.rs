@@ -1090,6 +1090,72 @@ pub struct WirelessDeviceReport {
     pub ts_unix: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Whole-site telemetry (Transport A). The site-telemetry poller builds one
+// snapshot per tick (SSID on-air/gate/egress + per-client + uplink);
+// `portcullis-control` maps it to `pb::SiteTelemetryReport` and fans it into an
+// unsolicited `EngineFrame`. Purely observational.
+// ---------------------------------------------------------------------------
+
+/// One SSID's site-telemetry row, keyed by its owned bridge iface.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteSsid {
+    pub ifname: String,        // owned bridge, e.g. "br-ss1"
+    pub name: String,          // advertised SSID name
+    pub on_air: bool,          // >=1 VIF operationally up
+    pub gated: bool,           // captive-gated (desired posture)
+    pub gate_enforced: bool,   // gate actually scoped to the bridge (live)
+    pub client_count: u32,
+    pub channel: u32,
+    pub fwd_pkts: u64,         // cumulative FORWARD packets from the bridge
+    pub fwd_bytes: u64,        // cumulative FORWARD bytes (egress toward uplink)
+}
+
+/// One associated client on any SSID VIF. f64 rates ⇒ no `Eq`.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SiteClient {
+    pub mac: String,
+    pub ssid_ifname: String,   // owning bridge
+    pub ip: String,            // "" = associated but no DHCP lease
+    pub signal_dbm: i32,
+    pub tx_rate_mbps: f64,
+    pub rx_rate_mbps: f64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub connected_secs: u32,
+}
+
+/// Backup-SIM signal (`None` on the report = no modem present).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteUplinkSim {
+    pub operator: String,
+    pub rsrp: i32,
+    pub sinr: i32,
+}
+
+/// Site uplink / Internet reachability. f64 ⇒ no `Eq`.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SiteUplink {
+    pub active_wan: String,        // "wan" | "sim" | iface label
+    pub wan_up: bool,
+    pub sim_up: bool,
+    pub internet_reachable: bool,
+    pub latency_ms: f64,
+    pub loss_pct: f64,
+    pub public_ip: String,
+    pub sim: Option<SiteUplinkSim>,
+}
+
+/// One whole-site telemetry snapshot for a router (Transport A).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SiteTelemetryReport {
+    pub ts_unix: i64,
+    pub router_uptime_secs: u32,
+    pub ssids: Vec<SiteSsid>,
+    pub clients: Vec<SiteClient>,
+    pub uplink: SiteUplink,
+}
+
 /// Provision-subsystem errors (fail-OPEN: an error rolls back / leaves prior
 /// config, never drops an enforced client).
 #[derive(Debug, thiserror::Error)]

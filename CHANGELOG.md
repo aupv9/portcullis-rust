@@ -4,6 +4,24 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.26.0] — 2026-08-09
+
+### Added
+- **Whole-site telemetry poller (Transport A — engine-native "Giám sát trực tiếp").**
+  A new isolated, read-only task (`portcullis-provision::site_telemetry`) polls the
+  site every ~60 s and pushes ONE `SiteTelemetryReport` up the control channel
+  (unsolicited `EngineFrame.site_telemetry`): per-SSID on-air / gated / gate-enforced
+  / client-count / channel / cumulative FORWARD egress counters, one row per
+  associated client (signal / PHY rates / byte counters / association age / DHCP IP),
+  and site uplink (active WAN vs SIM, Internet reachability + latency/loss, public IP,
+  backup-SIM signal). SSIDs are enumerated from the committed desired-state; all
+  collection goes through the `CommandRunner` seam (`iw` / `iptables` / `ubus` /
+  `mwan3` / `ping`) with host-unit-tested pure parsers. Purely observational — it
+  reads only and never writes wireless config or touches enforcement. The control
+  plane stores the latest snapshot + a 24 h history and derives per-SSID uptime% /
+  liveness for the admin monitoring tab. Cut from 0.24.4 (carries the tier-2
+  control-channel keepalive/watchdog fix).
+
 ## [0.24.2] — 2026-07-29
 
 ### Changed

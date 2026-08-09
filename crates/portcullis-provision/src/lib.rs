@@ -38,11 +38,15 @@ pub mod device_obs;
 pub mod handle;
 pub mod liveness;
 pub mod runner;
+pub mod site_telemetry;
 pub mod sm;
 pub mod uci;
 
 pub use device_obs::{
     run_device_obs_poller, AssocEntry, DEFAULT_DEVICE_POLL_INTERVAL, DEVICE_REPORT_BUFFER,
+};
+pub use site_telemetry::{
+    run_site_telemetry_poller, DEFAULT_SITE_TELEMETRY_INTERVAL, SITE_TELEMETRY_BUFFER,
 };
 pub use handle::{
     run_provision_subsystem, run_provision_subsystem_with_policy,

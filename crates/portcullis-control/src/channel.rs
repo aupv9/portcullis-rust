@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures::SinkExt;
 use portcullis_types::{
     Deauthenticator, EngineControl, Enforcer, ProvisionState, Provisioner, RulesetWriter,
-    SessionEvent, WirelessDeviceReport, WirelessLiveness, WirelessStatus,
+    SessionEvent, SiteTelemetryReport, WirelessDeviceReport, WirelessLiveness, WirelessStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::transport::ClientTlsConfig;
@@ -127,6 +127,7 @@ pub async fn run<F>(
     mut wireless_status: mpsc::Receiver<WirelessStatus>,
     mut liveness: mpsc::Receiver<WirelessLiveness>,
     mut device_reports: mpsc::Receiver<WirelessDeviceReport>,
+    mut site_telemetry: mpsc::Receiver<SiteTelemetryReport>,
     cp_state: F,
 ) where
     F: Fn(bool) + Send + Sync,
@@ -149,6 +150,7 @@ pub async fn run<F>(
             &mut wireless_status,
             &mut liveness,
             &mut device_reports,
+            &mut site_telemetry,
             &cp_state,
             &mut established,
         )
@@ -190,6 +192,7 @@ async fn connect_once<F>(
     wireless_status: &mut mpsc::Receiver<WirelessStatus>,
     liveness: &mut mpsc::Receiver<WirelessLiveness>,
     device_reports: &mut mpsc::Receiver<WirelessDeviceReport>,
+    site_telemetry: &mut mpsc::Receiver<SiteTelemetryReport>,
     cp_state: &F,
     established: &mut bool,
 ) -> portcullis_types::Result<()>
@@ -318,6 +321,21 @@ where
                 }
                 None => {
                     tracing::debug!("device-report channel closed; stopping device fan-out");
+                    std::future::pending::<()>().await;
+                }
+            },
+            st = site_telemetry.recv() => match st {
+                Some(report) => {
+                    // Transport A whole-site telemetry: purely observational.
+                    // Unsolicited (correlation_id 0); the CP stores the latest
+                    // snapshot + a 24h history. Never touches enforcement.
+                    let f = frame(0, engine_frame::Msg::SiteTelemetry(convert::site_telemetry_report_to_pb(&report)));
+                    if out_tx.send(f).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    tracing::debug!("site-telemetry channel closed; stopping site fan-out");
                     std::future::pending::<()>().await;
                 }
             },

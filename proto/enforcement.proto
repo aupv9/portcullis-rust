@@ -72,6 +72,7 @@ message EngineFrame {
     WirelessConfig  wireless_config  = 12; // reply to ControlFrame.get_wireless_config (keys REDACTED)
     WirelessLiveness wireless_liveness = 13; // on-air SSID liveness (P5); unsolicited, periodic poll of gated VIFs
     WirelessDeviceReport wireless_devices = 14; // per-device telemetry (P3 device monitoring); unsolicited, ~30s poll of device VIFs
+    SiteTelemetryReport  site_telemetry   = 16; // whole-site telemetry (SSID/client/uplink); unsolicited, ~30-60s poll (Transport A)
   }
 }
 
@@ -95,6 +96,64 @@ message DeviceObservation {
 message WirelessDeviceReport {
   repeated DeviceObservation devices = 1;
   int64 ts_unix = 2; // engine wall-clock (unix seconds) at sample
+}
+
+// ---------------------------------------------------------------------------
+// Whole-site telemetry (Transport A — engine-native "Giám sát trực tiếp"). The
+// engine polls SSID on-air/gate/egress + per-client + uplink (~30-60s) and pushes
+// one snapshot up unsolicited as EngineFrame.site_telemetry. Purely observational.
+// The CP stores the latest snapshot + a 24h history and derives per-SSID
+// uptime%/liveness for the admin monitoring tab.
+// ---------------------------------------------------------------------------
+message SiteSsid {
+  string ifname        = 1; // bridge iface, e.g. "br-ss1"
+  string name          = 2; // advertised SSID name
+  bool   on_air        = 3; // at least one VIF up (hostapd broadcasting)
+  bool   gated         = 4; // captive-gated SSID
+  bool   gate_enforced = 5; // gate actually scoped to this bridge (live)
+  uint32 client_count  = 6; // associated stations across the bridge's VIFs
+  uint32 channel       = 7; // primary channel (0 = unknown)
+  uint64 fwd_pkts      = 8; // cumulative forwarded packets (FORWARD -i ifname)
+  uint64 fwd_bytes     = 9; // cumulative forwarded bytes toward the uplink (egress)
+}
+
+message SiteClient {
+  string mac            = 1; // station MAC (lowercase)
+  string ssid_ifname    = 2; // bridge it is associated on
+  string ip             = 3; // DHCP-leased IP, "" = associated but no lease
+  int32  signal_dbm     = 4;
+  double tx_rate_mbps   = 5; // AP->client PHY rate
+  double rx_rate_mbps   = 6; // client->AP PHY rate
+  uint64 rx_bytes       = 7; // cumulative bytes from the client
+  uint64 tx_bytes       = 8; // cumulative bytes to the client
+  uint32 connected_secs = 9; // association age
+}
+
+message SiteUplinkSim {
+  string operator = 1;
+  int32  rsrp     = 2;
+  int32  sinr     = 3;
+}
+
+message SiteUplink {
+  string active_wan         = 1; // "wan" (cable) | "sim" | other iface label
+  bool   wan_up             = 2;
+  bool   sim_up             = 3;
+  bool   internet_reachable = 4; // ping succeeded
+  double latency_ms         = 5;
+  double loss_pct           = 6;
+  string public_ip          = 7;
+  SiteUplinkSim sim         = 8; // absent = no modem
+}
+
+// One whole-site snapshot for a router, pushed unsolicited as
+// EngineFrame.site_telemetry.
+message SiteTelemetryReport {
+  int64  ts_unix            = 1; // engine wall-clock (unix seconds) at sample
+  uint32 router_uptime_secs = 2;
+  repeated SiteSsid   ssids   = 3;
+  repeated SiteClient clients = 4;
+  SiteUplink          uplink  = 5;
 }
 
 // control plane -> engine. `correlation_id` is echoed back in the answering
