@@ -67,10 +67,12 @@ pub struct Config {
     pub control_keepalive_timeout_secs: u64,
 
     /// Inbound-idle watchdog (seconds): reconnect the control channel if NO frame
-    /// arrives from the control plane within this window. 0 = disabled (default).
-    /// SAFE ONLY once the control plane sends periodic keepalive pings on the Attach
-    /// stream — otherwise a healthy-but-quiet link reconnects every idle window. Set
-    /// to ~3× the CP ping interval after that ships.
+    /// arrives from the control plane within this window. Defaults to 90 = 3× the
+    /// edge's 30s Attach keepalive ping (now shipped fleet-wide), so a zombie
+    /// half-open stream — h2 alive but the CP dropped/stopped feeding the Attach —
+    /// self-heals in ≤90s. Set 0 to DISABLE (only for a CP that does NOT send
+    /// periodic Attach pings, e.g. the on-net dev server; otherwise a healthy-but-
+    /// quiet link would reconnect every idle window).
     #[serde(default = "default_inbound_idle_secs")]
     pub control_inbound_idle_secs: u64,
 
@@ -216,7 +218,12 @@ fn default_keepalive_timeout_secs() -> u64 {
 }
 
 fn default_inbound_idle_secs() -> u64 {
-    0
+    // 3× the edge's 30s Attach keepalive ping (domain/edge .../attach/handler.go
+    // `pingInterval`). Defaults ON now that the CP ping has shipped fleet-wide: a
+    // zombie half-open stream (edge stopped pinging / dropped the Attach while h2
+    // stays alive) self-heals in ≤90s instead of hanging until a manual restart
+    // (site-.22 root cause). Set 0 in UCI only for a CP that does not ping.
+    90
 }
 
 fn default_liveness_poll_secs() -> u64 {
@@ -699,13 +706,13 @@ config portcullis 'main'
     }
 
     #[test]
-    fn control_keepalive_timeout_defaults_on_inbound_idle_defaults_off() {
+    fn control_keepalive_timeout_and_inbound_idle_default_on() {
         // Absent from UCI => keepalive-timeout defaults ON (fixes dead-TCP zombie
-        // fleet-wide), while the inbound-idle watchdog defaults OFF (0) until the CP
-        // sends periodic Attach pings.
+        // fleet-wide) AND the inbound-idle watchdog defaults ON (90 = 3× the edge's
+        // 30s Attach ping, now shipped) so a zombie half-open stream self-heals.
         let cfg = Config::from_uci_str("config portcullis 'main'\n").unwrap();
         assert_eq!(cfg.control_keepalive_timeout_secs, 20);
-        assert_eq!(cfg.control_inbound_idle_secs, 0);
+        assert_eq!(cfg.control_inbound_idle_secs, 90);
     }
 
     #[test]

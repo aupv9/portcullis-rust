@@ -4,6 +4,20 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.34.1] — 2026-08-09
+
+### Changed
+- **Inbound-idle watchdog now defaults ON (`control_inbound_idle_secs` 0 → 90).**
+  The keep-alive-timeout + inbound-idle watchdog that kills zombie half-open control
+  streams already shipped in the codebase, but the inbound-idle half defaulted OFF
+  (safe only once the CP sent periodic Attach pings). The edge now sends a
+  `ControlFrame_Ping` every 30 s (`domain/edge .../attach/handler.go` `pingInterval`),
+  so 90 s (= 3× the ping) is safe and on by default: when the CP drops/stops feeding
+  the Attach stream while h2 still looks alive (site-.22: WAN/NAT flap → edge detaches,
+  engine holds a zombie), the engine now self-heals in ≤90 s instead of hanging until a
+  manual restart. Set `control_inbound_idle_secs = 0` in UCI only for a CP that does not
+  ping (e.g. the on-net dev server). Engine-only; contract unchanged.
+
 ## [0.34.0] — 2026-08-09
 
 ### Changed

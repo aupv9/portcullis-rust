@@ -67,9 +67,9 @@ pub struct ControlChannelConfig {
     /// Inbound-idle watchdog: reconnect if NO frame arrives from the control plane
     /// within this window (belt-and-suspenders for a zombie stream the transport
     /// keepalive doesn't catch — e.g. h2 alive but the CP dropped the Attach stream).
-    /// `Duration::ZERO` disables it — the safe default until the CP sends periodic
-    /// Attach pings, since otherwise a healthy-but-quiet link would reconnect each
-    /// idle window. Set to ~3× the CP ping interval once that ships.
+    /// Defaults to 90s (= 3× the edge's 30s Attach ping, now shipped). `Duration::ZERO`
+    /// disables it — use only for a CP that does not send periodic Attach pings, else
+    /// a healthy-but-quiet link would reconnect each idle window.
     pub inbound_idle: Duration,
     /// CP-managed wireless subsystem (P-W1). `set_wireless_config` /
     /// `confirm_wireless` / `get_wireless_config` frames are dispatched here; its
