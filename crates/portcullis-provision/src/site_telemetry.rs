@@ -147,6 +147,8 @@ pub async fn poll_once<R: CommandRunner>(
                     tx_bytes: download,
                     connected_secs: st.connected_secs,
                     hostname,
+                    tx_retries: st.tx_retries,
+                    tx_failed: st.tx_failed,
                 });
             }
         }
@@ -158,6 +160,12 @@ pub async fn poll_once<R: CommandRunner>(
             Some(prefix) => acc.subnet_bytes(prefix),
             None => (0, 0),
         };
+        // Bridge reliability counters (netdev /sys) — router-side drop evidence.
+        let stat = |c: &str| format!("/sys/class/net/{ifname}/statistics/{c}");
+        let rx_errors = read_sys_u64(runner, &stat("rx_errors")).await;
+        let rx_dropped = read_sys_u64(runner, &stat("rx_dropped")).await;
+        let tx_errors = read_sys_u64(runner, &stat("tx_errors")).await;
+        let tx_dropped = read_sys_u64(runner, &stat("tx_dropped")).await;
         let gated = gated_ifaces.contains(&ifname); // has a FORWARD -> wifihub_fwd jump
         ssids.push(SiteSsid {
             ifname,
@@ -171,6 +179,10 @@ pub async fn poll_once<R: CommandRunner>(
             fwd_bytes,
             ul_bytes,
             dl_bytes,
+            rx_errors,
+            rx_dropped,
+            tx_errors,
+            tx_dropped,
         });
     }
 
@@ -230,6 +242,11 @@ async fn run_text<R: CommandRunner>(runner: &R, prog: &str, args: &[&str]) -> St
         .unwrap_or_default()
 }
 
+/// Read a single u64 from a `/sys` counter file. 0 on any error (fail-soft).
+async fn read_sys_u64<R: CommandRunner>(runner: &R, path: &str) -> u64 {
+    run_text(runner, "cat", &[path]).await.trim().parse().unwrap_or(0)
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -251,6 +268,8 @@ pub struct StationRow {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub connected_secs: u32,
+    pub tx_retries: u64,
+    pub tx_failed: u64,
 }
 
 /// Parse `iw dev <vif> station dump` into per-station rows (lowercased MAC).
@@ -283,6 +302,10 @@ pub fn parse_station_dump(text: &str) -> Vec<StationRow> {
             row.tx_bytes = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
         } else if t.starts_with("connected time:") {
             row.connected_secs = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        } else if t.starts_with("tx retries:") {
+            row.tx_retries = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        } else if t.starts_with("tx failed:") {
+            row.tx_failed = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
         }
     }
     if let Some(row) = cur.take() {
@@ -672,6 +695,8 @@ Station A4:83:E7:1C:22:9F (on wlan1-D-1)
 \trx bitrate:\t780.0 MBit/s
 \trx bytes:\t5242880
 \ttx bytes:\t1048576
+\ttx retries:\t398270
+\ttx failed:\t7550
 \tconnected time:\t1440 seconds
 Station dc:0b:34:77:1e:02 (on wlan1-D-1)
 \tsignal:\t-61 [-64] dBm
@@ -687,6 +712,8 @@ Station dc:0b:34:77:1e:02 (on wlan1-D-1)
         assert_eq!(rows[0].rx_rate_mbps, 780.0);
         assert_eq!(rows[0].rx_bytes, 5242880);
         assert_eq!(rows[0].tx_bytes, 1048576);
+        assert_eq!(rows[0].tx_retries, 398270);
+        assert_eq!(rows[0].tx_failed, 7550);
         assert_eq!(rows[0].connected_secs, 1440);
         assert_eq!(rows[1].mac, "dc:0b:34:77:1e:02");
         assert_eq!(rows[1].signal_dbm, -61);

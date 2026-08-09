@@ -146,12 +146,22 @@ pub struct SiteSsid {
     /// cumulative forwarded bytes toward the uplink (egress)
     #[prost(uint64, tag="9")]
     pub fwd_bytes: u64,
-    /// cumulative bytes client->internet (bridge rx_bytes)
+    /// cumulative bytes client->internet (conntrack)
     #[prost(uint64, tag="10")]
     pub ul_bytes: u64,
-    /// cumulative bytes internet->client (bridge tx_bytes)
+    /// cumulative bytes internet->client (conntrack)
     #[prost(uint64, tag="11")]
     pub dl_bytes: u64,
+    /// bridge netdev reliability counters — router-side drop
+    #[prost(uint64, tag="12")]
+    pub rx_errors: u64,
+    /// evidence (~0 when the router is healthy)
+    #[prost(uint64, tag="13")]
+    pub rx_dropped: u64,
+    #[prost(uint64, tag="14")]
+    pub tx_errors: u64,
+    #[prost(uint64, tag="15")]
+    pub tx_dropped: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -185,6 +195,12 @@ pub struct SiteClient {
     /// DHCP-lease hostname ("" if none)
     #[prost(string, tag="10")]
     pub hostname: ::prost::alloc::string::String,
+    /// 802.11 retransmit attempts (RF/congestion evidence)
+    #[prost(uint64, tag="11")]
+    pub tx_retries: u64,
+    /// frames given up after retries
+    #[prost(uint64, tag="12")]
+    pub tx_failed: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

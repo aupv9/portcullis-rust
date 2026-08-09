@@ -4,6 +4,22 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.31.0] — 2026-08-09
+
+### Added
+- **Per-SSID / per-client reliability evidence in site telemetry.** For proving,
+  during a third-party SSID integration, whether the router itself is dropping
+  traffic (it usually is not) vs. the client's own RF/coverage problem:
+  - `SiteSsid` gains bridge netdev counters `rx_errors`, `rx_dropped`,
+    `tx_errors`, `tx_dropped` (from `/sys/class/net/<bridge>/statistics/*`).
+    ~0 on a healthy router.
+  - `SiteClient` gains `tx_retries` and `tx_failed` from `iw … station dump`
+    (802.11 retransmit attempts and frames given up after retries) — the actual
+    WiFi-quality signal. Offload-independent (PHY/L2 counters, not byte counters),
+    so unlike the byte counters these were always accurate; they were just not
+    collected. The dashboard shows "Router: không rớt/lỗi gói" per SSID plus a
+    per-client "Chất lượng liên kết" column (✗failed · ↻retries).
+
 ## [0.30.0] — 2026-08-09
 
 ### Fixed
