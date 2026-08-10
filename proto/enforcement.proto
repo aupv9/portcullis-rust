@@ -202,6 +202,16 @@ message SiteFlow {
   uint64 bytes     = 5; // cumulative bytes this flow (orig + reply)
 }
 
+// An edge/threshold event the engine detected (trap-style). Rides the telemetry
+// push (≤ tick latency) so the CP gets a discrete, timestamped event log instead of
+// having to diff snapshots itself.
+message SiteEvent {
+  int64  ts_unix  = 1;
+  string kind     = 2; // "wan_down"|"wan_up"|"wan_flap"|"conntrack_high"|"cpu_high"|"cp_reconnect"
+  string severity = 3; // "info"|"warn"|"crit"
+  string message  = 4; // human-readable (vi)
+}
+
 // One whole-site snapshot for a router, pushed unsolicited as
 // EngineFrame.site_telemetry.
 message SiteTelemetryReport {
@@ -213,6 +223,7 @@ message SiteTelemetryReport {
   SiteControlChannel  control = 6; // engine<->CP dial health
   SiteHealth          health  = 7; // router CPU/RAM/flash/temp
   repeated SiteFlow   flows   = 8; // top-N client->internet conversations (top-talkers)
+  repeated SiteEvent  events  = 9; // edge/threshold events detected this tick (traps)
 }
 
 // control plane -> engine. `correlation_id` is echoed back in the answering

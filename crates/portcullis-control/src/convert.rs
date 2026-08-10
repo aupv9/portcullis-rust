@@ -446,6 +446,12 @@ pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetry
             proto: f.proto.clone(),
             bytes: f.bytes,
         }).collect(),
+        events: r.events.iter().map(|e| pb::SiteEvent {
+            ts_unix: e.ts_unix,
+            kind: e.kind.clone(),
+            severity: e.severity.clone(),
+            message: e.message.clone(),
+        }).collect(),
     }
 }
 
