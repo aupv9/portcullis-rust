@@ -320,6 +320,27 @@ pub struct SiteHealth {
     #[prost(uint32, tag="11")]
     pub conntrack_max: u32,
 }
+/// One active client->internet conversation (RMON-Matrix / mini-NetFlow), derived
+/// from /proc/net/nf_conntrack. L3/L4 metadata only (no payload); top-N by bytes.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteFlow {
+    /// LAN client (conntrack orig src)
+    #[prost(string, tag="1")]
+    pub client_ip: ::prost::alloc::string::String,
+    /// remote endpoint
+    #[prost(string, tag="2")]
+    pub dst_ip: ::prost::alloc::string::String,
+    /// destination port
+    #[prost(uint32, tag="3")]
+    pub dport: u32,
+    /// "tcp" | "udp"
+    #[prost(string, tag="4")]
+    pub proto: ::prost::alloc::string::String,
+    /// cumulative bytes this flow (orig + reply)
+    #[prost(uint64, tag="5")]
+    pub bytes: u64,
+}
 /// One whole-site snapshot for a router, pushed unsolicited as
 /// EngineFrame.site_telemetry.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -342,6 +363,9 @@ pub struct SiteTelemetryReport {
     /// router CPU/RAM/flash/temp
     #[prost(message, optional, tag="7")]
     pub health: ::core::option::Option<SiteHealth>,
+    /// top-N client->internet conversations (top-talkers)
+    #[prost(message, repeated, tag="8")]
+    pub flows: ::prost::alloc::vec::Vec<SiteFlow>,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.
