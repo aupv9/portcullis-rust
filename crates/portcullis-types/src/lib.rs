@@ -1163,6 +1163,13 @@ pub struct SiteUplink {
     pub loss_pct: f64,
     pub public_ip: String,
     pub sim: Option<SiteUplinkSim>,
+    // Uplink stability + per-uplink throughput (net-monitor coverage).
+    pub wan_carrier_changes: u32, // cumulative link up/down transitions (carrier_changes)
+    pub wan_uptime_secs: u32,     // mwan3 "online" age of WAN (short = just flapped); 0 = down
+    pub wan_rx_bytes: u64,        // WAN netdev cumulative rx (/proc/net/dev)
+    pub wan_tx_bytes: u64,
+    pub sim_rx_bytes: u64,        // SIM netdev cumulative rx
+    pub sim_tx_bytes: u64,
 }
 
 /// Engine's own control-channel (dial to CP) health snapshot.
@@ -1185,6 +1192,9 @@ pub struct SiteHealth {
     pub flash_total: u64,   // bytes (persistent /overlay)
     pub flash_free: u64,    // bytes
     pub modem_temp_dc: i32, // deci-°C (390 = 39.0°C); 0 = n/a. No CPU sensor on MT7621.
+    pub cpu_pct: u32,       // aggregate CPU busy % (0..100) from /proc/stat delta; 0 = first sample
+    pub conntrack_count: u32, // nf_conntrack_count (active flows)
+    pub conntrack_max: u32,   // nf_conntrack_max (table capacity)
 }
 
 /// One whole-site telemetry snapshot for a router (Transport A).
