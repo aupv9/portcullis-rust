@@ -246,6 +246,27 @@ pub struct SiteUplink {
     /// absent = no modem
     #[prost(message, optional, tag="8")]
     pub sim: ::core::option::Option<SiteUplinkSim>,
+    /// Uplink stability + per-uplink throughput (net-monitor coverage). wan_up (from
+    /// mwan3) is too coarse to see brief physical flaps that mwan3 rides through, so:
+    ///
+    /// /sys/class/net/<wan>/carrier_changes — cumulative link up/down transitions since boot; CP diffs consecutive snapshots to count flaps/window
+    #[prost(uint32, tag="9")]
+    pub wan_carrier_changes: u32,
+    /// mwan3 "online" age of the WAN iface (short = just flapped); 0 = down/unknown
+    #[prost(uint32, tag="10")]
+    pub wan_uptime_secs: u32,
+    /// WAN netdev cumulative rx (/proc/net/dev); CP derives throughput
+    #[prost(uint64, tag="11")]
+    pub wan_rx_bytes: u64,
+    /// WAN netdev cumulative tx
+    #[prost(uint64, tag="12")]
+    pub wan_tx_bytes: u64,
+    /// SIM netdev cumulative rx
+    #[prost(uint64, tag="13")]
+    pub sim_rx_bytes: u64,
+    /// SIM netdev cumulative tx
+    #[prost(uint64, tag="14")]
+    pub sim_tx_bytes: u64,
 }
 /// Engine's own view of its outbound control channel to the CP (the .22 zombie
 /// signals): is it dialed in, how long the current connection has held, and how
@@ -289,6 +310,15 @@ pub struct SiteHealth {
     /// deci-°C (390 = 39.0°C); 0 = n/a (no CPU sensor on MT7621)
     #[prost(int32, tag="8")]
     pub modem_temp_dc: i32,
+    /// aggregate CPU busy % (0..100) from /proc/stat delta; 0 = first sample/unknown
+    #[prost(uint32, tag="9")]
+    pub cpu_pct: u32,
+    /// /proc/sys/net/netfilter/nf_conntrack_count — active flows
+    #[prost(uint32, tag="10")]
+    pub conntrack_count: u32,
+    /// nf_conntrack_max — table capacity (count/max ~1.0 = exhaustion → dropped conns)
+    #[prost(uint32, tag="11")]
+    pub conntrack_max: u32,
 }
 /// One whole-site snapshot for a router, pushed unsolicited as
 /// EngineFrame.site_telemetry.

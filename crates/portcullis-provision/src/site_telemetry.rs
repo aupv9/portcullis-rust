@@ -62,6 +62,8 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     let mut survey = SurveyState::default();
     // Cached uplink refreshed every UPLINK_REFRESH_EVERY ticks (ping/curl are slow).
     let mut uplink = gather_uplink(runner.as_ref()).await;
+    // CPU% needs a /proc/stat delta across ticks, so its state lives here.
+    let mut cpu = CpuSampler::default();
     let mut tick_n: u32 = 0;
     loop {
         tick.tick().await;
@@ -71,6 +73,7 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
         tick_n = tick_n.wrapping_add(1);
         let mut report = poll_once(runner.as_ref(), &mut acc, &mut survey, &uplink).await;
         report.control = health.snapshot();
+        report.health.cpu_pct = cpu.sample(&run_text(runner.as_ref(), "cat", &["/proc/stat"]).await);
         match tx.try_send(report) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -275,7 +278,9 @@ async fn list_bridge_vifs<R: CommandRunner>(runner: &R, bridge: &str) -> Vec<Str
 /// Gather site uplink state: active WAN vs SIM, Internet reachability (+latency/
 /// loss), public IP, and backup-SIM signal. Fail-soft per field.
 async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
-    let (wan_up, sim_up) = parse_mwan3(&run_text(runner, "mwan3", &["status"]).await);
+    let mwan3 = run_text(runner, "mwan3", &["status"]).await;
+    let (wan_up, sim_up) = parse_mwan3(&mwan3);
+    let wan_uptime_secs = parse_mwan3_uptime(&mwan3, "wan");
     let dev = parse_default_dev(&run_text(runner, "ip", &["route", "show", "default"]).await);
     let active_wan = match dev.as_str() {
         "wan" => "wan".to_string(),
@@ -290,6 +295,20 @@ async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
             .trim()
             .to_string();
     let sim = parse_gsm(&run_text(runner, "ubus", &["call", "gsm.modem0", "info"]).await);
+
+    // Per-uplink throughput + WAN link-flap counter (net-monitor coverage). Fail-soft:
+    // any missing dev/file yields 0. wan netdev on RUTM wired WAN is "wan"; the QMI
+    // modem surfaces as qmimux0 (fallbacks cover other stacks).
+    let netdev = parse_proc_net_dev(&run_text(runner, "cat", &["/proc/net/dev"]).await);
+    let wan_dev = pick_dev(&netdev, &["wan"]);
+    let sim_dev = pick_dev(&netdev, &["qmimux0", "wwan0", "3g-mob1s1a1", "rmnet0"]);
+    let (wan_rx_bytes, wan_tx_bytes) = wan_dev.as_deref().and_then(|d| netdev.get(d)).copied().unwrap_or((0, 0));
+    let (sim_rx_bytes, sim_tx_bytes) = sim_dev.as_deref().and_then(|d| netdev.get(d)).copied().unwrap_or((0, 0));
+    let wan_carrier_changes = match wan_dev.as_deref() {
+        Some(d) => run_text(runner, "cat", &[&format!("/sys/class/net/{d}/carrier_changes")]).await.trim().parse().unwrap_or(0),
+        None => 0,
+    };
+
     SiteUplink {
         active_wan,
         wan_up,
@@ -299,6 +318,12 @@ async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
         loss_pct,
         public_ip,
         sim,
+        wan_carrier_changes,
+        wan_uptime_secs,
+        wan_rx_bytes,
+        wan_tx_bytes,
+        sim_rx_bytes,
+        sim_tx_bytes,
     }
 }
 
@@ -310,6 +335,9 @@ async fn gather_health<R: CommandRunner>(runner: &R) -> SiteHealth {
         parse_system_info(&run_text(runner, "ubus", &["call", "system", "info"]).await);
     let (flash_total, flash_free) = parse_df_overlay(&run_text(runner, "df", &["-k"]).await);
     let modem_temp_dc = run_text(runner, "gsmctl", &["-c"]).await.trim().parse().unwrap_or(0);
+    // conntrack table utilization (count/max ~1.0 = exhaustion → dropped new conns).
+    let conntrack_count = run_text(runner, "cat", &["/proc/sys/net/netfilter/nf_conntrack_count"]).await.trim().parse().unwrap_or(0);
+    let conntrack_max = run_text(runner, "cat", &["/proc/sys/net/netfilter/nf_conntrack_max"]).await.trim().parse().unwrap_or(0);
     SiteHealth {
         cpu_load1,
         cpu_load5,
@@ -319,6 +347,9 @@ async fn gather_health<R: CommandRunner>(runner: &R) -> SiteHealth {
         flash_total,
         flash_free,
         modem_temp_dc,
+        cpu_pct: 0, // filled by the poller loop (needs a /proc/stat delta across ticks)
+        conntrack_count,
+        conntrack_max,
     }
 }
 
@@ -517,6 +548,104 @@ pub fn parse_mwan3(text: &str) -> (bool, bool) {
         }
     }
     (wan_up, sim_up)
+}
+
+/// `interface <iface> is online <Hh:Mm:Ss>, uptime ...` -> the ONLINE age in secs
+/// (short = the iface just came back = recent flap). 0 if offline / not found.
+pub fn parse_mwan3_uptime(text: &str, iface: &str) -> u32 {
+    for line in text.lines() {
+        let f: Vec<&str> = line.trim().split_whitespace().collect();
+        if f.len() >= 5 && f[0] == "interface" && f[1] == iface && f[2] == "is" && f[3] == "online" {
+            return parse_hms(f[4]);
+        }
+    }
+    0
+}
+
+/// "12h:17m:12s" (with optional trailing comma) -> seconds.
+fn parse_hms(tok: &str) -> u32 {
+    let mut secs = 0u32;
+    for part in tok.trim_end_matches(',').split(':') {
+        if part.len() < 2 {
+            continue;
+        }
+        let (num, unit) = part.split_at(part.len() - 1);
+        let n: u32 = num.parse().unwrap_or(0);
+        secs += match unit {
+            "h" => n * 3600,
+            "m" => n * 60,
+            "s" => n,
+            _ => 0,
+        };
+    }
+    secs
+}
+
+/// Parse `/proc/net/dev` -> iface -> (rx_bytes, tx_bytes). Cumulative counters.
+pub fn parse_proc_net_dev(text: &str) -> BTreeMap<String, (u64, u64)> {
+    let mut m = BTreeMap::new();
+    for line in text.lines() {
+        let Some((name, rest)) = line.split_once(':') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name.contains('|') {
+            continue; // header rows
+        }
+        let cols: Vec<&str> = rest.split_whitespace().collect();
+        // rx_bytes = col 0, tx_bytes = col 8 (after the "iface:" split).
+        if cols.len() >= 9 {
+            let rx = cols[0].parse().unwrap_or(0);
+            let tx = cols[8].parse().unwrap_or(0);
+            m.insert(name.to_string(), (rx, tx));
+        }
+    }
+    m
+}
+
+/// First candidate netdev name present in the `/proc/net/dev` map.
+fn pick_dev(m: &BTreeMap<String, (u64, u64)>, cands: &[&str]) -> Option<String> {
+    cands.iter().find(|c| m.contains_key(**c)).map(|c| c.to_string())
+}
+
+/// Aggregate CPU-busy % from consecutive `/proc/stat` reads (needs the previous
+/// sample, so it lives with the poller loop like the byte accumulator).
+#[derive(Default)]
+pub struct CpuSampler {
+    prev_idle: u64,
+    prev_total: u64,
+}
+
+impl CpuSampler {
+    /// Feed the current `/proc/stat`; returns busy % since the previous sample
+    /// (0 on the first sample or a non-monotonic/empty read).
+    pub fn sample(&mut self, proc_stat: &str) -> u32 {
+        let (idle, total) = parse_cpu_jiffies(proc_stat);
+        let pct = if self.prev_total != 0 && total > self.prev_total {
+            let dt = total - self.prev_total;
+            let di = idle.saturating_sub(self.prev_idle);
+            (((dt - di) as f64 / dt as f64) * 100.0).round() as u32
+        } else {
+            0
+        };
+        self.prev_idle = idle;
+        self.prev_total = total;
+        pct.min(100)
+    }
+}
+
+/// Aggregate "cpu " line of `/proc/stat` -> (idle_jiffies, total_jiffies).
+/// idle = idle + iowait; total = sum of all fields.
+fn parse_cpu_jiffies(text: &str) -> (u64, u64) {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("cpu ") {
+            let v: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if v.len() >= 5 {
+                let idle = v[3] + v[4];
+                let total: u64 = v.iter().sum();
+                return (idle, total);
+            }
+        }
+    }
+    (0, 0)
 }
 
 /// Parse `ping -c N` output -> (loss_pct, avg_ms). Loss defaults to 100 (no reply).
@@ -1231,5 +1360,36 @@ fe80::1 dev br-ss2 lladdr aa:bb:cc:dd:ee:ff STALE
         assert_eq!(s.get("wlan0-D-2"), Some(&true));
         assert_eq!(s.get("wlan1-D-1"), Some(&false)); // retry_setup_failed → down
         assert!(parse_wireless_status("not json").is_empty());
+    }
+
+    #[test]
+    fn mwan3_uptime_parses_online_age() {
+        let t = " interface wan is online 12h:17m:12s, uptime 12h:20m:53s and tracking is active\n\
+                  interface mob1s1a1 is offline and tracking is paused\n";
+        assert_eq!(parse_mwan3_uptime(t, "wan"), 12 * 3600 + 17 * 60 + 12);
+        assert_eq!(parse_mwan3_uptime(t, "mob1s1a1"), 0); // offline
+        assert_eq!(parse_mwan3_uptime(t, "nope"), 0);
+    }
+
+    #[test]
+    fn proc_net_dev_parses_rx_tx_bytes() {
+        let t = "Inter-|   Receive                                                |  Transmit\n\
+                 \x20face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets\n\
+                 \x20 wan: 1000 5 0 0 0 0 0 0 2000 8 0 0 0 0 0 0\n\
+                 qmimux0: 300 3 0 0 0 0 0 0 400 4 0 0 0 0 0 0\n";
+        let m = parse_proc_net_dev(t);
+        assert_eq!(m.get("wan"), Some(&(1000, 2000)));
+        assert_eq!(m.get("qmimux0"), Some(&(300, 400)));
+        assert_eq!(pick_dev(&m, &["eth9", "qmimux0"]).as_deref(), Some("qmimux0"));
+        assert_eq!(pick_dev(&m, &["eth9"]), None);
+    }
+
+    #[test]
+    fn cpu_sampler_first_zero_then_busy_pct() {
+        let mut c = CpuSampler::default();
+        // first sample → 0 (no baseline)
+        assert_eq!(c.sample("cpu  100 0 100 800 0 0 0 0 0 0"), 0);
+        // +100 busy (user+sys), +100 idle over a 200 total delta → 50%
+        assert_eq!(c.sample("cpu  150 0 150 900 0 0 0 0 0 0"), 50);
     }
 }

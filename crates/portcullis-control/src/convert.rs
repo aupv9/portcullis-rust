@@ -435,6 +435,9 @@ pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetry
             flash_total: r.health.flash_total,
             flash_free: r.health.flash_free,
             modem_temp_dc: r.health.modem_temp_dc,
+            cpu_pct: r.health.cpu_pct,
+            conntrack_count: r.health.conntrack_count,
+            conntrack_max: r.health.conntrack_max,
         }),
     }
 }
@@ -494,6 +497,12 @@ fn site_uplink_to_pb(u: &SiteUplink) -> pb::SiteUplink {
             rsrp: s.rsrp,
             sinr: s.sinr,
         }),
+        wan_carrier_changes: u.wan_carrier_changes,
+        wan_uptime_secs: u.wan_uptime_secs,
+        wan_rx_bytes: u.wan_rx_bytes,
+        wan_tx_bytes: u.wan_tx_bytes,
+        sim_rx_bytes: u.sim_rx_bytes,
+        sim_tx_bytes: u.sim_tx_bytes,
     }
 }
 

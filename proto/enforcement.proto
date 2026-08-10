@@ -157,6 +157,14 @@ message SiteUplink {
   double loss_pct           = 6;
   string public_ip          = 7;
   SiteUplinkSim sim         = 8; // absent = no modem
+  // Uplink stability + per-uplink throughput (net-monitor coverage). wan_up (from
+  // mwan3) is too coarse to see brief physical flaps that mwan3 rides through, so:
+  uint32 wan_carrier_changes = 9;  // /sys/class/net/<wan>/carrier_changes — cumulative link up/down transitions since boot; CP diffs consecutive snapshots to count flaps/window
+  uint32 wan_uptime_secs     = 10; // mwan3 "online" age of the WAN iface (short = just flapped); 0 = down/unknown
+  uint64 wan_rx_bytes        = 11; // WAN netdev cumulative rx (/proc/net/dev); CP derives throughput
+  uint64 wan_tx_bytes        = 12; // WAN netdev cumulative tx
+  uint64 sim_rx_bytes        = 13; // SIM netdev cumulative rx
+  uint64 sim_tx_bytes        = 14; // SIM netdev cumulative tx
 }
 
 // Engine's own view of its outbound control channel to the CP (the .22 zombie
@@ -179,6 +187,9 @@ message SiteHealth {
   uint64 flash_total    = 6; // bytes (persistent /overlay)
   uint64 flash_free     = 7; // bytes
   int32  modem_temp_dc  = 8; // deci-°C (390 = 39.0°C); 0 = n/a (no CPU sensor on MT7621)
+  uint32 cpu_pct          = 9;  // aggregate CPU busy % (0..100) from /proc/stat delta; 0 = first sample/unknown
+  uint32 conntrack_count  = 10; // /proc/sys/net/netfilter/nf_conntrack_count — active flows
+  uint32 conntrack_max    = 11; // nf_conntrack_max — table capacity (count/max ~1.0 = exhaustion → dropped conns)
 }
 
 // One whole-site snapshot for a router, pushed unsolicited as
