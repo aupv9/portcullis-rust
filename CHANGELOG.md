@@ -4,6 +4,26 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.35.0] — 2026-08-10
+
+### Added
+- **Net-monitor coverage in site telemetry** (all observational, fail-soft, cumulative
+  so the CP derives rates):
+  - `SiteUplink` += `wan_carrier_changes` (`/sys/class/net/<wan>/carrier_changes` —
+    catches brief physical WAN flaps mwan3 rides through), `wan_uptime_secs` (mwan3
+    online age), `wan_rx/tx_bytes` + `sim_rx/tx_bytes` (`/proc/net/dev` per-uplink
+    throughput). Fixes the "flapping WAN reads solid green" blind spot.
+  - `SiteHealth` += `cpu_pct` (`/proc/stat` delta), `conntrack_count`/`conntrack_max`
+    (`/proc/sys/net/netfilter` — table-exhaustion signal).
+  - `SiteFlow` (new) — top-N client→internet conversations from `nf_conntrack`
+    (RMON-Matrix / mini-NetFlow), L3/L4 metadata only, restricted to resolved client
+    IPs. Adds who-talks-to-whom / by-port that SNMP/RMON can't do on OpenWrt.
+  - `SiteEvent` (new) — trap-style edge/threshold events (`wan_down`/`wan_up`/
+    `wan_flap`/`conntrack_high`/`cpu_high`/`cp_reconnect`) detected in the poller
+    (hysteresis on thresholds) and carried on the push (≤ tick latency). CP flattens
+    into an event log.
+  - proto tags all additive (proto3 forward-compat: old CP ignores them). Engine-only.
+
 ## [0.34.1] — 2026-08-09
 
 ### Changed
