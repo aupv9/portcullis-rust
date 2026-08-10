@@ -1208,6 +1208,15 @@ pub struct SiteFlow {
     pub bytes: u64,
 }
 
+/// An edge/threshold event the engine detected (trap-style), carried on the push.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteEvent {
+    pub ts_unix: i64,
+    pub kind: String,     // "wan_down"|"wan_up"|"wan_flap"|"conntrack_high"|"cpu_high"|"cp_reconnect"
+    pub severity: String, // "info"|"warn"|"crit"
+    pub message: String,
+}
+
 /// One whole-site telemetry snapshot for a router (Transport A).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SiteTelemetryReport {
@@ -1219,6 +1228,7 @@ pub struct SiteTelemetryReport {
     pub control: SiteControlChannel,
     pub health: SiteHealth,
     pub flows: Vec<SiteFlow>,
+    pub events: Vec<SiteEvent>,
 }
 
 /// Shared, interior-mutable control-channel health tracked by the control task

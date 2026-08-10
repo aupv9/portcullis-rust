@@ -341,6 +341,24 @@ pub struct SiteFlow {
     #[prost(uint64, tag="5")]
     pub bytes: u64,
 }
+/// An edge/threshold event the engine detected (trap-style). Rides the telemetry
+/// push (≤ tick latency) so the CP gets a discrete, timestamped event log instead of
+/// having to diff snapshots itself.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteEvent {
+    #[prost(int64, tag="1")]
+    pub ts_unix: i64,
+    /// "wan_down"|"wan_up"|"wan_flap"|"conntrack_high"|"cpu_high"|"cp_reconnect"
+    #[prost(string, tag="2")]
+    pub kind: ::prost::alloc::string::String,
+    /// "info"|"warn"|"crit"
+    #[prost(string, tag="3")]
+    pub severity: ::prost::alloc::string::String,
+    /// human-readable (vi)
+    #[prost(string, tag="4")]
+    pub message: ::prost::alloc::string::String,
+}
 /// One whole-site snapshot for a router, pushed unsolicited as
 /// EngineFrame.site_telemetry.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -366,6 +384,9 @@ pub struct SiteTelemetryReport {
     /// top-N client->internet conversations (top-talkers)
     #[prost(message, repeated, tag="8")]
     pub flows: ::prost::alloc::vec::Vec<SiteFlow>,
+    /// edge/threshold events detected this tick (traps)
+    #[prost(message, repeated, tag="9")]
+    pub events: ::prost::alloc::vec::Vec<SiteEvent>,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.

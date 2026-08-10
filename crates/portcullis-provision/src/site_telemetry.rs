@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portcullis_types::{
-    ControlChannelHealth, SiteClient, SiteFlow, SiteHealth, SiteSsid, SiteTelemetryReport,
-    SiteUplink, SiteUplinkSim,
+    ControlChannelHealth, SiteClient, SiteEvent, SiteFlow, SiteHealth, SiteSsid,
+    SiteTelemetryReport, SiteUplink, SiteUplinkSim,
 };
 use tokio::sync::mpsc;
 
@@ -64,6 +64,8 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     let mut uplink = gather_uplink(runner.as_ref()).await;
     // CPU% needs a /proc/stat delta across ticks, so its state lives here.
     let mut cpu = CpuSampler::default();
+    // Trap-style event detector — holds the previous sample across ticks.
+    let mut detector = EventDetector::default();
     let mut tick_n: u32 = 0;
     loop {
         tick.tick().await;
@@ -74,6 +76,8 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
         let mut report = poll_once(runner.as_ref(), &mut acc, &mut survey, &uplink).await;
         report.control = health.snapshot();
         report.health.cpu_pct = cpu.sample(&run_text(runner.as_ref(), "cat", &["/proc/stat"]).await);
+        // Trap events (edge/threshold) — after control+cpu are set so they can trip on those.
+        report.events = detector.detect(&report);
         match tx.try_send(report) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -270,6 +274,81 @@ pub async fn poll_once<R: CommandRunner>(
         control: Default::default(),
         health,
         flows,
+        events: Vec::new(), // filled by the poller loop's EventDetector after control/cpu are set
+    }
+}
+
+/// Trap-style edge/threshold detector. Holds the previous sample so the poller can
+/// emit discrete [`SiteEvent`]s (WAN link up/down/flap, conntrack/CPU threshold, CP
+/// reconnect) on the telemetry push instead of the CP diffing snapshots. Threshold
+/// events use hysteresis (fire once on the way up, re-arm below a lower mark) so a
+/// value hovering at the line does not spam every tick.
+#[derive(Default)]
+pub struct EventDetector {
+    prev_wan_up: Option<bool>,
+    prev_carrier: Option<u32>,
+    prev_reconnects: Option<u32>,
+    ct_alerting: bool,
+    cpu_alerting: bool,
+}
+
+impl EventDetector {
+    /// Compare `r` against the previous sample; return the events crossed this tick.
+    /// First call establishes the baseline (edge events need a prior value).
+    pub fn detect(&mut self, r: &SiteTelemetryReport) -> Vec<SiteEvent> {
+        let now = r.ts_unix;
+        let mut ev = Vec::new();
+        let mut push = |kind: &str, sev: &str, msg: String| {
+            ev.push(SiteEvent { ts_unix: now, kind: kind.into(), severity: sev.into(), message: msg });
+        };
+
+        // WAN link (mwan3 online/offline)
+        if let Some(prev) = self.prev_wan_up {
+            if prev && !r.uplink.wan_up {
+                push("wan_down", "crit", "WAN rớt — chuyển sang dự phòng SIM".into());
+            } else if !prev && r.uplink.wan_up {
+                push("wan_up", "warn", "WAN đã lên lại".into());
+            }
+        }
+        self.prev_wan_up = Some(r.uplink.wan_up);
+
+        // WAN physical flap (carrier_changes delta)
+        if let Some(prev) = self.prev_carrier {
+            if r.uplink.wan_carrier_changes > prev {
+                let d = r.uplink.wan_carrier_changes - prev;
+                push("wan_flap", "warn", format!("WAN chập {d} lần (link up/down)"));
+            }
+        }
+        self.prev_carrier = Some(r.uplink.wan_carrier_changes);
+
+        // conntrack table near exhaustion (hysteresis 85% / 75%)
+        if r.health.conntrack_max > 0 {
+            let pct = r.health.conntrack_count as f64 / r.health.conntrack_max as f64;
+            if !self.ct_alerting && pct >= 0.85 {
+                self.ct_alerting = true;
+                push("conntrack_high", "warn", format!("Bảng conntrack {:.0}% ({}/{})", pct * 100.0, r.health.conntrack_count, r.health.conntrack_max));
+            } else if self.ct_alerting && pct < 0.75 {
+                self.ct_alerting = false;
+            }
+        }
+
+        // CPU sustained high (hysteresis 90% / 70%)
+        if !self.cpu_alerting && r.health.cpu_pct >= 90 {
+            self.cpu_alerting = true;
+            push("cpu_high", "warn", format!("CPU {}% bận", r.health.cpu_pct));
+        } else if self.cpu_alerting && r.health.cpu_pct < 70 {
+            self.cpu_alerting = false;
+        }
+
+        // control-channel re-dial (engine reconnected to CP)
+        if let Some(prev) = self.prev_reconnects {
+            if r.control.reconnects_since_boot > prev {
+                push("cp_reconnect", "info", "Kênh điều khiển re-dial".into());
+            }
+        }
+        self.prev_reconnects = Some(r.control.reconnects_since_boot);
+
+        ev
     }
 }
 
@@ -1446,5 +1525,28 @@ ipv4 2 tcp 6 100 ESTABLISHED src=10.95.87.92 dst=34.21.186.115 sport=40000 dport
         assert_eq!(top[0].dport, 443);
         assert_eq!(top[0].bytes, 6000); // orig 1000 + reply 5000
         assert_eq!(top[1].dst_ip, "8.8.8.8");
+    }
+
+    #[test]
+    fn event_detector_edges_and_hysteresis() {
+        let mut d = EventDetector::default();
+        let mut r = SiteTelemetryReport::default();
+        r.uplink.wan_up = true;
+        r.health.conntrack_max = 100;
+        r.health.conntrack_count = 10;
+        assert!(d.detect(&r).is_empty(), "first tick = baseline, no edges");
+
+        r.uplink.wan_up = false; // link down
+        r.health.conntrack_count = 90; // cross 85%
+        let ev = d.detect(&r);
+        assert!(ev.iter().any(|e| e.kind == "wan_down" && e.severity == "crit"));
+        assert!(ev.iter().any(|e| e.kind == "conntrack_high"));
+
+        let ev2 = d.detect(&r); // still 90% → no repeat (hysteresis)
+        assert!(!ev2.iter().any(|e| e.kind == "conntrack_high"));
+
+        r.uplink.wan_carrier_changes = 4; // physical flap (prev 0)
+        let ev3 = d.detect(&r);
+        assert!(ev3.iter().any(|e| e.kind == "wan_flap"));
     }
 }
