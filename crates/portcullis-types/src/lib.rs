@@ -1197,6 +1197,17 @@ pub struct SiteHealth {
     pub conntrack_max: u32,   // nf_conntrack_max (table capacity)
 }
 
+/// One active client->internet conversation (RMON-Matrix / mini-NetFlow) from
+/// nf_conntrack — L3/L4 metadata only, top-N by bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteFlow {
+    pub client_ip: String,
+    pub dst_ip: String,
+    pub dport: u32,
+    pub proto: String,
+    pub bytes: u64,
+}
+
 /// One whole-site telemetry snapshot for a router (Transport A).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SiteTelemetryReport {
@@ -1207,6 +1218,7 @@ pub struct SiteTelemetryReport {
     pub uplink: SiteUplink,
     pub control: SiteControlChannel,
     pub health: SiteHealth,
+    pub flows: Vec<SiteFlow>,
 }
 
 /// Shared, interior-mutable control-channel health tracked by the control task

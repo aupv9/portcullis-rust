@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portcullis_types::{
-    ControlChannelHealth, SiteClient, SiteHealth, SiteSsid, SiteTelemetryReport, SiteUplink,
-    SiteUplinkSim,
+    ControlChannelHealth, SiteClient, SiteFlow, SiteHealth, SiteSsid, SiteTelemetryReport,
+    SiteUplink, SiteUplinkSim,
 };
 use tokio::sync::mpsc;
 
@@ -126,7 +126,8 @@ pub async fn poll_once<R: CommandRunner>(
     // netdev/xtables counters, so they read backwards (upload > download). conntrack
     // reflects offloaded bytes; `acc` folds each flow's increment into a monotonic
     // per-client-IP cumulative, and `subnets` attributes IPs to their SSID bridge.
-    acc.ingest(&parse_conntrack(&run_text(runner, "cat", &["/proc/net/nf_conntrack"]).await));
+    let ct_flows = parse_conntrack(&run_text(runner, "cat", &["/proc/net/nf_conntrack"]).await);
+    acc.ingest(&ct_flows);
     let subnets = parse_bridge_subnets(&network);
     // DHCP pool size per bridge (uci dhcp .limit) + lease counts per subnet.
     let dhcp = run_text(runner, "uci", &["-q", "show", "dhcp"]).await;
@@ -251,6 +252,13 @@ pub async fn poll_once<R: CommandRunner>(
         });
     }
 
+    // Top-N client->internet conversations (RMON-Matrix / mini-NetFlow) from the
+    // conntrack flows already parsed — restricted to resolved client IPs so the
+    // router's own control-channel / WG / uplink flows are excluded.
+    let client_ips: BTreeSet<String> =
+        clients.iter().filter(|c| !c.ip.is_empty()).map(|c| c.ip.clone()).collect();
+    let flows = top_flows(&ct_flows, &client_ips, TOP_FLOWS_N);
+
     // control is filled by the poller from the shared ControlChannelHealth; uplink is
     // the poller's cached probe (refreshed on a slower cadence).
     SiteTelemetryReport {
@@ -261,7 +269,37 @@ pub async fn poll_once<R: CommandRunner>(
         uplink: uplink.clone(),
         control: Default::default(),
         health,
+        flows,
     }
+}
+
+/// How many top-talker conversations to report per snapshot.
+pub const TOP_FLOWS_N: usize = 12;
+
+/// Top-N client->internet conversations by bytes. Aggregates conntrack flows by
+/// (client, dst, dport, proto); keeps only flows whose src is a resolved client IP
+/// (excludes the router's own control-channel / WG / uplink flows). L3/L4 metadata
+/// only — no payload.
+pub fn top_flows(flows: &[ConntrackFlow], client_ips: &BTreeSet<String>, n: usize) -> Vec<SiteFlow> {
+    let mut agg: BTreeMap<(String, String, u32, String), u64> = BTreeMap::new();
+    for f in flows {
+        if !client_ips.contains(&f.src_ip) {
+            continue;
+        }
+        let bytes = f.orig_bytes.saturating_add(f.reply_bytes);
+        if bytes == 0 {
+            continue;
+        }
+        *agg.entry((f.src_ip.clone(), f.dst_ip.clone(), f.dst_port, f.proto.clone()))
+            .or_insert(0) += bytes;
+    }
+    let mut v: Vec<SiteFlow> = agg
+        .into_iter()
+        .map(|((client_ip, dst_ip, dport, proto), bytes)| SiteFlow { client_ip, dst_ip, dport, proto, bytes })
+        .collect();
+    v.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.client_ip.cmp(&b.client_ip)));
+    v.truncate(n);
+    v
 }
 
 /// List a bridge's wireless VIF members from `/sys/class/net/<bridge>/brif`.
@@ -1391,5 +1429,22 @@ fe80::1 dev br-ss2 lladdr aa:bb:cc:dd:ee:ff STALE
         assert_eq!(c.sample("cpu  100 0 100 800 0 0 0 0 0 0"), 0);
         // +100 busy (user+sys), +100 idle over a 200 total delta → 50%
         assert_eq!(c.sample("cpu  150 0 150 900 0 0 0 0 0 0"), 50);
+    }
+
+    #[test]
+    fn top_flows_ranks_and_excludes_non_clients() {
+        let ct = "\
+ipv4 2 tcp 6 100 ESTABLISHED src=10.20.0.5 dst=142.250.0.1 sport=51000 dport=443 packets=10 bytes=1000 src=142.250.0.1 dst=10.20.0.5 sport=443 dport=51000 packets=20 bytes=5000 [ASSURED] mark=0 use=1\n\
+ipv4 2 udp 17 30 src=10.20.0.5 dst=8.8.8.8 sport=5000 dport=53 packets=1 bytes=80 src=8.8.8.8 dst=10.20.0.5 sport=53 dport=5000 packets=1 bytes=120 mark=0 use=1\n\
+ipv4 2 tcp 6 100 ESTABLISHED src=10.95.87.92 dst=34.21.186.115 sport=40000 dport=8443 packets=5 bytes=999 src=34.21.186.115 dst=10.95.87.92 sport=8443 dport=40000 packets=5 bytes=999 [ASSURED] mark=512 use=2\n";
+        let flows = parse_conntrack(ct);
+        let mut clients = BTreeSet::new();
+        clients.insert("10.20.0.5".to_string()); // 10.95.* (router SIM/control) is NOT a client
+        let top = top_flows(&flows, &clients, 10);
+        assert_eq!(top.len(), 2); // control-channel flow excluded
+        assert_eq!(top[0].dst_ip, "142.250.0.1");
+        assert_eq!(top[0].dport, 443);
+        assert_eq!(top[0].bytes, 6000); // orig 1000 + reply 5000
+        assert_eq!(top[1].dst_ip, "8.8.8.8");
     }
 }

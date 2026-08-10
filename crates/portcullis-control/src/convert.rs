@@ -439,6 +439,13 @@ pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetry
             conntrack_count: r.health.conntrack_count,
             conntrack_max: r.health.conntrack_max,
         }),
+        flows: r.flows.iter().map(|f| pb::SiteFlow {
+            client_ip: f.client_ip.clone(),
+            dst_ip: f.dst_ip.clone(),
+            dport: f.dport,
+            proto: f.proto.clone(),
+            bytes: f.bytes,
+        }).collect(),
     }
 }
 
