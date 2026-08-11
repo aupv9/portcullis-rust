@@ -30,9 +30,10 @@ use tokio::sync::mpsc;
 use crate::runner::CommandRunner;
 
 /// Default LIGHT site-telemetry cadence (~20 s) — SSID/clients/bytes/airtime/health,
-/// all cheap reads. The expensive uplink probe (ping + curl) runs only every
-/// [`UPLINK_REFRESH_EVERY`] ticks (~60 s) and is cached in between, so the dashboard
-/// feels live without paying ping/curl every tick.
+/// all cheap reads. Uplink is split by cost: the LOCAL half (mwan3 / ip route / sysfs /
+/// procfs) runs every tick for near-realtime WAN up/down, failover, flap and throughput,
+/// while the slow network probes (ping / curl / gsm) run only every
+/// [`UPLINK_REFRESH_EVERY`] ticks (~60 s) and are cached in between.
 pub const DEFAULT_SITE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Refresh the uplink probe (ping/curl/gsm) every Nth light tick (~60 s at 20 s).
@@ -60,8 +61,11 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     // flow; survey times are since-boot), so their state lives with the poller.
     let mut acc = FlowByteAccumulator::new();
     let mut survey = SurveyState::default();
-    // Cached uplink refreshed every UPLINK_REFRESH_EVERY ticks (ping/curl are slow).
-    let mut uplink = gather_uplink(runner.as_ref()).await;
+    // Uplink split by cost (P1 near-realtime): the SLOW network probes (ping/curl/gsm)
+    // are cached and refreshed every UPLINK_REFRESH_EVERY ticks (~60s); the fast LOCAL
+    // reads (mwan3/route/netdev/carrier) run EVERY tick so WAN up/down, flap, failover
+    // and per-uplink throughput surface at the tick cadence (~20s).
+    let mut probe = gather_uplink_probe(runner.as_ref()).await;
     // CPU% needs a /proc/stat delta across ticks, so its state lives here.
     let mut cpu = CpuSampler::default();
     // Trap-style event detector — holds the previous sample across ticks.
@@ -70,9 +74,10 @@ pub async fn run_site_telemetry_poller<R: CommandRunner>(
     loop {
         tick.tick().await;
         if tick_n != 0 && tick_n.is_multiple_of(UPLINK_REFRESH_EVERY) {
-            uplink = gather_uplink(runner.as_ref()).await;
+            probe = gather_uplink_probe(runner.as_ref()).await;
         }
         tick_n = tick_n.wrapping_add(1);
+        let uplink = merge_uplink(gather_uplink_local(runner.as_ref()).await, &probe);
         let mut report = poll_once(runner.as_ref(), &mut acc, &mut survey, &uplink).await;
         report.control = health.snapshot();
         report.health.cpu_pct = cpu.sample(&run_text(runner.as_ref(), "cat", &["/proc/stat"]).await);
@@ -392,11 +397,18 @@ async fn list_bridge_vifs<R: CommandRunner>(runner: &R, bridge: &str) -> Vec<Str
         .collect()
 }
 
-/// Gather site uplink state: active WAN vs SIM, Internet reachability (+latency/
-/// loss), public IP, and backup-SIM signal. Fail-soft per field.
-async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
+/// Fast LOCAL uplink reads — mwan3 status, default route, per-uplink netdev bytes and
+/// the WAN link-flap counter. All are local files / quick CLI (sub-ms), so this runs
+/// EVERY tick (~20s) for near-realtime WAN up/down, failover, flap and throughput.
+async fn gather_uplink_local<R: CommandRunner>(runner: &R) -> UplinkLocal {
     let mwan3 = run_text(runner, "mwan3", &["status"]).await;
     let (wan_up, sim_up) = parse_mwan3(&mwan3);
+    // Did mwan3 actually report interfaces? If not (tool absent / empty output), the
+    // reachable flag must fall back to the ping probe instead of falsely reading "down".
+    let mwan3_seen = mwan3.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() >= 4 && f[0] == "interface" && f[2] == "is"
+    });
     let wan_uptime_secs = parse_mwan3_uptime(&mwan3, "wan");
     let dev = parse_default_dev(&run_text(runner, "ip", &["route", "show", "default"]).await);
     let active_wan = match dev.as_str() {
@@ -405,14 +417,6 @@ async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
         "" => "unknown".to_string(),
         other => other.to_string(),
     };
-    let (loss_pct, latency_ms) =
-        parse_ping(&run_text(runner, "ping", &["-c", "3", "-W", "3", PING_TARGET]).await);
-    let public_ip =
-        run_text(runner, "curl", &["-s", "--max-time", "5", "https://api.ipify.org"]).await
-            .trim()
-            .to_string();
-    let sim = parse_gsm(&run_text(runner, "ubus", &["call", "gsm.modem0", "info"]).await);
-
     // Per-uplink throughput + WAN link-flap counter (net-monitor coverage). Fail-soft:
     // any missing dev/file yields 0. wan netdev on RUTM wired WAN is "wan"; the QMI
     // modem surfaces as qmimux0 (fallbacks cover other stacks).
@@ -425,22 +429,82 @@ async fn gather_uplink<R: CommandRunner>(runner: &R) -> SiteUplink {
         Some(d) => run_text(runner, "cat", &[&format!("/sys/class/net/{d}/carrier_changes")]).await.trim().parse().unwrap_or(0),
         None => 0,
     };
-
-    SiteUplink {
-        active_wan,
+    UplinkLocal {
         wan_up,
         sim_up,
-        internet_reachable: loss_pct < 100.0,
-        latency_ms,
-        loss_pct,
-        public_ip,
-        sim,
-        wan_carrier_changes,
+        mwan3_seen,
         wan_uptime_secs,
+        active_wan,
+        wan_carrier_changes,
         wan_rx_bytes,
         wan_tx_bytes,
         sim_rx_bytes,
         sim_tx_bytes,
+    }
+}
+
+/// Slow NETWORK uplink probes — ping (reachability/latency/loss), curl (public IP),
+/// ubus gsm (backup-SIM signal). Each is a network round-trip, so these are cached and
+/// refreshed only every [`UPLINK_REFRESH_EVERY`] ticks (~60s). Fail-soft per field.
+async fn gather_uplink_probe<R: CommandRunner>(runner: &R) -> UplinkProbe {
+    let (loss_pct, latency_ms) =
+        parse_ping(&run_text(runner, "ping", &["-c", "3", "-W", "3", PING_TARGET]).await);
+    let public_ip =
+        run_text(runner, "curl", &["-s", "--max-time", "5", "https://api.ipify.org"]).await
+            .trim()
+            .to_string();
+    let sim = parse_gsm(&run_text(runner, "ubus", &["call", "gsm.modem0", "info"]).await);
+    UplinkProbe { loss_pct, latency_ms, public_ip, sim }
+}
+
+/// Fast local uplink state, refreshed every tick.
+struct UplinkLocal {
+    wan_up: bool,
+    sim_up: bool,
+    mwan3_seen: bool,
+    wan_uptime_secs: u32,
+    active_wan: String,
+    wan_carrier_changes: u32,
+    wan_rx_bytes: u64,
+    wan_tx_bytes: u64,
+    sim_rx_bytes: u64,
+    sim_tx_bytes: u64,
+}
+
+/// Slow network-probe uplink state, cached across ticks.
+struct UplinkProbe {
+    loss_pct: f64,
+    latency_ms: f64,
+    public_ip: String,
+    sim: Option<SiteUplinkSim>,
+}
+
+/// Merge the fast-local and cached-probe halves into the wire [`SiteUplink`]. Internet
+/// reachability comes from mwan3's own tracking (wan_up || sim_up) when mwan3 reported
+/// interfaces, so "có Internet" flips at the tick cadence (~20s) instead of the slow
+/// ping cache; ping still supplies the latency/loss numbers. When mwan3 gave nothing,
+/// fall back to the ping result so we don't falsely read "down".
+fn merge_uplink(local: UplinkLocal, probe: &UplinkProbe) -> SiteUplink {
+    let internet_reachable = if local.mwan3_seen {
+        local.wan_up || local.sim_up
+    } else {
+        probe.loss_pct < 100.0
+    };
+    SiteUplink {
+        active_wan: local.active_wan,
+        wan_up: local.wan_up,
+        sim_up: local.sim_up,
+        internet_reachable,
+        latency_ms: probe.latency_ms,
+        loss_pct: probe.loss_pct,
+        public_ip: probe.public_ip.clone(),
+        sim: probe.sim.clone(),
+        wan_carrier_changes: local.wan_carrier_changes,
+        wan_uptime_secs: local.wan_uptime_secs,
+        wan_rx_bytes: local.wan_rx_bytes,
+        wan_tx_bytes: local.wan_tx_bytes,
+        sim_rx_bytes: local.sim_rx_bytes,
+        sim_tx_bytes: local.sim_tx_bytes,
     }
 }
 
@@ -1198,6 +1262,42 @@ pub fn parse_gsm(json: &str) -> Option<SiteUplinkSim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local(wan_up: bool, sim_up: bool, mwan3_seen: bool) -> UplinkLocal {
+        UplinkLocal {
+            wan_up,
+            sim_up,
+            mwan3_seen,
+            wan_uptime_secs: 0,
+            active_wan: "wan".into(),
+            wan_carrier_changes: 0,
+            wan_rx_bytes: 0,
+            wan_tx_bytes: 0,
+            sim_rx_bytes: 0,
+            sim_tx_bytes: 0,
+        }
+    }
+    fn probe(loss_pct: f64) -> UplinkProbe {
+        UplinkProbe { loss_pct, latency_ms: 0.0, public_ip: String::new(), sim: None }
+    }
+
+    #[test]
+    fn merge_uplink_reachable_follows_mwan3_when_present() {
+        // mwan3 reported interfaces + WAN online → reachable at tick cadence, even if the
+        // cached ping shows 100% loss (stale-down).
+        assert!(merge_uplink(local(true, false, true), &probe(100.0)).internet_reachable);
+        // mwan3 reported interfaces, all offline → NOT reachable even if cached ping is 0% loss.
+        assert!(!merge_uplink(local(false, false, true), &probe(0.0)).internet_reachable);
+        // SIM online counts as reachable.
+        assert!(merge_uplink(local(false, true, true), &probe(100.0)).internet_reachable);
+    }
+
+    #[test]
+    fn merge_uplink_falls_back_to_ping_when_mwan3_absent() {
+        // mwan3 gave nothing (tool absent/empty) → use the ping result, not a false "down".
+        assert!(merge_uplink(local(false, false, false), &probe(0.0)).internet_reachable);
+        assert!(!merge_uplink(local(false, false, false), &probe(100.0)).internet_reachable);
+    }
 
     #[test]
     fn station_dump_parses_all_fields_lowercased() {

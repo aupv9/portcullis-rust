@@ -4,6 +4,22 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.36.0] — 2026-08-11
+
+### Changed
+- **Near-realtime uplink telemetry (P1).** Split `gather_uplink` by cost so the fast
+  LOCAL reads (mwan3 status, default route, `/proc/net/dev` per-uplink bytes,
+  `/sys/.../carrier_changes`) run EVERY site-telemetry tick (~20s), while only the slow
+  network probes (ping / curl / ubus gsm) stay cached and refresh every
+  `UPLINK_REFRESH_EVERY` ticks (~60s). Result: **WAN up/down, failover, link-flap and
+  per-uplink throughput now surface at ~20s instead of ~60s** — no cadence change, no
+  extra probe cost (local reads are sub-ms).
+- **`internet_reachable` now follows mwan3's own tracking** (`wan_up || sim_up`) when
+  mwan3 reports interfaces, so "có Internet" flips at the tick cadence (~20s) instead of
+  the 60s ping cache. Falls back to the ping result when mwan3 is unavailable/empty so a
+  missing tool never reads a false "down". Ping still supplies the latency/loss numbers
+  (cached ~60s). New unit tests cover both the mwan3 and ping-fallback paths.
+
 ## [0.35.0] — 2026-08-10
 
 ### Added
