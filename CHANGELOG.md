@@ -4,6 +4,19 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.38.0] — 2026-08-12
+
+### Added
+- **LAN port telemetry on swconfig switches** (RUT200 / RUT906 — rt305x/mt7530, which have
+  no DSA `lanN` netdevs). `gather_lan_ports` now falls back to `swconfig` when no DSA
+  slaves exist: per LAN port (`port N get lan == 1`) it reports link/speed/duplex parsed
+  from `swconfig … port N get link`, and the downstream device(s) from the switch ARL table
+  (`get dump_arl`, PORTMAP hex bitmask → port) matched to DHCP leases. rt305x exposes no
+  per-port **byte** counters, so `rx_bytes`/`tx_bytes` stay 0 (throughput unknown) — the
+  dashboard shows link + device but "—" for throughput on these switches; DSA boxes
+  (RUTM11) keep full per-port throughput. New unit tests cover the link / `list` / ARL
+  parsers against real RUT200 output. No proto change.
+
 ## [0.37.0] — 2026-08-12
 
 ### Added
