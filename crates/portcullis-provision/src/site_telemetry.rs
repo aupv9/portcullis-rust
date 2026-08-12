@@ -524,7 +524,8 @@ async fn gather_lan_ports<R: CommandRunner>(
 ) -> Vec<SiteLanPort> {
     let names = list_lan_ports(&run_text(runner, "ls", &["-1", "/sys/class/net"]).await);
     if names.is_empty() {
-        return Vec::new();
+        // No DSA slaves → fall back to a swconfig switch (RUT200/RUT906: rt305x/…).
+        return gather_lan_ports_swconfig(runner, leases, neigh).await;
     }
     let fdb = parse_bridge_fdb(&run_text(runner, "bridge", &["fdb", "show"]).await);
     let mut out = Vec::with_capacity(names.len());
@@ -565,6 +566,125 @@ async fn gather_lan_ports<R: CommandRunner>(
             })
             .unwrap_or_default();
         out.push(SiteLanPort { name, link_up, speed_mbps, duplex, rx_bytes, tx_bytes, devices });
+    }
+    out
+}
+
+/// swconfig fallback for boxes without DSA slaves (RUT200 / RUT906 — rt305x/mt7530 …).
+/// Per LAN port (`get lan` == 1): link/speed/duplex from `get link`; downstream devices
+/// from the switch ARL table (`get dump_arl`, PORTMAP bitmask) matched to DHCP leases.
+/// rt305x exposes no per-port BYTE counters, so throughput is left unknown (rx/tx = 0) —
+/// the dashboard shows link + device but "—" for throughput on these switches.
+async fn gather_lan_ports_swconfig<R: CommandRunner>(
+    runner: &R,
+    leases: &BTreeMap<String, (String, String)>,
+    neigh: &BTreeMap<String, String>,
+) -> Vec<SiteLanPort> {
+    let dev = match parse_swconfig_dev(&run_text(runner, "swconfig", &["list"]).await) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let arl =
+        parse_swconfig_arl(&run_text(runner, "swconfig", &["dev", &dev, "get", "dump_arl"]).await);
+    let mut out = Vec::new();
+    let mut seq = 0u32;
+    // rt305x tops out at 7 ports (cpu @ 6); probe a bounded range, keep LAN ports only.
+    for p in 0..=6u32 {
+        let ps = p.to_string();
+        if run_text(runner, "swconfig", &["dev", &dev, "port", &ps, "get", "lan"]).await.trim() != "1" {
+            continue; // WAN, CPU, or non-existent port
+        }
+        let link = run_text(runner, "swconfig", &["dev", &dev, "port", &ps, "get", "link"]).await;
+        let Some((link_up, speed_mbps, duplex)) = parse_swconfig_link(&link) else { continue };
+        seq += 1;
+        let devices = arl
+            .get(&p)
+            .map(|macs| {
+                macs.iter()
+                    .map(|mac| {
+                        let (ip, hostname) = leases.get(mac).cloned().unwrap_or_default();
+                        let ip = if ip.is_empty() {
+                            neigh.get(mac).cloned().unwrap_or_default()
+                        } else {
+                            ip
+                        };
+                        SiteLanDevice { mac: mac.clone(), ip, hostname }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(SiteLanPort {
+            name: format!("lan{seq}"),
+            link_up,
+            speed_mbps,
+            duplex,
+            rx_bytes: 0, // rt305x has no per-port byte counters
+            tx_bytes: 0,
+            devices,
+        });
+    }
+    out
+}
+
+/// First `switchN` device from `swconfig list` ("Found: switch0 - rt305x").
+fn parse_swconfig_dev(list: &str) -> Option<String> {
+    list.split_whitespace()
+        .find(|t| t.starts_with("switch") && t.len() > 6 && t[6..].bytes().all(|b| b.is_ascii_digit()))
+        .map(|t| t.to_string())
+}
+
+/// `swconfig … port N get link` → (up, speed_mbps, duplex).
+///   "port:1 link:up speed:100baseT full-duplex" → (true, 100, "full")
+///   "port:0 link:down"                          → (false, 0, "")
+///   "Failed to get attribute" / ""              → None (port absent)
+fn parse_swconfig_link(s: &str) -> Option<(bool, u32, String)> {
+    if !s.contains("link:") {
+        return None;
+    }
+    if !s.contains("link:up") {
+        return Some((false, 0, String::new()));
+    }
+    let speed = s
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("speed:"))
+        .and_then(|v| v.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+        .unwrap_or(0);
+    let duplex = if s.contains("full-duplex") {
+        "full".to_string()
+    } else if s.contains("half-duplex") {
+        "half".to_string()
+    } else {
+        String::new()
+    };
+    Some((true, speed, duplex))
+}
+
+/// `swconfig … get dump_arl` → switch-port -> learned MACs (lowercased, deduped).
+///   "MAC: 20:97:27:7e:ee:9f PORTMAP: 0x02 VID: 0x00 STATUS: 0x01"
+/// PORTMAP is a hex bitmask (bit i = port i). Multicast/broadcast dropped.
+fn parse_swconfig_arl(text: &str) -> BTreeMap<u32, Vec<String>> {
+    let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let mac = f.iter().position(|&t| t == "MAC:").and_then(|i| f.get(i + 1)).copied();
+        let pm = f.iter().position(|&t| t == "PORTMAP:").and_then(|i| f.get(i + 1)).copied();
+        let (Some(mac), Some(pm)) = (mac, pm) else { continue };
+        let mac = mac.to_ascii_lowercase();
+        if mac.starts_with("33:33") || mac.starts_with("01:00:5e") || mac.starts_with("ff:ff") {
+            continue;
+        }
+        let Ok(mask) = u32::from_str_radix(pm.trim_start_matches("0x").trim_start_matches("0X"), 16)
+        else {
+            continue;
+        };
+        for port in 0..32u32 {
+            if mask & (1 << port) != 0 {
+                let e = out.entry(port).or_default();
+                if !e.contains(&mac) {
+                    e.push(mac.clone());
+                }
+            }
+        }
     }
     out
 }
@@ -1370,6 +1490,30 @@ mod tests {
         assert_eq!(list_lan_ports(ls), vec!["lan1", "lan2", "lan3"]);
         // swconfig box (no lanN netdevs) -> empty
         assert!(list_lan_ports("br-lan\neth0\neth0.1\nwan\n").is_empty());
+    }
+
+    #[test]
+    fn swconfig_link_and_dev_and_arl_parse() {
+        assert_eq!(parse_swconfig_dev("Found: switch0 - rt305x"), Some("switch0".to_string()));
+        assert_eq!(parse_swconfig_dev("nothing here"), None);
+        // real RUT200 (rt305x) link strings
+        assert_eq!(
+            parse_swconfig_link("port:1 link:up speed:100baseT full-duplex "),
+            Some((true, 100, "full".to_string()))
+        );
+        assert_eq!(parse_swconfig_link("port:0 link:down"), Some((false, 0, String::new())));
+        assert_eq!(parse_swconfig_link("Failed to get attribute: Invalid input"), None);
+        assert_eq!(
+            parse_swconfig_link("port:2 link:up speed:1000baseT full-duplex"),
+            Some((true, 1000, "full".to_string()))
+        );
+        // real dump_arl: PORTMAP 0x02 = port 1, 0x40 = port 6 (CPU)
+        let arl = parse_swconfig_arl(
+            "MAC: 20:97:27:74:45:cc PORTMAP: 0x40 VID: 0x00 STATUS: 0x01\n\
+             MAC: 20:97:27:7e:ee:9f PORTMAP: 0x02 VID: 0x00 STATUS: 0x01\n",
+        );
+        assert_eq!(arl.get(&1), Some(&vec!["20:97:27:7e:ee:9f".to_string()]));
+        assert_eq!(arl.get(&6), Some(&vec!["20:97:27:74:45:cc".to_string()]));
     }
 
     #[test]
