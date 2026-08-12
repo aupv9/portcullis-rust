@@ -143,9 +143,15 @@ message SiteClient {
 }
 
 message SiteUplinkSim {
-  string operator = 1;
-  int32  rsrp     = 2;
-  int32  sinr     = 3;
+  string operator  = 1; // network name, e.g. "Wintel"
+  int32  rsrp      = 2; // dBm
+  int32  sinr      = 3; // dB
+  int32  rsrq      = 4; // dB
+  int32  rssi      = 5; // dBm
+  string net_type  = 6; // "LTE"|"5G"|"WCDMA"|… (net_mode); "" = no service
+  string band      = 7; // e.g. "LTE B3"
+  bool   connected = 8; // data session up (net_mode != "No service")
+  string msisdn    = 9; // SIM's own number via AT+CNUM; "" if not provisioned (common)
 }
 
 message SiteUplink {

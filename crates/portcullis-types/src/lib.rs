@@ -1150,6 +1150,12 @@ pub struct SiteUplinkSim {
     pub operator: String,
     pub rsrp: i32,
     pub sinr: i32,
+    pub rsrq: i32,
+    pub rssi: i32,
+    pub net_type: String, // "LTE"|"5G"|"WCDMA"|… ; "" = no service
+    pub band: String,     // e.g. "LTE B3"
+    pub connected: bool,
+    pub msisdn: String,   // SIM's own number (AT+CNUM); "" if not provisioned
 }
 
 /// Site uplink / Internet reachability. f64 ⇒ no `Eq`.

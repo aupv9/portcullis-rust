@@ -217,12 +217,33 @@ pub struct SiteClient {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SiteUplinkSim {
+    /// network name, e.g. "Wintel"
     #[prost(string, tag="1")]
     pub operator: ::prost::alloc::string::String,
+    /// dBm
     #[prost(int32, tag="2")]
     pub rsrp: i32,
+    /// dB
     #[prost(int32, tag="3")]
     pub sinr: i32,
+    /// dB
+    #[prost(int32, tag="4")]
+    pub rsrq: i32,
+    /// dBm
+    #[prost(int32, tag="5")]
+    pub rssi: i32,
+    /// "LTE"|"5G"|"WCDMA"|… (net_mode); "" = no service
+    #[prost(string, tag="6")]
+    pub net_type: ::prost::alloc::string::String,
+    /// e.g. "LTE B3"
+    #[prost(string, tag="7")]
+    pub band: ::prost::alloc::string::String,
+    /// data session up (net_mode != "No service")
+    #[prost(bool, tag="8")]
+    pub connected: bool,
+    /// SIM's own number via AT+CNUM; "" if not provisioned (common)
+    #[prost(string, tag="9")]
+    pub msisdn: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
