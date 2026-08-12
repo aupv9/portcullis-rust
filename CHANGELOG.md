@@ -4,6 +4,17 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.39.0] — 2026-08-12
+
+### Fixed
+- **swconfig LAN ports: enumerate real (wired) ports, not every chip port.** rt305x
+  switches (RUT200/RUT906) expose 6 switch ports but a board wires only some to jacks
+  (RUT200 = 1 LAN). The previous `get lan`==1 probe surfaced the unwired chip ports as
+  phantom LAN ports. Now derive the physical LAN ports from the switch-VLAN membership
+  in `uci show network` (untagged member ports of the switch_vlan the LAN bridge sits on;
+  the tagged CPU port is excluded), falling back to the port probe only if the layout
+  can't be resolved. New unit test against the real RUT200 UCI layout.
+
 ## [0.38.0] — 2026-08-12
 
 ### Added
