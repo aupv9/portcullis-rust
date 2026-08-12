@@ -212,6 +212,27 @@ message SiteEvent {
   string message  = 4; // human-readable (vi)
 }
 
+// A device learned on a physical LAN port (from the bridge FDB, matched to a DHCP
+// lease). >1 device on a port ⇒ a downstream switch is plugged in.
+message SiteLanDevice {
+  string mac      = 1;
+  string ip       = 2; // from DHCP lease / neigh; "" if unknown
+  string hostname = 3; // from DHCP lease; "" if unknown
+}
+
+// One physical wired Ethernet LAN port on the router (DSA slave, e.g. lan1/lan2/lan3).
+// Byte counters are cumulative so the CP derives per-port throughput; devices lists the
+// downstream MACs learned on this port. WAN is reported separately under SiteUplink.
+message SiteLanPort {
+  string name       = 1; // netdev name, e.g. "lan1"
+  bool   link_up    = 2; // carrier == 1 (cable plugged + link)
+  uint32 speed_mbps = 3; // negotiated PHY 10/100/1000; 0 = down/unknown
+  string duplex     = 4; // "full"|"half"|""
+  uint64 rx_bytes   = 5; // cumulative /sys/class/net/<name>/statistics/rx_bytes
+  uint64 tx_bytes   = 6; // cumulative tx_bytes
+  repeated SiteLanDevice devices = 7; // downstream devices learned on this port
+}
+
 // One whole-site snapshot for a router, pushed unsolicited as
 // EngineFrame.site_telemetry.
 message SiteTelemetryReport {
@@ -224,6 +245,7 @@ message SiteTelemetryReport {
   SiteHealth          health  = 7; // router CPU/RAM/flash/temp
   repeated SiteFlow   flows   = 8; // top-N client->internet conversations (top-talkers)
   repeated SiteEvent  events  = 9; // edge/threshold events detected this tick (traps)
+  repeated SiteLanPort lan_ports = 10; // physical wired LAN ports (DSA: lan1/lan2/…)
 }
 
 // control plane -> engine. `correlation_id` is echoed back in the answering

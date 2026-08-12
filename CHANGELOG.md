@@ -4,6 +4,23 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.37.0] — 2026-08-12
+
+### Added
+- **Wired LAN port telemetry.** New `SiteLanPort` (+ `SiteLanDevice`) in the site-telemetry
+  report (`SiteTelemetryReport.lan_ports`, field 10 — additive, wire-compatible). Per
+  physical DSA LAN port (`lan1/lan2/…`) the engine reports, every tick (~20s, local reads):
+  - link up/down, negotiated speed (10/100/1000) and duplex — from
+    `/sys/class/net/<port>/{carrier,speed,duplex}`;
+  - cumulative rx/tx bytes — from `/sys/class/net/<port>/statistics/*` (the CP derives
+    per-port throughput, same Δbytes/Δt as clients/uplink);
+  - the downstream device(s) learned on the port — from `bridge fdb show` (dynamic entries
+    only, router-own/multicast filtered) matched to DHCP leases → mac/ip/hostname. >1 MAC on
+    a port surfaces as a downstream switch.
+  Enumeration is DSA-only (netdevs named `lanN`); non-DSA boxes (swconfig, e.g. RUT906)
+  report no ports and the dashboard panel hides itself. WAN stays under `SiteUplink`. New
+  unit tests cover the `ls`/netdev filter and the bridge-FDB parser.
+
 ## [0.36.0] — 2026-08-11
 
 ### Changed

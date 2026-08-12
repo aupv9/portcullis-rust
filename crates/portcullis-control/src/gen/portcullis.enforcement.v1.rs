@@ -359,6 +359,48 @@ pub struct SiteEvent {
     #[prost(string, tag="4")]
     pub message: ::prost::alloc::string::String,
 }
+/// A device learned on a physical LAN port (from the bridge FDB, matched to a DHCP
+/// lease). >1 device on a port ⇒ a downstream switch is plugged in.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteLanDevice {
+    #[prost(string, tag="1")]
+    pub mac: ::prost::alloc::string::String,
+    /// from DHCP lease / neigh; "" if unknown
+    #[prost(string, tag="2")]
+    pub ip: ::prost::alloc::string::String,
+    /// from DHCP lease; "" if unknown
+    #[prost(string, tag="3")]
+    pub hostname: ::prost::alloc::string::String,
+}
+/// One physical wired Ethernet LAN port on the router (DSA slave, e.g. lan1/lan2/lan3).
+/// Byte counters are cumulative so the CP derives per-port throughput; devices lists the
+/// downstream MACs learned on this port. WAN is reported separately under SiteUplink.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SiteLanPort {
+    /// netdev name, e.g. "lan1"
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// carrier == 1 (cable plugged + link)
+    #[prost(bool, tag="2")]
+    pub link_up: bool,
+    /// negotiated PHY 10/100/1000; 0 = down/unknown
+    #[prost(uint32, tag="3")]
+    pub speed_mbps: u32,
+    /// "full"|"half"|""
+    #[prost(string, tag="4")]
+    pub duplex: ::prost::alloc::string::String,
+    /// cumulative /sys/class/net/<name>/statistics/rx_bytes
+    #[prost(uint64, tag="5")]
+    pub rx_bytes: u64,
+    /// cumulative tx_bytes
+    #[prost(uint64, tag="6")]
+    pub tx_bytes: u64,
+    /// downstream devices learned on this port
+    #[prost(message, repeated, tag="7")]
+    pub devices: ::prost::alloc::vec::Vec<SiteLanDevice>,
+}
 /// One whole-site snapshot for a router, pushed unsolicited as
 /// EngineFrame.site_telemetry.
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -387,6 +429,9 @@ pub struct SiteTelemetryReport {
     /// edge/threshold events detected this tick (traps)
     #[prost(message, repeated, tag="9")]
     pub events: ::prost::alloc::vec::Vec<SiteEvent>,
+    /// physical wired LAN ports (DSA: lan1/lan2/…)
+    #[prost(message, repeated, tag="10")]
+    pub lan_ports: ::prost::alloc::vec::Vec<SiteLanPort>,
 }
 /// control plane -> engine. `correlation_id` is echoed back in the answering
 /// EngineFrame(s) so overlapping requests can be matched.

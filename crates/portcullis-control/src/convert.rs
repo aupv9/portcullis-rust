@@ -452,6 +452,19 @@ pub fn site_telemetry_report_to_pb(r: &SiteTelemetryReport) -> pb::SiteTelemetry
             severity: e.severity.clone(),
             message: e.message.clone(),
         }).collect(),
+        lan_ports: r.lan_ports.iter().map(|p| pb::SiteLanPort {
+            name: p.name.clone(),
+            link_up: p.link_up,
+            speed_mbps: p.speed_mbps,
+            duplex: p.duplex.clone(),
+            rx_bytes: p.rx_bytes,
+            tx_bytes: p.tx_bytes,
+            devices: p.devices.iter().map(|d| pb::SiteLanDevice {
+                mac: d.mac.clone(),
+                ip: d.ip.clone(),
+                hostname: d.hostname.clone(),
+            }).collect(),
+        }).collect(),
     }
 }
 

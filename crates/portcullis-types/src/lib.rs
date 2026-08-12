@@ -1217,6 +1217,27 @@ pub struct SiteEvent {
     pub message: String,
 }
 
+/// A device learned on a physical LAN port (bridge FDB matched to a DHCP lease).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteLanDevice {
+    pub mac: String,
+    pub ip: String,
+    pub hostname: String,
+}
+
+/// One physical wired Ethernet LAN port (DSA slave, e.g. lan1/lan2/lan3). Byte
+/// counters are cumulative so the CP derives per-port throughput.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SiteLanPort {
+    pub name: String,
+    pub link_up: bool,
+    pub speed_mbps: u32, // 10/100/1000; 0 = down/unknown
+    pub duplex: String,  // "full"|"half"|""
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub devices: Vec<SiteLanDevice>,
+}
+
 /// One whole-site telemetry snapshot for a router (Transport A).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SiteTelemetryReport {
@@ -1229,6 +1250,7 @@ pub struct SiteTelemetryReport {
     pub health: SiteHealth,
     pub flows: Vec<SiteFlow>,
     pub events: Vec<SiteEvent>,
+    pub lan_ports: Vec<SiteLanPort>,
 }
 
 /// Shared, interior-mutable control-channel health tracked by the control task
