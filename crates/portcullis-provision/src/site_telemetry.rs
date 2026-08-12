@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use portcullis_types::{
-    ControlChannelHealth, SiteClient, SiteEvent, SiteFlow, SiteHealth, SiteSsid,
-    SiteTelemetryReport, SiteUplink, SiteUplinkSim,
+    ControlChannelHealth, SiteClient, SiteEvent, SiteFlow, SiteHealth, SiteLanDevice,
+    SiteLanPort, SiteSsid, SiteTelemetryReport, SiteUplink, SiteUplinkSim,
 };
 use tokio::sync::mpsc;
 
@@ -268,6 +268,10 @@ pub async fn poll_once<R: CommandRunner>(
         clients.iter().filter(|c| !c.ip.is_empty()).map(|c| c.ip.clone()).collect();
     let flows = top_flows(&ct_flows, &client_ips, TOP_FLOWS_N);
 
+    // Physical wired LAN ports (DSA slaves lanN): link/speed + per-port throughput +
+    // learned downstream devices. Empty on non-DSA (swconfig) boxes — fail-soft.
+    let lan_ports = gather_lan_ports(runner, &leases, &neigh).await;
+
     // control is filled by the poller from the shared ControlChannelHealth; uplink is
     // the poller's cached probe (refreshed on a slower cadence).
     SiteTelemetryReport {
@@ -280,6 +284,7 @@ pub async fn poll_once<R: CommandRunner>(
         health,
         flows,
         events: Vec::new(), // filled by the poller loop's EventDetector after control/cpu are set
+        lan_ports,
     }
 }
 
@@ -506,6 +511,102 @@ fn merge_uplink(local: UplinkLocal, probe: &UplinkProbe) -> SiteUplink {
         sim_rx_bytes: local.sim_rx_bytes,
         sim_tx_bytes: local.sim_tx_bytes,
     }
+}
+
+/// Gather physical wired LAN ports (DSA slaves named lanN). Per-port link/speed/duplex
+/// and cumulative byte counters come from sysfs; downstream devices from the bridge FDB
+/// matched to DHCP leases. All local reads, so this runs every tick (near-realtime).
+/// Non-DSA boxes (swconfig, e.g. RUT906) have no lanN netdevs → empty (fail-soft).
+async fn gather_lan_ports<R: CommandRunner>(
+    runner: &R,
+    leases: &BTreeMap<String, (String, String)>,
+    neigh: &BTreeMap<String, String>,
+) -> Vec<SiteLanPort> {
+    let names = list_lan_ports(&run_text(runner, "ls", &["-1", "/sys/class/net"]).await);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let fdb = parse_bridge_fdb(&run_text(runner, "bridge", &["fdb", "show"]).await);
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        // One cat over the 5 sysfs fields (ordered) — carrier, speed, duplex, rx, tx.
+        let p_carrier = format!("/sys/class/net/{name}/carrier");
+        let p_speed = format!("/sys/class/net/{name}/speed");
+        let p_duplex = format!("/sys/class/net/{name}/duplex");
+        let p_rx = format!("/sys/class/net/{name}/statistics/rx_bytes");
+        let p_tx = format!("/sys/class/net/{name}/statistics/tx_bytes");
+        let raw =
+            run_text(runner, "cat", &[&p_carrier, &p_speed, &p_duplex, &p_rx, &p_tx]).await;
+        let lines: Vec<&str> = raw.lines().map(|l| l.trim()).collect();
+        let g = |i: usize| lines.get(i).copied().unwrap_or("");
+        let link_up = g(0) == "1";
+        let speed_raw: i64 = g(1).parse().unwrap_or(-1);
+        let speed_mbps = if speed_raw > 0 { speed_raw as u32 } else { 0 };
+        let duplex = match g(2) {
+            d @ ("full" | "half") => d.to_string(),
+            _ => String::new(),
+        };
+        let rx_bytes = g(3).parse().unwrap_or(0);
+        let tx_bytes = g(4).parse().unwrap_or(0);
+        let devices = fdb
+            .get(&name)
+            .map(|macs| {
+                macs.iter()
+                    .map(|mac| {
+                        let (ip, hostname) = leases.get(mac).cloned().unwrap_or_default();
+                        let ip = if ip.is_empty() {
+                            neigh.get(mac).cloned().unwrap_or_default()
+                        } else {
+                            ip
+                        };
+                        SiteLanDevice { mac: mac.clone(), ip, hostname }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(SiteLanPort { name, link_up, speed_mbps, duplex, rx_bytes, tx_bytes, devices });
+    }
+    out
+}
+
+/// Physical LAN port netdevs from `ls /sys/class/net`: names `lan` + digits (DSA slaves
+/// lan1/lan2/…). Excludes the `lan` bridge itself and any non-numeric suffix.
+fn list_lan_ports(ls_output: &str) -> Vec<String> {
+    ls_output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| is_lan_port(l))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn is_lan_port(dev: &str) -> bool {
+    dev.len() > 3 && dev.starts_with("lan") && dev[3..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse `bridge fdb show` -> LAN port -> learned downstream MACs (lowercased, deduped,
+/// order-preserving). Skips the router's own `permanent`/`self` entries and multicast so
+/// only real plugged-in devices remain; >1 MAC on a port ⇒ a downstream switch.
+fn parse_bridge_fdb(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 || f[1] != "dev" || !is_lan_port(f[2]) {
+            continue;
+        }
+        if f.iter().any(|&t| t == "permanent" || t == "self") {
+            continue;
+        }
+        let mac = f[0].to_ascii_lowercase();
+        if mac.starts_with("33:33") || mac.starts_with("01:00:5e") || mac.starts_with("ff:ff") {
+            continue;
+        }
+        let entry = out.entry(f[2].to_string()).or_default();
+        if !entry.contains(&mac) {
+            entry.push(mac);
+        }
+    }
+    out
 }
 
 /// Router system health via local sources (SNMP-equivalent, no snmpd): ubus for
@@ -1262,6 +1363,37 @@ pub fn parse_gsm(json: &str) -> Option<SiteUplinkSim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_lan_ports_picks_dsa_slaves_only() {
+        let ls = "br-lan\neth0\nlan\nlan1\nlan2\nlan3\nwan\nwlan0-1\nwwan0\n";
+        assert_eq!(list_lan_ports(ls), vec!["lan1", "lan2", "lan3"]);
+        // swconfig box (no lanN netdevs) -> empty
+        assert!(list_lan_ports("br-lan\neth0\neth0.1\nwan\n").is_empty());
+    }
+
+    #[test]
+    fn bridge_fdb_keeps_learned_downstream_only() {
+        let text = "\
+20:97:27:a1:32:58 dev lan1 vlan 1 master br-lan permanent
+20:97:27:a1:32:58 dev lan1 master br-lan permanent
+AA:BB:CC:DD:EE:01 dev lan1 master br-lan
+aa:bb:cc:dd:ee:01 dev lan1 vlan 1 master br-lan
+bb:bb:cc:dd:ee:02 dev lan2 master br-lan
+cc:cc:cc:dd:ee:03 dev lan2 vlan 1 master br-lan
+33:33:00:00:00:01 dev lan2 self permanent
+20:97:27:a1:32:5b dev wlan1-2 master br-lan permanent";
+        let fdb = parse_bridge_fdb(text);
+        // lan1: router's own (permanent) dropped; learned MAC deduped + lowercased.
+        assert_eq!(fdb.get("lan1"), Some(&vec!["aa:bb:cc:dd:ee:01".to_string()]));
+        // lan2: two distinct learned MACs = downstream switch; multicast self dropped.
+        assert_eq!(
+            fdb.get("lan2"),
+            Some(&vec!["bb:bb:cc:dd:ee:02".to_string(), "cc:cc:cc:dd:ee:03".to_string()])
+        );
+        // a WiFi VIF is not a physical LAN port -> never tracked.
+        assert!(fdb.get("wlan1-2").is_none());
+    }
 
     fn local(wan_up: bool, sim_up: bool, mwan3_seen: bool) -> UplinkLocal {
         UplinkLocal {
