@@ -586,10 +586,16 @@ async fn gather_lan_ports_swconfig<R: CommandRunner>(
     };
     let arl =
         parse_swconfig_arl(&run_text(runner, "swconfig", &["dev", &dev, "get", "dump_arl"]).await);
+    // Physical LAN ports = untagged members of the switch_vlan the LAN bridge sits on
+    // (from `uci show network`). This excludes switch ports that exist on the chip but
+    // aren't wired to a jack (rt305x has 6 ports; RUT200 wires only 1) — probing every
+    // `get lan`==1 port would surface those as phantom ports. Fall back to the lan-flag
+    // probe (ports 0..=6) if the UCI layout can't be resolved.
+    let net = run_text(runner, "uci", &["-q", "show", "network"]).await;
+    let switch_ports = swconfig_lan_ports_from_uci(&net).unwrap_or_else(|| (0..=6).collect());
     let mut out = Vec::new();
     let mut seq = 0u32;
-    // rt305x tops out at 7 ports (cpu @ 6); probe a bounded range, keep LAN ports only.
-    for p in 0..=6u32 {
+    for p in switch_ports {
         let ps = p.to_string();
         if run_text(runner, "swconfig", &["dev", &dev, "port", &ps, "get", "lan"]).await.trim() != "1" {
             continue; // WAN, CPU, or non-existent port
@@ -687,6 +693,45 @@ fn parse_swconfig_arl(text: &str) -> BTreeMap<u32, Vec<String>> {
         }
     }
     out
+}
+
+/// From `uci show network`, the physical LAN switch ports for a swconfig box: the
+/// UNTAGGED member ports of the switch_vlan the LAN bridge sits on (the CPU port is
+/// tagged, e.g. "6t", so it's excluded). Returns None if the layout can't be resolved
+/// (caller falls back to probing every port). Keeps phantom (unwired) chip ports out.
+fn swconfig_lan_ports_from_uci(net: &str) -> Option<Vec<u32>> {
+    // lan bridge device (e.g. network.lan.device='br-lan') → its section (br_lan) →
+    // its member device 'eth0.<vid>' → the LAN vlan id.
+    let lan_dev = uci_value(net, "network.lan.device")?;
+    let member = uci_value(net, &format!("network.{}.ports", lan_dev.replace('-', "_")))?;
+    let lan_vid = member.rsplit('.').next()?.trim().to_string();
+    // switch_vlan[k] whose vid == lan_vid → its untagged ports.
+    for k in 0..16 {
+        match (
+            uci_value(net, &format!("network.@switch_vlan[{k}].vid")),
+            uci_value(net, &format!("network.@switch_vlan[{k}].ports")),
+        ) {
+            (Some(vid), Some(ports)) if vid == lan_vid => {
+                let v: Vec<u32> = ports
+                    .split_whitespace()
+                    .filter(|t| t.bytes().all(|b| b.is_ascii_digit())) // untagged only (drop "6t")
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                return if v.is_empty() { None } else { Some(v) };
+            }
+            (None, None) => break, // no more switch_vlan sections
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of a `uci show`-style line `key='val'` (quotes stripped). None if absent.
+fn uci_value(text: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix(&prefix))
+        .map(|v| v.trim().trim_matches('\'').to_string())
 }
 
 /// Physical LAN port netdevs from `ls /sys/class/net`: names `lan` + digits (DSA slaves
@@ -1490,6 +1535,30 @@ mod tests {
         assert_eq!(list_lan_ports(ls), vec!["lan1", "lan2", "lan3"]);
         // swconfig box (no lanN netdevs) -> empty
         assert!(list_lan_ports("br-lan\neth0\neth0.1\nwan\n").is_empty());
+    }
+
+    #[test]
+    fn swconfig_lan_ports_from_uci_uses_vlan_membership() {
+        // Real RUT200 layout: lan bridge on eth0.1; switch_vlan vid=1 has ports "1 6t"
+        // (port1 + tagged CPU) → only port1 is a physical LAN port (not 2..5).
+        let net = "\
+network.lan.device='br-lan'
+network.br_lan.ports='eth0.1'
+network.@switch_vlan[0].vid='1'
+network.@switch_vlan[0].ports='1 6t'
+network.@switch_vlan[1].vid='2'
+network.@switch_vlan[1].ports='0 6t'
+";
+        assert_eq!(swconfig_lan_ports_from_uci(net), Some(vec![1]));
+        // multi-LAN example (untagged 1 2 3, tagged CPU 6) → [1,2,3]
+        let net2 = "\
+network.lan.device='br-lan'
+network.br_lan.ports='eth0.1'
+network.@switch_vlan[0].vid='1'
+network.@switch_vlan[0].ports='1 2 3 6t'
+";
+        assert_eq!(swconfig_lan_ports_from_uci(net2), Some(vec![1, 2, 3]));
+        assert_eq!(swconfig_lan_ports_from_uci("network.foo='bar'"), None);
     }
 
     #[test]
