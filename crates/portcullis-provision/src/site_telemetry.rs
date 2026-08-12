@@ -458,7 +458,7 @@ async fn gather_uplink_probe<R: CommandRunner>(runner: &R) -> UplinkProbe {
         run_text(runner, "curl", &["-s", "--max-time", "5", "https://api.ipify.org"]).await
             .trim()
             .to_string();
-    let sim = parse_gsm(&run_text(runner, "ubus", &["call", "gsm.modem0", "info"]).await);
+    let sim = gather_sim(runner).await;
     UplinkProbe { loss_pct, latency_ms, public_ip, sim }
 }
 
@@ -1513,16 +1513,66 @@ impl FlowByteAccumulator {
     }
 }
 
-/// Parse `ubus call gsm.modem0 info` JSON -> SIM signal, or None (no modem / empty).
-pub fn parse_gsm(json: &str) -> Option<SiteUplinkSim> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let operator = v.get("operator").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let rsrp = v.get("rsrp_value").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-    let sinr = v.get("sinr_value").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-    if operator.is_empty() && rsrp == 0 && sinr == 0 {
-        return None;
+/// Backup-SIM info from the modem: signal (`read_signal_db`) + network mode
+/// (`get_network_info`) + operator name (`gsmctl -o`) + own number (`gsmctl -A AT+CNUM`).
+/// `None` only when nothing responds (no modem → FE shows "không có"). Runs in the slow
+/// probe path (cached ~60s). Replaces the old `gsm.modem0 info` query, which returns
+/// modem HARDWARE info (no operator/signal) and always read empty.
+async fn gather_sim<R: CommandRunner>(runner: &R) -> Option<SiteUplinkSim> {
+    let sig = parse_signal_db(&run_text(runner, "ubus", &["call", "gsm.modem0", "read_signal_db"]).await);
+    let net_mode = parse_gsm_net_mode(&run_text(runner, "ubus", &["call", "gsm.modem0", "get_network_info"]).await);
+    let operator = run_text(runner, "gsmctl", &["-o"]).await.trim().to_string();
+    let msisdn = parse_cnum(&run_text(runner, "gsmctl", &["-A", "AT+CNUM"]).await);
+    if sig.is_none() && net_mode.is_empty() && operator.is_empty() && msisdn.is_empty() {
+        return None; // no modem present
     }
-    Some(SiteUplinkSim { operator, rsrp, sinr })
+    let (rssi, rsrp, rsrq, sinr, band) = sig.unwrap_or((0, 0, 0, 0, String::new()));
+    let no_service = net_mode.is_empty() || net_mode == "No service";
+    Some(SiteUplinkSim {
+        operator,
+        rsrp,
+        sinr,
+        rsrq,
+        rssi,
+        net_type: if no_service { String::new() } else { net_mode },
+        band,
+        connected: !no_service,
+        msisdn,
+    })
+}
+
+/// Newest `signal_data` entry of `ubus … read_signal_db` → (rssi, rsrp, rsrq, sinr, band).
+/// None when there are no samples (no service).
+fn parse_signal_db(json: &str) -> Option<(i32, i32, i32, i32, String)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let last = v.get("signal_data")?.as_array()?.last()?;
+    let n = |k: &str| last.get(k).and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+    let band = last.get("band").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Some((n("rssi"), n("rsrp"), n("rsrq"), n("sinr"), band))
+}
+
+/// `net_mode` string from `ubus … get_network_info` (e.g. "LTE", "No service"). "" if absent.
+fn parse_gsm_net_mode(json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("net_mode").and_then(|x| x.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// SIM own number from `gsmctl -A "AT+CNUM"` (`+CNUM: "","+84…",145`). "" if the SIM has
+/// no MSISDN provisioned (common) or the query fails. Value is SIM-reported (may be stale).
+fn parse_cnum(text: &str) -> String {
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("+CNUM:") {
+            for f in rest.split(',') {
+                let n = f.trim().trim_matches('"');
+                if n.len() >= 6 && n.strip_prefix('+').unwrap_or(n).chars().all(|c| c.is_ascii_digit()) {
+                    return n.to_string();
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -1716,12 +1766,22 @@ Chain FORWARD (policy DROP 0 packets, 0 bytes)
     }
 
     #[test]
-    fn gsm_none_when_empty() {
-        assert!(parse_gsm("{}").is_none());
-        assert!(parse_gsm("not json").is_none());
-        let s = parse_gsm(r#"{"operator":"Viettel","rsrp_value":-71,"sinr_value":12}"#).unwrap();
-        assert_eq!(s.operator, "Viettel");
-        assert_eq!(s.rsrp, -71);
+    fn sim_signal_and_net_and_cnum_parse() {
+        // real .14 read_signal_db: take the NEWEST sample
+        let sig = parse_signal_db(
+            r#"{"signal_data":[{"sinr":19,"rssi":-50,"rsrp":-80,"rsrq":-10,"band":"LTE B3"},
+                               {"sinr":21,"rssi":-48,"rsrp":-80,"rsrq":-13,"band":"LTE B3"}]}"#,
+        );
+        assert_eq!(sig, Some((-48, -80, -13, 21, "LTE B3".to_string())));
+        assert!(parse_signal_db(r#"{"signal_data":[]}"#).is_none());
+        assert!(parse_signal_db("not json").is_none());
+        // net_mode
+        assert_eq!(parse_gsm_net_mode(r#"{"net_mode":"LTE","opernum":"45202"}"#), "LTE");
+        assert_eq!(parse_gsm_net_mode(r#"{"net_mode":"No service"}"#), "No service");
+        // AT+CNUM own number (real .14 shape) + not-provisioned
+        assert_eq!(parse_cnum("+CNUM: \"\",\"+1984559214938\",145\n\nOK"), "+1984559214938");
+        assert_eq!(parse_cnum("84901234567 via CNUM"), "");
+        assert_eq!(parse_cnum("+CNUM: \"\",\"\",129"), "");
     }
 
     #[test]

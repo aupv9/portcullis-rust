@@ -4,6 +4,18 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.40.0] — 2026-08-12
+
+### Fixed / Added
+- **Full backup-SIM info (fixes the always-empty SIM signal).** The engine was querying
+  `ubus gsm.modem0 info`, which returns modem *hardware* info (no operator/signal), so the
+  SIM always read empty. `gather_sim` now reads the correct sources: `read_signal_db`
+  (RSSI/RSRP/RSRQ/SINR + band from the newest sample), `get_network_info` (net_mode →
+  net_type + connected), `gsmctl -o` (operator name), and `gsmctl -A "AT+CNUM"` (SIM own
+  number/MSISDN — SIM-reported, often unprovisioned). `SiteUplinkSim` gains
+  `rsrq/rssi/net_type/band/connected/msisdn` (additive proto fields). New parser unit tests
+  against real RUT906 output.
+
 ## [0.39.0] — 2026-08-12
 
 ### Fixed
