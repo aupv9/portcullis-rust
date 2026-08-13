@@ -408,17 +408,20 @@ async fn list_bridge_vifs<R: CommandRunner>(runner: &R, bridge: &str) -> Vec<Str
 async fn gather_uplink_local<R: CommandRunner>(runner: &R) -> UplinkLocal {
     let mwan3 = run_text(runner, "mwan3", &["status"]).await;
     let (wan_up, sim_up) = parse_mwan3(&mwan3);
-    // Did mwan3 actually report interfaces? If not (tool absent / empty output), the
-    // reachable flag must fall back to the ping probe instead of falsely reading "down".
-    let mwan3_seen = mwan3.lines().any(|l| {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        f.len() >= 4 && f[0] == "interface" && f[2] == "is"
-    });
     let wan_uptime_secs = parse_mwan3_uptime(&mwan3, "wan");
     let dev = parse_default_dev(&run_text(runner, "ip", &["route", "show", "default"]).await);
     let active_wan = match dev.as_str() {
         "wan" => "wan".to_string(),
-        d if d.starts_with("mob") || d.starts_with("wwan") || d.starts_with("qmimux") || d.starts_with("rmnet") => "sim".to_string(),
+        // Cellular data interfaces across modem stacks: QMI (qmimux/wwan), MBIM (wwan),
+        // ECM/NCM (usbN — e.g. RUT906's internal USB modem), mwan3 (mob), rmnet.
+        d if d.starts_with("mob")
+            || d.starts_with("wwan")
+            || d.starts_with("qmimux")
+            || d.starts_with("rmnet")
+            || d.starts_with("usb") =>
+        {
+            "sim".to_string()
+        }
         "" => "unknown".to_string(),
         other => other.to_string(),
     };
@@ -437,7 +440,6 @@ async fn gather_uplink_local<R: CommandRunner>(runner: &R) -> UplinkLocal {
     UplinkLocal {
         wan_up,
         sim_up,
-        mwan3_seen,
         wan_uptime_secs,
         active_wan,
         wan_carrier_changes,
@@ -466,7 +468,6 @@ async fn gather_uplink_probe<R: CommandRunner>(runner: &R) -> UplinkProbe {
 struct UplinkLocal {
     wan_up: bool,
     sim_up: bool,
-    mwan3_seen: bool,
     wan_uptime_secs: u32,
     active_wan: String,
     wan_carrier_changes: u32,
@@ -490,15 +491,18 @@ struct UplinkProbe {
 /// ping cache; ping still supplies the latency/loss numbers. When mwan3 gave nothing,
 /// fall back to the ping result so we don't falsely read "down".
 fn merge_uplink(local: UplinkLocal, probe: &UplinkProbe) -> SiteUplink {
-    let internet_reachable = if local.mwan3_seen {
-        local.wan_up || local.sim_up
-    } else {
-        probe.loss_pct < 100.0
-    };
+    // Online iff mwan3 marks an uplink up OR there is a default route via a recognised
+    // uplink (active_wan != "unknown"). The route check covers cellular stacks mwan3
+    // doesn't track (e.g. RUT906's usb0 modem), so a SIM-only box isn't falsely shown as
+    // "Internet mất". Local + near-realtime; ping only supplies latency/loss.
+    let sim_active = local.active_wan == "sim";
+    let internet_reachable = local.wan_up || local.sim_up || local.active_wan != "unknown";
     SiteUplink {
         active_wan: local.active_wan,
         wan_up: local.wan_up,
-        sim_up: local.sim_up,
+        // A cellular uplink mwan3 doesn't track still counts as SIM up when it's the
+        // active path, so the SIM box reads "đang dùng" instead of a false "offline".
+        sim_up: local.sim_up || sim_active,
         internet_reachable,
         latency_ms: probe.latency_ms,
         loss_pct: probe.loss_pct,
@@ -1658,13 +1662,12 @@ cc:cc:cc:dd:ee:03 dev lan2 vlan 1 master br-lan
         assert!(fdb.get("wlan1-2").is_none());
     }
 
-    fn local(wan_up: bool, sim_up: bool, mwan3_seen: bool) -> UplinkLocal {
+    fn local(active_wan: &str, wan_up: bool, sim_up: bool) -> UplinkLocal {
         UplinkLocal {
             wan_up,
             sim_up,
-            mwan3_seen,
             wan_uptime_secs: 0,
-            active_wan: "wan".into(),
+            active_wan: active_wan.into(),
             wan_carrier_changes: 0,
             wan_rx_bytes: 0,
             wan_tx_bytes: 0,
@@ -1677,21 +1680,16 @@ cc:cc:cc:dd:ee:03 dev lan2 vlan 1 master br-lan
     }
 
     #[test]
-    fn merge_uplink_reachable_follows_mwan3_when_present() {
-        // mwan3 reported interfaces + WAN online → reachable at tick cadence, even if the
-        // cached ping shows 100% loss (stale-down).
-        assert!(merge_uplink(local(true, false, true), &probe(100.0)).internet_reachable);
-        // mwan3 reported interfaces, all offline → NOT reachable even if cached ping is 0% loss.
-        assert!(!merge_uplink(local(false, false, true), &probe(0.0)).internet_reachable);
-        // SIM online counts as reachable.
-        assert!(merge_uplink(local(false, true, true), &probe(100.0)).internet_reachable);
-    }
-
-    #[test]
-    fn merge_uplink_falls_back_to_ping_when_mwan3_absent() {
-        // mwan3 gave nothing (tool absent/empty) → use the ping result, not a false "down".
-        assert!(merge_uplink(local(false, false, false), &probe(0.0)).internet_reachable);
-        assert!(!merge_uplink(local(false, false, false), &probe(100.0)).internet_reachable);
+    fn merge_uplink_reachable_from_route_or_mwan3() {
+        // mwan3 marks WAN online → reachable, even if the cached ping shows 100% loss.
+        assert!(merge_uplink(local("wan", true, false), &probe(100.0)).internet_reachable);
+        // A default route via a cellular stack mwan3 doesn't track (usb0 → active_wan
+        // "sim") → reachable, AND sim_up is derived so the SIM box isn't false "offline".
+        let m = merge_uplink(local("sim", false, false), &probe(100.0));
+        assert!(m.internet_reachable);
+        assert!(m.sim_up);
+        // No default route (active_wan "unknown") + mwan3 all offline → genuinely down.
+        assert!(!merge_uplink(local("unknown", false, false), &probe(0.0)).internet_reachable);
     }
 
     #[test]

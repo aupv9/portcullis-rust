@@ -4,6 +4,20 @@ All notable changes to the `portcullis` engine are documented here. The format
 is loosely based on [Keep a Changelog](https://keepachangelog.com/); the engine
 follows semver at the workspace level (`[workspace.package] version`).
 
+## [0.41.0] — 2026-08-13
+
+### Fixed
+- **Uplink false alarm on USB-modem routers (e.g. RUT906 usb0 cellular).** These run the
+  cellular data path on `usb0`, which mwan3 doesn't track (`wan offline`, `mob disabled`).
+  The 0.36.0 near-realtime change derived `internet_reachable` purely from mwan3
+  (`wan_up || sim_up`), so a box happily online via `usb0` reported `internet_reachable=
+  false`, `active_wan="usb0"` (unclassified) and `sim_up=false` → the dashboard falsely
+  showed "Internet mất" and "WAN down". Now: `usb*` classifies as a cellular uplink
+  (`active_wan="sim"`); `internet_reachable = wan_up || sim_up || has-default-route`
+  (a route via any recognised uplink means online — local + near-realtime, covers modem
+  stacks mwan3 misses); and `sim_up` is derived true when the active path is cellular.
+  Removed the now-redundant mwan3-seen/ping fallback. Tests updated.
+
 ## [0.40.0] — 2026-08-12
 
 ### Fixed / Added
