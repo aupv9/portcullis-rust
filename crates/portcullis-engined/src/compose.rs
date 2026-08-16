@@ -205,7 +205,13 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     let (liveness_tx, liveness_rx) =
         tokio::sync::mpsc::channel(portcullis_provision::LIVENESS_BUFFER);
     {
-        let runner = Arc::new(portcullis_provision::ProcessRunner);
+        // Bounded: read-only poller shell-outs get a hard timeout + hang
+        // cooldown so one kernel-wedged child (box .20: `mwan3 status`→`pgrep`
+        // D-state) degrades a field instead of silently killing the poller.
+        // The APPLY-path runner above stays UNBOUNDED on purpose (`wifi reload`
+        // legitimately runs long; a mid-apply kill would tear a radio down).
+        let runner =
+            Arc::new(portcullis_provision::BoundedRunner::telemetry(portcullis_provision::ProcessRunner));
         let prov = provisioner.clone();
         // P2: give the poller a read-only view of the enforcement gate scope so it
         // can report per-SSID `gate_enforced` (surfacing a reboot fail-OPEN where a
@@ -251,7 +257,13 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     let (device_reports_tx, device_reports_rx) =
         tokio::sync::mpsc::channel(portcullis_provision::DEVICE_REPORT_BUFFER);
     {
-        let runner = Arc::new(portcullis_provision::ProcessRunner);
+        // Bounded: read-only poller shell-outs get a hard timeout + hang
+        // cooldown so one kernel-wedged child (box .20: `mwan3 status`→`pgrep`
+        // D-state) degrades a field instead of silently killing the poller.
+        // The APPLY-path runner above stays UNBOUNDED on purpose (`wifi reload`
+        // legitimately runs long; a mid-apply kill would tear a radio down).
+        let runner =
+            Arc::new(portcullis_provision::BoundedRunner::telemetry(portcullis_provision::ProcessRunner));
         let prov = provisioner.clone();
         tasks.push(tokio::spawn(async move {
             portcullis_provision::run_device_obs_poller(
@@ -278,7 +290,13 @@ pub async fn run(cfg: Config, config_path: std::path::PathBuf) -> anyhow::Result
     let (site_telemetry_tx, site_telemetry_rx) =
         tokio::sync::mpsc::channel(portcullis_provision::SITE_TELEMETRY_BUFFER);
     {
-        let runner = Arc::new(portcullis_provision::ProcessRunner);
+        // Bounded: read-only poller shell-outs get a hard timeout + hang
+        // cooldown so one kernel-wedged child (box .20: `mwan3 status`→`pgrep`
+        // D-state) degrades a field instead of silently killing the poller.
+        // The APPLY-path runner above stays UNBOUNDED on purpose (`wifi reload`
+        // legitimately runs long; a mid-apply kill would tear a radio down).
+        let runner =
+            Arc::new(portcullis_provision::BoundedRunner::telemetry(portcullis_provision::ProcessRunner));
         let health = ctrl_health.clone();
         tasks.push(tokio::spawn(async move {
             portcullis_provision::run_site_telemetry_poller(

@@ -55,6 +55,8 @@ pub use handle::{
 pub use liveness::{
     poll_once, run_liveness_poller, DEFAULT_POLL_INTERVAL, LIVENESS_BUFFER, MIN_POLL_INTERVAL_SECS,
 };
-pub use runner::{CommandRunner, ProcessRunner};
+pub use runner::{
+    BoundedRunner, CommandRunner, ProcessRunner, TELEMETRY_CMD_TIMEOUT, TELEMETRY_HANG_COOLDOWN,
+};
 pub use sm::{derive_gated_from_uci, read_committed_gated, ProvisionMachine, DEFAULT_STATE_DIR};
 pub use uci::{parse_gated_bridges_from_uci, render_wireless, validate_wireless, UciCmd};
