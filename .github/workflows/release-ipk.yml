@@ -110,7 +110,7 @@ jobs:
         shell: bash
         run: |
           for i in 1 2 3 4 5; do
-            if cargo install cargo-zigbuild --locked; then exit 0; fi
+            if cargo install cargo-zigbuild --version 0.23.0 --locked; then exit 0; fi
             echo "::warning::cargo-zigbuild install attempt $i failed; retrying in 20s"
             sleep 20
           done
